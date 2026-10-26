@@ -582,16 +582,30 @@ export function createContextForgeEngine(options: ContextForgePluginOptions = {}
         abortSignal: params.abortSignal,
       });
 
-      // Surface active L3 Permanent Context rules in systemPromptAddition so the model
-      // always sees owner-approved permanent contracts alongside the stable cache boundary.
+      // Surface active L3 Permanent Context rules in systemPromptAddition, and when
+      // promptMode === 'slim-domain', also surface the compiled Dual-Channel Symbolic IR
+      // (`<compiled_rules_ir>`) in systemPromptAddition so local/smaller-window models
+      // always receive it even if OpenClaw's core system-prompt builder runs after hooks.
       const l3Nodes = store.listPermanentContext();
+      const additionSections: string[] = [];
+      if (l3Nodes.length > 0) {
+        additionSections.push(
+          "## ContextForge L3 Permanent Context",
+          ...l3Nodes.map((n) => `### ${n.title} (${n.logicalKey})\n${n.body}`),
+        );
+      }
+      if (plan.receipt.profile.promptMode === "slim-domain" && symbolicIr) {
+        const compiled = compileDualChannelSystemPrompt({
+          rawSystemPrompt: workspaceSystemPrompt,
+          symbolicIr: true,
+        });
+        additionSections.push(
+          `## ContextForge Slim-Domain Symbolic IR (fixedOverhead=${plan.receipt.capabilityEnvelope.systemTokens}/${plan.receipt.capabilityEnvelope.nativeContextTokens} tokens > ${Math.round(maxFixedOverheadRatio * 100)}%)`,
+          compiled.symbolicRulesIr || compiled.compiledSystemPrompt,
+        );
+      }
       const systemPromptAddition =
-        l3Nodes.length > 0
-          ? [
-              "## ContextForge L3 Permanent Context",
-              ...l3Nodes.map((n) => `### ${n.title} (${n.logicalKey})\n${n.body}`),
-            ].join("\n\n")
-          : undefined;
+        additionSections.length > 0 ? additionSections.join("\n\n") : undefined;
 
       return {
         messages: plan.messages,
@@ -727,7 +741,7 @@ export default {
             symbolicIr: true,
           });
           return {
-            systemPrompt: compiled.compiledSystemPrompt,
+            prependSystemContext: compiled.symbolicRulesIr || compiled.compiledSystemPrompt,
           };
         }
         return;

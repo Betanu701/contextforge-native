@@ -79,10 +79,9 @@ test("OpenClaw plugin entry registers contextforge engine, 6 cf_* tools, and bef
     systemPrompt: largePrompt,
     contextTokens: 4096, // 15% of 4096 = 614 tokens; largePrompt > 1000 tokens -> triggers Symbolic IR
   });
-  assert.ok(smallWindowHookRes?.systemPrompt);
-  assert.match(smallWindowHookRes.systemPrompt, /# Persona & Soul/);
-  assert.match(smallWindowHookRes.systemPrompt, /<compiled_rules_ir>/);
-  assert.ok(smallWindowHookRes.systemPrompt.length < largePrompt.length);
+  assert.ok(smallWindowHookRes?.prependSystemContext);
+  assert.match(smallWindowHookRes.prependSystemContext, /<compiled_rules_ir>/);
+  assert.ok(smallWindowHookRes.prependSystemContext.length < largePrompt.length);
 
   // On a huge 1M window, 1200 tokens is < 15% so it leaves the prompt untouched
   const hugeWindowHookRes = await registeredHookFn!({

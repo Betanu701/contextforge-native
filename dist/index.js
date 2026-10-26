@@ -411,10 +411,18 @@ export function createContextForgeEngine(options = {}) {
                 abortSignal: params.abortSignal
             });
             const l3Nodes = store.listPermanentContext();
-            const systemPromptAddition = l3Nodes.length > 0 ? [
-                "## ContextForge L3 Permanent Context",
-                ...l3Nodes.map((n)=>`### ${n.title} (${n.logicalKey})\n${n.body}`)
-            ].join("\n\n") : undefined;
+            const additionSections = [];
+            if (l3Nodes.length > 0) {
+                additionSections.push("## ContextForge L3 Permanent Context", ...l3Nodes.map((n)=>`### ${n.title} (${n.logicalKey})\n${n.body}`));
+            }
+            if (plan.receipt.profile.promptMode === "slim-domain" && symbolicIr) {
+                const compiled = compileDualChannelSystemPrompt({
+                    rawSystemPrompt: workspaceSystemPrompt,
+                    symbolicIr: true
+                });
+                additionSections.push(`## ContextForge Slim-Domain Symbolic IR (fixedOverhead=${plan.receipt.capabilityEnvelope.systemTokens}/${plan.receipt.capabilityEnvelope.nativeContextTokens} tokens > ${Math.round(maxFixedOverheadRatio * 100)}%)`, compiled.symbolicRulesIr || compiled.compiledSystemPrompt);
+            }
+            const systemPromptAddition = additionSections.length > 0 ? additionSections.join("\n\n") : undefined;
             return {
                 messages: plan.messages,
                 estimatedTokens: plan.estimatedTokens,
@@ -514,7 +522,7 @@ export default {
                         symbolicIr: true
                     });
                     return {
-                        systemPrompt: compiled.compiledSystemPrompt
+                        prependSystemContext: compiled.symbolicRulesIr || compiled.compiledSystemPrompt
                     };
                 }
                 return;
