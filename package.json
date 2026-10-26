@@ -1,0 +1,20 @@
+{
+  "name": "@openclaw/contextforge-native",
+  "version": "2.0.0",
+  "description": "Native in-process SQLite ContextForge v2 context engine and Dual-Channel Symbolic IR compiler for OpenClaw",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./ts": "./index.ts"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

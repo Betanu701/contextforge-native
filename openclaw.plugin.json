@@ -1,0 +1,45 @@
+{
+  "id": "contextforge-native",
+  "name": "ContextForge v2 Native Engine",
+  "version": "2.0.0",
+  "description": "Model-agnostic, elastic SQLite context engine with source-backed L0-L3 Wiki compilation, multimodal CAS hydration, and Dual-Channel Symbolic IR prompt compression.",
+  "kind": "context-engine",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "cf_recall",
+      "cf_remember",
+      "cf_permanent",
+      "cf_ingest",
+      "cf_wiki_lint",
+      "cf_status"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dbPath": {
+        "type": "string"
+      },
+      "blobRoot": {
+        "type": "string"
+      },
+      "maxFixedOverheadRatio": {
+        "type": "number",
+        "minimum": 0.05,
+        "maximum": 0.8
+      },
+      "symbolicIr": {
+        "type": "boolean"
+      }
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}
