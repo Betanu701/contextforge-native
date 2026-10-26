@@ -432,17 +432,31 @@ export function createContextForgeTools(getStore, ctx = {}) {
                 const stats = store.getStats();
                 const sessionId = typeof params.sessionId === "string" && params.sessionId.trim() ? params.sessionId.trim() : ctx.sessionId;
                 const latestReceiptRow = sessionId ? store.db.prepare("SELECT receipt_json FROM planner_receipts WHERE session_id=? ORDER BY created_at DESC LIMIT 1").get(sessionId) : store.db.prepare("SELECT receipt_json FROM planner_receipts ORDER BY created_at DESC LIMIT 1").get();
-                const latestReceipt = latestReceiptRow ? JSON.parse(String(latestReceiptRow.receipt_json)) : null;
+                const rawReceipt = latestReceiptRow ? JSON.parse(String(latestReceiptRow.receipt_json)) : null;
+                const latestReceiptSummary = rawReceipt ? {
+                    receiptId: rawReceipt.receiptId,
+                    sessionId: rawReceipt.sessionId,
+                    modelId: rawReceipt.capabilityEnvelope?.modelId,
+                    providerId: rawReceipt.capabilityEnvelope?.providerId,
+                    disposition: rawReceipt.disposition,
+                    stopReason: rawReceipt.stopReason,
+                    promptMode: rawReceipt.profile?.promptMode,
+                    demand: rawReceipt.demand,
+                    tokens: rawReceipt.tokens,
+                    cache: rawReceipt.cache,
+                    selectionCount: Array.isArray(rawReceipt.selections) ? rawReceipt.selections.length : 0,
+                    stageCount: Array.isArray(rawReceipt.stages) ? rawReceipt.stages.length : 0
+                } : null;
                 return {
                     content: [
                         {
                             type: "text",
-                            text: `ContextForge Native Status (namespace=${store.namespaceId}):\n${JSON.stringify(stats, null, 2)}${latestReceipt ? `\nLatest Plan Receipt (${latestReceipt.receiptId}): disposition=${latestReceipt.disposition}, stopReason=${latestReceipt.stopReason}, promptMode=${latestReceipt.profile?.promptMode}, selectedHistoryTokens=${latestReceipt.tokens?.selectedHistory}/${latestReceipt.tokens?.admissibleHistory}` : ""}`
+                            text: `ContextForge Native Status (namespace=${store.namespaceId}):\n${JSON.stringify(stats, null, 2)}${latestReceiptSummary ? `\nLatest Plan Receipt (${latestReceiptSummary.receiptId}): model=${latestReceiptSummary.providerId}/${latestReceiptSummary.modelId}, disposition=${latestReceiptSummary.disposition}, stopReason=${latestReceiptSummary.stopReason}, promptMode=${latestReceiptSummary.promptMode}, selections=${latestReceiptSummary.selectionCount}, selectedHistoryTokens=${latestReceiptSummary.tokens?.selectedHistory}/${latestReceiptSummary.tokens?.admissibleHistory}` : ""}`
                         }
                     ],
                     details: {
                         stats,
-                        latestReceipt
+                        latestReceipt: latestReceiptSummary
                     }
                 };
             }

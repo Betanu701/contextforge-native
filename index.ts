@@ -517,18 +517,36 @@ export function createContextForgeEngine(options: ContextForgePluginOptions = {}
             : "";
 
       // Ensure any unindexed historical messages passed in `params.messages` are committed
+      // Group each user-initiated turn slice into its own logical turn so earlier turns stay optional
       if (normalizedMessages.length > 0) {
-        const syncKey = `assemble-sync:${sessionId}:${normalizedMessages.length}:${sha256(JSON.stringify(normalizedMessages.map((m) => m.id ?? m.role))).slice(0, 12)}`;
-        try {
-          store.commitTurn({
-            sessionId,
-            advancementKey: syncKey,
-            messages: normalizedMessages,
-          });
-          compiler.compilePending();
-        } catch {
-          // Already committed; safe to continue
+        let turnIndex = 0;
+        let currentTurn: AcceptedMessage[] = [];
+        const flushSlice = (slice: AcceptedMessage[], tIdx: number) => {
+          if (slice.length === 0) return;
+          const syncKey = `assemble-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m) => m.id ?? m.role))).slice(0, 12)}`;
+          try {
+            store.commitTurn({
+              sessionId,
+              advancementKey: syncKey,
+              messages: slice.map((m) => ({
+                ...m,
+                protocolGroupId: m.protocolGroupId ?? syncKey,
+              })),
+            });
+          } catch {
+            // Already committed; safe to continue
+          }
+        };
+        for (const msg of normalizedMessages) {
+          if (msg.role === "user" && currentTurn.length > 0) {
+            flushSlice(currentTurn, turnIndex++);
+            currentTurn = [msg];
+          } else {
+            currentTurn.push(msg);
+          }
         }
+        flushSlice(currentTurn, turnIndex);
+        compiler.compilePending();
       }
 
       const availableToolsList =

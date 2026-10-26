@@ -342,15 +342,34 @@ export function createContextForgeEngine(options = {}) {
             const normalizedMessages = rawMessages.map((m, idx)=>normalizeHostMessage(m, `hist:${sessionId}:${idx}`, store, sessionId));
             const latestText = typeof params.prompt === "string" && params.prompt.trim() ? params.prompt.trim() : normalizedMessages.length > 0 ? extractTextFromMessage(normalizedMessages[normalizedMessages.length - 1]) : "";
             if (normalizedMessages.length > 0) {
-                const syncKey = `assemble-sync:${sessionId}:${normalizedMessages.length}:${sha256(JSON.stringify(normalizedMessages.map((m)=>m.id ?? m.role))).slice(0, 12)}`;
-                try {
-                    store.commitTurn({
-                        sessionId,
-                        advancementKey: syncKey,
-                        messages: normalizedMessages
-                    });
-                    compiler.compilePending();
-                } catch  {}
+                let turnIndex = 0;
+                let currentTurn = [];
+                const flushSlice = (slice, tIdx)=>{
+                    if (slice.length === 0) return;
+                    const syncKey = `assemble-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m)=>m.id ?? m.role))).slice(0, 12)}`;
+                    try {
+                        store.commitTurn({
+                            sessionId,
+                            advancementKey: syncKey,
+                            messages: slice.map((m)=>({
+                                    ...m,
+                                    protocolGroupId: m.protocolGroupId ?? syncKey
+                                }))
+                        });
+                    } catch  {}
+                };
+                for (const msg of normalizedMessages){
+                    if (msg.role === "user" && currentTurn.length > 0) {
+                        flushSlice(currentTurn, turnIndex++);
+                        currentTurn = [
+                            msg
+                        ];
+                    } else {
+                        currentTurn.push(msg);
+                    }
+                }
+                flushSlice(currentTurn, turnIndex);
+                compiler.compilePending();
             }
             const availableToolsList = params.availableTools instanceof Set ? [
                 ...params.availableTools
