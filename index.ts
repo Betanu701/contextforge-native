@@ -523,15 +523,12 @@ export function createContextForgeEngine(options: ContextForgePluginOptions = {}
         let currentTurn: AcceptedMessage[] = [];
         const flushSlice = (slice: AcceptedMessage[], tIdx: number) => {
           if (slice.length === 0) return;
-          const syncKey = `assemble-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m) => m.id ?? m.role))).slice(0, 12)}`;
+          const syncKey = `turn-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m) => m.id ?? m.role))).slice(0, 12)}`;
           try {
             store.commitTurn({
               sessionId,
               advancementKey: syncKey,
-              messages: slice.map((m) => ({
-                ...m,
-                protocolGroupId: m.protocolGroupId ?? syncKey,
-              })),
+              messages: slice,
             });
           } catch {
             // Already committed; safe to continue

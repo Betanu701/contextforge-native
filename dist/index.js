@@ -346,15 +346,12 @@ export function createContextForgeEngine(options = {}) {
                 let currentTurn = [];
                 const flushSlice = (slice, tIdx)=>{
                     if (slice.length === 0) return;
-                    const syncKey = `assemble-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m)=>m.id ?? m.role))).slice(0, 12)}`;
+                    const syncKey = `turn-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m)=>m.id ?? m.role))).slice(0, 12)}`;
                     try {
                         store.commitTurn({
                             sessionId,
                             advancementKey: syncKey,
-                            messages: slice.map((m)=>({
-                                    ...m,
-                                    protocolGroupId: m.protocolGroupId ?? syncKey
-                                }))
+                            messages: slice
                         });
                     } catch  {}
                 };

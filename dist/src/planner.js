@@ -359,7 +359,9 @@ export function planContext(input) {
         const sourceForMessage = new Map();
         const history = occurrences.map((r)=>{
             const m = JSON.parse(String(r.text_content));
-            m.protocolGroupId ??= String(r.protocol_group_id);
+            if (m.protocolGroupId === undefined && r.protocol_group_id && !String(r.protocol_group_id).startsWith('assemble-sync:') && !String(r.protocol_group_id).startsWith('turn-sync:')) {
+                m.protocolGroupId = String(r.protocol_group_id);
+            }
             sourceForMessage.set(m, String(r.source_id));
             return m;
         });

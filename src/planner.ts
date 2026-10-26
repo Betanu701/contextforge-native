@@ -181,7 +181,16 @@ export function planContext(input: PlanContextInput): ContextPlan {
     }
     const occurrences=db.prepare(`SELECT o.*,a.text_content FROM message_occurrences o JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) JOIN artifacts a USING(source_id) WHERE o.session_id=? AND s.namespace_id=? AND l.status='active' AND a.kind='normalized_message' ORDER BY o.sequence`).all(input.sessionId,ns);
     const sourceForMessage=new Map<AcceptedMessage,string>();
-    const history=occurrences.map(r=>{const m=JSON.parse(String(r.text_content)) as AcceptedMessage;m.protocolGroupId??=String(r.protocol_group_id);sourceForMessage.set(m,String(r.source_id));return m;});
+    const history=occurrences.map(r=>{
+      const m=JSON.parse(String(r.text_content)) as AcceptedMessage;
+      // Preserve explicit protocolGroupId when set on the message; toolCall/toolResult
+      // pairs are closed by union-find in groupVerbatimTail().
+      if(m.protocolGroupId===undefined && r.protocol_group_id && !String(r.protocol_group_id).startsWith('assemble-sync:') && !String(r.protocol_group_id).startsWith('turn-sync:')) {
+        m.protocolGroupId=String(r.protocol_group_id);
+      }
+      sourceForMessage.set(m,String(r.source_id));
+      return m;
+    });
     if(history.some(m=>Array.isArray(m.content)&&m.content.some(b=>b&&typeof b==='object'&&!Array.isArray(b)&&['image','audio','video','document'].includes(String(b.type))))) throw new Error('HistoricalMediaRequiresAdapter: quote/hydrate stored media artifacts instead of unpriced protocol replay');
     const tailGroups=groupVerbatimTail(history);
     for(const [index,group] of [...tailGroups].reverse().entries()) {
