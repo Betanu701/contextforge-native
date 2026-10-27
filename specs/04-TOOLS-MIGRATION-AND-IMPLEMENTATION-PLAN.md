@@ -1,9 +1,9 @@
 # ContextForge v2 Native Engine (`contextforge-native`)
 ## 04 — Agent Tool Surface, Migration Plan, Verification Benchmarks & Build Roadmap
 
-**Authors**: Edith (`gemini-4-argon`) & Astra (`gpt-6-astra`)  
-**Date**: October 25, 2026  
-**Status**: Complete Design & Specification Kit (Awaiting Derek's Review)
+**Authors**: ContextForge contributors
+**Date**: October 25, 2026
+**Status**: Complete Design & Specification Kit (Awaiting the owner's Review)
 
 ---
 
@@ -42,7 +42,7 @@ ContextForge v2 is 100% model-agnostic and plug-and-play for any OpenClaw user:
 ### Scenario B: Heavy RAG / 100k+ Multi-Document Synthesis / Codebase Analysis
 1. **What Happens When You Ask a Deep Research or Multi-Document Question:**
    - Example: *"Compare all 16 personality and professional reports in `reports/` with my March/April reflections and synthesize every contradiction with exact citations"* or *"Analyze this 150-page architecture PDF and cross-reference it with our repo."*
-   - **Elastic Demand Classifier:** Detects `intent = "heavy_rag"` (multi-source synthesis / high breadth) on a high-capacity model (`gemini-4-argon`, `gpt-6.1-sol`, or `gpt-6-astra` with `tokenBudget = 922,000`).
+   - **Elastic Demand Classifier:** Detects `intent = "heavy_rag"` (multi-source synthesis / high breadth) on a high-capacity model (`cloud-model-A`, `cloud-model-C`, or `cloud-model-B` with `tokenBudget = 922,000`).
    - **Staged Expansion Without Artificial Caps:**
      - Stage 1 loads the L2 Wiki index and entity/concept maps (~5k tokens).
      - Stage 2 follows provenance links to pull all matching L0 document chunks and full report sections—scaling dynamically to **80k, 150k, or 300k+ tokens** as needed so no evidence is truncated.
@@ -72,16 +72,16 @@ Before writing a single line of production code, here are the three real enginee
 
 ---
 
-## 4. Parallel Implementation Plan & Milestones (Edith + `gpt-6-astra`)
+## 4. Parallel Implementation Plan & Milestones (implementation team + `cloud-model-B`)
 
-Once you approve this Spec Kit, me (`gemini-4-argon`) and `gpt-6-astra` can execute the entire build in **4 bounded, verifiable milestones (~3 hours total)**:
+Once you approve this Spec Kit, me (`cloud-model-A`) and `cloud-model-B` can execute the entire build in **4 bounded, verifiable milestones (~3 hours total)**:
 
 | Milestone | Owner | Deliverable & Scope | Verification Gate |
 | :--- | :--- | :--- | :--- |
-| **M1: Native SQLite Core & L0–L3 Compiler** | `gpt-6-astra` | `extensions/contextforge-native/src/db.ts`, `schema.ts`, `compiler.ts`, `media.ts`. Full `node:sqlite` WAL database, L0–L3 tables, FTS5 index, deterministic Wiki/Fact compiler, and multimodal asset registry. | Unit test suite (`vitest`): 100% lossless round-trip of L0 turns/docs/media, deterministic L1/L2 compilation in `<5ms`, cumulative scale & temporal supersession tests. |
-| **M2: Elastic Context Planner, Dual-Channel Symbolic IR & KV-Cache Assembler** | `gpt-6-astra` + Edith | `extensions/contextforge-native/src/planner.ts`, `assembler.ts`, `prompt-controller.ts`, `symbolic-ir.ts`. Demand classifier (`conversational` vs `heavy_rag` vs `multimodal`), staged budget expansion (no hard cap, up to full `tokenBudget`), Dual-Channel Prompt Compiler (natural prose `SOUL.md` persona + `<compiled_rules_ir>` Symbolic DSL for operational rules, toggleable via `symbolicIr: boolean`), tool-pair-safe verbatim tail slicer, and Epoch KV-cache prefix locking. | Benchmark tests: verify `1.5k–3.5k` assembly on conversational turns, 50%+ token reduction on operational rules via Symbolic IR without persona degradation, `100k+` expansion on multi-doc RAG turns, tool-call chain integrity, and `>90%` prefix cache reuse. |
-| **M3: OpenClaw Plugin Wiring & Agent Tools** | Edith | `extensions/contextforge-native/openclaw.plugin.json`, `src/index.ts`, `src/tools.ts`. Registers `api.registerContextEngine("contextforge", ...)`, atomic `commitTurn()`, `before_prompt_build` prompt/tool slimmer, background `maintain()`, and the 6 `cf_*` tools. | Live plugin load via `plugins` tool; verify `plugins.slots.contextEngine = "contextforge"` coexists with `plugins.slots.memory = "memory-core"` without degrading to legacy. |
-| **M4: Zero-Config Plug-and-Play Packaging & Live Validation** | Edith + `gpt-6-astra` | Package `extensions/contextforge-native` as a drop-in OpenClaw plugin (`openclaw plugins install -l`), run multi-turn benchmarks across both small-window (`32k/64k`) and large-window (`922k`) models, and verify automatic envelope adaptation, 100k+ RAG expansion, and multimodal fallback. | End-to-end proof: zero hardcoded model/project assumptions, automatic envelope discovery & overhead scaling, accurate multi-turn recall, and 100k+ RAG expansion + automatic next-turn release. |
+| **M1: Native SQLite Core & L0–L3 Compiler** | `cloud-model-B` | `extensions/contextforge-native/src/db.ts`, `schema.ts`, `compiler.ts`, `media.ts`. Full `node:sqlite` WAL database, L0–L3 tables, FTS5 index, deterministic Wiki/Fact compiler, and multimodal asset registry. | Unit test suite (`vitest`): 100% lossless round-trip of L0 turns/docs/media, deterministic L1/L2 compilation in `<5ms`, cumulative scale & temporal supersession tests. |
+| **M2: Elastic Context Planner, Dual-Channel Symbolic IR & KV-Cache Assembler** | `cloud-model-B` + implementation team | `extensions/contextforge-native/src/planner.ts`, `assembler.ts`, `prompt-controller.ts`, `symbolic-ir.ts`. Demand classifier (`conversational` vs `heavy_rag` vs `multimodal`), staged budget expansion (no hard cap, up to full `tokenBudget`), Dual-Channel Prompt Compiler (natural prose `SOUL.md` persona + `<compiled_rules_ir>` Symbolic DSL for operational rules, toggleable via `symbolicIr: boolean`), tool-pair-safe verbatim tail slicer, and Epoch KV-cache prefix locking. | Benchmark tests: verify `1.5k–3.5k` assembly on conversational turns, 50%+ token reduction on operational rules via Symbolic IR without persona degradation, `100k+` expansion on multi-doc RAG turns, tool-call chain integrity, and `>90%` prefix cache reuse. |
+| **M3: OpenClaw Plugin Wiring & Agent Tools** | implementation team | `extensions/contextforge-native/openclaw.plugin.json`, `src/index.ts`, `src/tools.ts`. Registers `api.registerContextEngine("contextforge", ...)`, atomic `commitTurn()`, `before_prompt_build` prompt/tool slimmer, background `maintain()`, and the 6 `cf_*` tools. | Live plugin load via `plugins` tool; verify `plugins.slots.contextEngine = "contextforge"` coexists with `plugins.slots.memory = "memory-core"` without degrading to legacy. |
+| **M4: Zero-Config Plug-and-Play Packaging & Live Validation** | implementation team + `cloud-model-B` | Package `extensions/contextforge-native` as a drop-in OpenClaw plugin (`openclaw plugins install -l`), run multi-turn benchmarks across both small-window (`32k/64k`) and large-window (`922k`) models, and verify automatic envelope adaptation, 100k+ RAG expansion, and multimodal fallback. | End-to-end proof: zero hardcoded model/project assumptions, automatic envelope discovery & overhead scaling, accurate multi-turn recall, and 100k+ RAG expansion + automatic next-turn release. |
 
 ---
 

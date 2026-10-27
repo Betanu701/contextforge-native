@@ -10,7 +10,7 @@ import {
 } from "../dist/index.js";
 import { estimateTokens } from "../dist/src/symbolic-ir.js";
 
-const LLAMA_BASE = "http://host.docker.internal:18080/v1";
+const LLAMA_BASE = process.env.CONTEXTFORGE_API_BASE ?? "http://127.0.0.1:8080/v1";
 
 const MODELS = [
   {
@@ -452,7 +452,7 @@ async function main() {
   const rawSystemPrompt = loadWorkspaceSystemPrompt();
   const results = [];
   const outPath =
-    "/home/node/.openclaw/workspace/extensions/contextforge-native/benchmark-100turns-results.json";
+    "benchmark-100turns-results.json";
   for (const m of MODELS) {
     const res = await runModelBenchmark(m, rawSystemPrompt);
     results.push(res);

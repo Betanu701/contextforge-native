@@ -60,3 +60,33 @@ Install into `~/.openclaw/extensions/contextforge-native` and enable:
   }
 }
 ```
+
+## Part 2: Long-horizon understanding benchmark
+
+The test-only [`benchmarks/long-horizon-understanding`](benchmarks/long-horizon-understanding/README.md)
+benchmark exercises the real SQLite/compiler/planner pipeline with **50/100 turns**,
+**0–5 bounded pressure spikes** (including 3/5 × 150k actual serialized-text heuristic
+tokens), immediate next-turn pressure release, and five deep causal tracks:
+architecture reversals, inferred operational constraints, native-image/tool/config
+three-hop debugging, 27-observation same-entity drift with exact decimal math, and
+late unprovisioned-sibling abstention (after turn 80 in the 100-turn variant).
+
+```bash
+# Offline only: no LLM inference or network. Includes all four 50/100 × 3/5 combinations.
+node --experimental-strip-types --test test/long-horizon-benchmark.test.ts
+node --experimental-strip-types benchmarks/long-horizon-understanding/runner.ts \
+  --preset stress-max --turns 100 --pressure-spikes 5 \
+  --spike-tokens 150000 --output long-horizon.json
+```
+
+Fixtures and scoring oracles are separate. Offline checks prove **original-premise
+coverage, wire pressure/release, provenance integrity, and native protocol delivery**,
+not model comprehension. Token estimates use actual serialized bytes but are not
+provider tokenizer counts. Explicit opt-in `--live` supports configurable
+OpenAI-compatible models, strictly sequential requests, provider usage reporting,
+and `local-sequential`, `cloud-economical`, and `stress-max` presets. Live responses
+are retained with lexical screens requiring separate human causal/citation review;
+no inference is performed by the offline suite. See the benchmark README for CLI,
+model-file schema, reporting semantics, and resource envelopes.
+
+Natural-prose untared/cumulative balance sequences now compile exact BigInt deltas in consistent g/kg/mg/ml/mL/L/oz/lb units, with original quotes and explicit normalized-number/unit rendering.

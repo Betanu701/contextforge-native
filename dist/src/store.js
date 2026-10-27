@@ -705,10 +705,11 @@ export class ContextForgeStore {
         const terms = new Set(recall.facets.flatMap((f)=>f.aliases));
         const rowAllowance = Math.min(maxBytes, budget.maxBytes - budget.bytes), titleCap = Math.min(2048, Math.floor(rowAllowance / 4)), bodyCap = Math.min(maxRowBytes, rowAllowance - titleCap);
         const statement = this.db.prepare(`SELECT d.rowid AS discovery_rowid,d.namespace_id,d.node_id,d.chunk_id,d.source_id,substr(CAST(d.body AS BLOB),1,?) AS bounded_body,length(CAST(d.body AS BLOB)) AS body_bytes,coalesce(d.source_id,sp.source_id) AS resolved_source_id,sp.span_id,sp.artifact_id,sp.byte_start,sp.byte_end,coalesce(n.layer,0) AS layer,coalesce(n.status,sl.status) AS lifecycle_status,n.logical_key,substr(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB),1,?) AS bounded_title,length(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB)) AS title_bytes,0 AS score FROM retrieval_fts JOIN retrieval_documents d ON d.rowid=retrieval_fts.rowid
-      LEFT JOIN chunks c ON c.chunk_id=d.chunk_id LEFT JOIN spans sp ON sp.span_id=c.span_id
+      LEFT JOIN chunks c ON c.chunk_id=d.chunk_id LEFT JOIN spans sp ON sp.span_id=c.span_id LEFT JOIN artifacts search_artifact ON search_artifact.artifact_id=sp.artifact_id
       LEFT JOIN sources s ON s.source_id=coalesce(d.source_id,sp.source_id) LEFT JOIN source_lifecycle sl ON sl.source_id=s.source_id
       LEFT JOIN derived_nodes n ON n.node_id=d.node_id
       WHERE retrieval_fts MATCH ? AND d.namespace_id=?
+      AND (search_artifact.kind IS NULL OR search_artifact.kind<>'normalized_message')
       AND (? IS NULL OR coalesce(n.layer,0) IN (SELECT value FROM json_each(?)))
       AND (? IS NULL OR (n.kind IN (SELECT value FROM json_each(?)) OR c.chunk_kind IN (SELECT value FROM json_each(?)) OR s.kind IN (SELECT value FROM json_each(?))))
       AND (? OR (coalesce(sl.status,n.status)='active' AND NOT EXISTS(SELECT 1 FROM provenance p JOIN spans ps USING(span_id) JOIN source_lifecycle pl ON pl.source_id=ps.source_id WHERE p.node_id=n.node_id AND pl.status<>'active')))

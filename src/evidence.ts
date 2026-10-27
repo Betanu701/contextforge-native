@@ -87,6 +87,19 @@ export function discoverEvidenceCandidates(store:ContextForgeStore,query:string,
   const extra=store.search(facet.surface,{namespaceId,layers:[0],limit:256,maxInspected:256,deadlineAt,budget});inspectedChunks+=extra.inspected??extra.length;statisticsInspected+=extra.statisticsInspected??0;continuationTruncated ||= extra.truncated??false;
   for(const h of extra)if(scoreFacetCoverage(recall,h.title+' '+h.body).anchored&&!raw.some(r=>r.chunkId===h.chunkId)){raw.push(h);scoreFacetCoverage(recall,h.title+' '+h.body).matchedFacetIds.forEach(f=>covered.add(f));}
  }
+ // A bounded first page may be saturated by a prior bulk attachment. Continue
+ // the original query by rowid after rare-facet continuation; a
+ // shared word in old telemetry does not establish a later causal premise.
+ let rawCursor=raw.nextRowid??0,rawPages=0,continuedInspected=0,continuedStatistics=0;
+ while(raw.truncated&&rawPages<3&&Date.now()<deadlineAt&&budget.inspected<budget.maxInspected&&budget.bytes<budget.maxBytes){
+  const page=store.search(query,{namespaceId,layers:[0],limit:128,afterRowid:rawCursor,deadlineAt,budget,maxInspected:256});rawPages++;continuedInspected+=page.inspected??page.length;continuedStatistics+=page.statisticsInspected??0;
+  if((page.nextRowid??rawCursor)<=rawCursor)break;rawCursor=page.nextRowid;
+  for(const h of page)if(!raw.some(r=>r.chunkId===h.chunkId))raw.push(h);
+  if(!page.truncated)break;
+ }
+ inspectedChunks += continuedInspected;
+ statisticsInspected = statisticsInspected + continuedStatistics;
+
  const nodes=Date.now()<deadlineAt?store.search(query,{namespaceId,layers:[1,2],limit:64,deadlineAt,budget}):Object.assign([],{truncated:true,inspected:0,statisticsInspected:0});statisticsInspected+=nodes.statisticsInspected??0;
  const out=new Map<string,EvidenceCandidate>(),windowCache=new Map<string,EvidenceCandidate|null>();
  const merge=(c:EvidenceCandidate)=>{const prev=out.get(c.sourceId);if(prev&&c.derivedText===undefined&&c.trace?.seedNodeId){const union=[...new Map([...(prev.excerpts??[]),...(c.excerpts??[])].map(e=>[e.spanId,e])).values()];if(renderExcerpts(union).length>12288){prev.trace={...prev.trace,truncated:true};return;}}if(!prev)out.set(c.sourceId,c);else{prev.derivedNodeIds=[...new Set([...(prev.derivedNodeIds??[]),...(c.derivedNodeIds??[])])];prev.claimSignatures=[...new Set([...(prev.claimSignatures??[]),...(c.claimSignatures??[])])];bind(prev,[...(prev.excerpts??[]),...(c.excerpts??[])]);if(c.derivedText&&!prev.derivedText?.includes(c.derivedText))prev.derivedText=(prev.derivedText?prev.derivedText+'\n':'')+c.derivedText;prev.reasons=[...new Set([...prev.reasons,...c.reasons])];prev.trace={...prev.trace,...c.trace};prev.supportRequirements={...prev.supportRequirements,...c.supportRequirements};prev.supportGroupIds=[...new Set([...prev.supportGroupIds,...c.supportGroupIds])];prev.matchedFacetIds=[...new Set([...prev.matchedFacetIds,...c.matchedFacetIds])];}};

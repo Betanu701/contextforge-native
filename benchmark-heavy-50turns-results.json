@@ -43,7 +43,7 @@
           "predictedPerSec": 21,
           "recallPassed": true,
           "matchedCount": "5/5",
-          "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+          "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added."
         },
         "checkpoints": [
           {
@@ -62,7 +62,7 @@
             "predictedPerSec": 21.6,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Got it: Vault Passphrase is Cobalt-99, the primary SQLite WAL DB is on spark-gpu-01, and I'm running as a cluster node."
+            "replyPreview": "Got it: Vault Passphrase is Cobalt-99, the primary SQLite WAL DB is on worker-gpu-01, and I'm running as a cluster node."
           },
           {
             "turn": 3,
@@ -98,7 +98,7 @@
             "predictedPerSec": 21.1,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is spark-gpu-01, with 550 g of oats and 430 g of honey added to the scale"
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is worker-gpu-01, with 550 g of oats and 430 g of honey added to the scale"
           },
           {
             "turn": 20,
@@ -116,7 +116,7 @@
             "predictedPerSec": 21,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is spark-gpu-01, with 550g of oats and 430g of honey added."
+            "replyPreview": "Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is worker-gpu-01, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 25,
@@ -134,7 +134,7 @@
             "predictedPerSec": 21.3,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Dual-spark-5090-cluster is now the primary node."
+            "replyPreview": "Dual-worker-cluster is now the primary node."
           },
           {
             "turn": 30,
@@ -152,7 +152,7 @@
             "predictedPerSec": 21.1,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 40,
@@ -170,7 +170,7 @@
             "predictedPerSec": 21,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 47,
@@ -188,7 +188,7 @@
             "predictedPerSec": 21,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 50,
@@ -206,7 +206,7 @@
             "predictedPerSec": 20.9,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           }
         ],
         "sqliteStats": {
@@ -245,7 +245,7 @@
           "llmLatencyMs": 17899.8,
           "recallPassed": false,
           "matchedCount": "3/5",
-          "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision is to use **spark-gpu-01** as the SQLite WAL node. The current primary cluster node is **dual-spark-5090-cl"
+          "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision is to use **worker-gpu-01** as the SQLite WAL node. The current primary cluster node is **dual-worker-cl"
         },
         "checkpoints": [
           {
@@ -260,7 +260,7 @@
             "llmLatencyMs": 3996,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Got it: Vault Passphrase is Cobalt-99, the primary SQLite WAL DB is on spark-gpu-01, and I've noted this cluster state."
+            "replyPreview": "Got it: Vault Passphrase is Cobalt-99, the primary SQLite WAL DB is on worker-gpu-01, and I've noted this cluster state."
           },
           {
             "turn": 3,
@@ -288,7 +288,7 @@
             "llmLatencyMs": 17344.5,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision was to identify **spark-gpu-01** as the main SQLite WAL node. The current primary cluster node remains **sp"
+            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision was to identify **worker-gpu-01** as the main SQLite WAL node. The current primary cluster node remains **sp"
           },
           {
             "turn": 20,
@@ -302,7 +302,7 @@
             "llmLatencyMs": 9288.5,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the primary database decision was to use spark-gpu-01 as the SQLite WAL node. The current primary cluster node is spark-gpu-01, and no oats o"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the primary database decision was to use worker-gpu-01 as the SQLite WAL node. The current primary cluster node is worker-gpu-01, and no oats o"
           },
           {
             "turn": 25,
@@ -316,7 +316,7 @@
             "llmLatencyMs": 7276.7,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Cluster node state updated to dual-spark-5090-cluster."
+            "replyPreview": "Cluster node state updated to dual-worker-cluster."
           },
           {
             "turn": 30,
@@ -330,7 +330,7 @@
             "llmLatencyMs": 9104.1,
             "recallPassed": false,
             "matchedCount": "2/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the primary database node is spark-gpu-01. The current primary cluster node is dual-spark-5090-cluster, and no oats or honey were added to th"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the primary database node is worker-gpu-01. The current primary cluster node is dual-worker-cluster, and no oats or honey were added to th"
           },
           {
             "turn": 40,
@@ -344,7 +344,7 @@
             "llmLatencyMs": 18180.6,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision was to identify **spark-gpu-01** as the primary SQLite WAL node. The current primary cluster node is **dual"
+            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision was to identify **worker-gpu-01** as the primary SQLite WAL node. The current primary cluster node is **dual"
           },
           {
             "turn": 47,
@@ -358,7 +358,7 @@
             "llmLatencyMs": 17899.8,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision is to use **spark-gpu-01** as the SQLite WAL node. The current primary cluster node is **dual-spark-5090-cl"
+            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision is to use **worker-gpu-01** as the SQLite WAL node. The current primary cluster node is **dual-worker-cl"
           },
           {
             "turn": 50,
@@ -372,7 +372,7 @@
             "llmLatencyMs": 18260.3,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision was to identify **spark-gpu-01** as the primary SQLite WAL node. The current primary cluster node is **dual"
+            "replyPreview": "The Vault passphrase is **Cobalt-99**, and the primary database decision was to identify **worker-gpu-01** as the primary SQLite WAL node. The current primary cluster node is **dual"
           }
         ]
       }
@@ -419,7 +419,7 @@
           "predictedPerSec": 37.8,
           "recallPassed": true,
           "matchedCount": "5/5",
-          "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-spark-5090-cluster`, with 550g of oats and 430g of honey add"
+          "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-worker-cluster`, with 550g of oats and 430g of honey add"
         },
         "checkpoints": [
           {
@@ -438,7 +438,7 @@
             "predictedPerSec": 39.2,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Vault Passphrase is Cobalt-99, the primary database is SQLite WAL, and the cluster node primary is spark-gpu-01."
+            "replyPreview": "Vault Passphrase is Cobalt-99, the primary database is SQLite WAL, and the cluster node primary is worker-gpu-01."
           },
           {
             "turn": 3,
@@ -474,7 +474,7 @@
             "predictedPerSec": 37.8,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is spark-gpu-01, with 550g of oats and 430g of honey added on the sca"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is worker-gpu-01, with 550g of oats and 430g of honey added on the sca"
           },
           {
             "turn": 20,
@@ -492,7 +492,7 @@
             "predictedPerSec": 37.8,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is spark-gpu-01, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is worker-gpu-01, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 25,
@@ -510,7 +510,7 @@
             "predictedPerSec": 39.3,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "The cluster node state is now Cluster Node with primary set to dual-spark-5090-cluster."
+            "replyPreview": "The cluster node state is now Cluster Node with primary set to dual-worker-cluster."
           },
           {
             "turn": 30,
@@ -528,7 +528,7 @@
             "predictedPerSec": 37.7,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added"
           },
           {
             "turn": 40,
@@ -546,7 +546,7 @@
             "predictedPerSec": 37,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-spark-5090-cluster`, with 550g of oats and 430g of honey add"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-worker-cluster`, with 550g of oats and 430g of honey add"
           },
           {
             "turn": 47,
@@ -564,7 +564,7 @@
             "predictedPerSec": 37.8,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-spark-5090-cluster`, with 550g of oats and 430g of honey add"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-worker-cluster`, with 550g of oats and 430g of honey add"
           },
           {
             "turn": 50,
@@ -582,7 +582,7 @@
             "predictedPerSec": 37.7,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-spark-5090-cluster`, with 550g of oats and 430g of honey add"
+            "replyPreview": "The Vault Passphrase is Cobalt-99, and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is `dual-worker-cluster`, with 550g of oats and 430g of honey add"
           }
         ],
         "sqliteStats": {
@@ -636,7 +636,7 @@
             "llmLatencyMs": 1987.2,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Vault Passphrase is Cobalt-99, the primary database is SQLite WAL, and the cluster node primary is spark-gpu-01."
+            "replyPreview": "Vault Passphrase is Cobalt-99, the primary database is SQLite WAL, and the cluster node primary is worker-gpu-01."
           },
           {
             "turn": 3,
@@ -692,7 +692,7 @@
             "llmLatencyMs": 4556.1,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "The primary cluster node is dual-spark-5090-cluster."
+            "replyPreview": "The primary cluster node is dual-worker-cluster."
           },
           {
             "turn": 30,
@@ -795,7 +795,7 @@
           "predictedPerSec": 18.1,
           "recallPassed": true,
           "matchedCount": "5/5",
-          "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+          "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-worker-cluster, with 550g of oats and 430g of honey added."
         },
         "checkpoints": [
           {
@@ -814,7 +814,7 @@
             "predictedPerSec": 18.6,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Understood: Vault passphrase is Cobalt-99, primary DB is SQLite WAL, and spark-gpu-01 is the primary cluster node."
+            "replyPreview": "Understood: Vault passphrase is Cobalt-99, primary DB is SQLite WAL, and worker-gpu-01 is the primary cluster node."
           },
           {
             "turn": 3,
@@ -850,7 +850,7 @@
             "predictedPerSec": 18.1,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB decision is SQLite WAL. The primary cluster node is spark-gpu-01, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB decision is SQLite WAL. The primary cluster node is worker-gpu-01, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 20,
@@ -868,7 +868,7 @@
             "predictedPerSec": 18.2,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is spark-gpu-01, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB is SQLite WAL. The primary Cluster Node is worker-gpu-01, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 25,
@@ -886,7 +886,7 @@
             "predictedPerSec": 18.7,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Acknowledged: primary cluster node is now dual-spark-5090-cluster."
+            "replyPreview": "Acknowledged: primary cluster node is now dual-worker-cluster."
           },
           {
             "turn": 30,
@@ -904,7 +904,7 @@
             "predictedPerSec": 17.8,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 40,
@@ -922,7 +922,7 @@
             "predictedPerSec": 18.4,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 47,
@@ -940,7 +940,7 @@
             "predictedPerSec": 18.1,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 50,
@@ -958,7 +958,7 @@
             "predictedPerSec": 18.3,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           }
         ],
         "sqliteStats": {
@@ -1012,7 +1012,7 @@
             "llmLatencyMs": 4460.4,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Understood: Vault passphrase is Cobalt-99, primary DB is SQLite WAL, and spark-gpu-01 is the primary cluster node."
+            "replyPreview": "Understood: Vault passphrase is Cobalt-99, primary DB is SQLite WAL, and worker-gpu-01 is the primary cluster node."
           },
           {
             "turn": 3,
@@ -1040,7 +1040,7 @@
             "llmLatencyMs": 10840,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is spark-gpu-01, with 2460g of oats and honey added."
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is worker-gpu-01, with 2460g of oats and honey added."
           },
           {
             "turn": 20,
@@ -1054,7 +1054,7 @@
             "llmLatencyMs": 37852.9,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is spark-gpu-01, and the kitchen scale recorded 0 net grams of oats and h"
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is worker-gpu-01, and the kitchen scale recorded 0 net grams of oats and h"
           },
           {
             "turn": 25,
@@ -1068,7 +1068,7 @@
             "llmLatencyMs": 11379.2,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Primary cluster node updated to dual-spark-5090-cluster."
+            "replyPreview": "Primary cluster node updated to dual-worker-cluster."
           },
           {
             "turn": 30,
@@ -1082,7 +1082,7 @@
             "llmLatencyMs": 12147.2,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-spark-5090-cluster, and no oats or honey were added."
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary DB is SQLite WAL. The primary cluster node is dual-worker-cluster, and no oats or honey were added."
           },
           {
             "turn": 40,
@@ -1124,7 +1124,7 @@
             "llmLatencyMs": 37030.4,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is the dual-spark-5090-cluster, and no oats or honey were added to the ki"
+            "replyPreview": "The Vault passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is the dual-worker-cluster, and no oats or honey were added to the ki"
           }
         ]
       }
@@ -1171,7 +1171,7 @@
           "predictedPerSec": 24.1,
           "recallPassed": true,
           "matchedCount": "5/5",
-          "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added "
+          "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added "
         },
         "checkpoints": [
           {
@@ -1190,7 +1190,7 @@
             "predictedPerSec": 24.7,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Got it: Vault passphrase is Cobalt-99, primary DB is SQLite WAL, and the cluster node is spark-gpu-01."
+            "replyPreview": "Got it: Vault passphrase is Cobalt-99, primary DB is SQLite WAL, and the cluster node is worker-gpu-01."
           },
           {
             "turn": 3,
@@ -1226,7 +1226,7 @@
             "predictedPerSec": 24.2,
             "recallPassed": true,
             "matchedCount": "4/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is spark-gpu-01, and 860 grams of oats and 430 grams of honey were add"
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is worker-gpu-01, and 860 grams of oats and 430 grams of honey were add"
           },
           {
             "turn": 20,
@@ -1244,7 +1244,7 @@
             "predictedPerSec": 24.2,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is spark-gpu-01, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is worker-gpu-01, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 25,
@@ -1262,7 +1262,7 @@
             "predictedPerSec": 24.5,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Acknowledged: primary node is dual-spark-5090-cluster."
+            "replyPreview": "Acknowledged: primary node is dual-worker-cluster."
           },
           {
             "turn": 30,
@@ -1280,7 +1280,7 @@
             "predictedPerSec": 24.1,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added."
           },
           {
             "turn": 40,
@@ -1298,7 +1298,7 @@
             "predictedPerSec": 24.2,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added "
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added "
           },
           {
             "turn": 47,
@@ -1316,7 +1316,7 @@
             "predictedPerSec": 24.1,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added "
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added "
           },
           {
             "turn": 50,
@@ -1334,7 +1334,7 @@
             "predictedPerSec": 23.9,
             "recallPassed": true,
             "matchedCount": "5/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-spark-5090-cluster, with 550g of oats and 430g of honey added "
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the Primary DB Decision is SQLite WAL. The current primary Cluster Node is dual-worker-cluster, with 550g of oats and 430g of honey added "
           }
         ],
         "sqliteStats": {
@@ -1373,7 +1373,7 @@
           "llmLatencyMs": 13800.1,
           "recallPassed": false,
           "matchedCount": "3/5",
-          "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-spark-5090-cluster, and 0 net grams of oats and honey were added."
+          "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-worker-cluster, and 0 net grams of oats and honey were added."
         },
         "checkpoints": [
           {
@@ -1388,7 +1388,7 @@
             "llmLatencyMs": 4944.1,
             "recallPassed": null,
             "matchedCount": null,
-            "replyPreview": "Got it: Vault Passphrase is Cobalt-99, primary DB is SQLite WAL, and the cluster node is spark-gpu-01."
+            "replyPreview": "Got it: Vault Passphrase is Cobalt-99, primary DB is SQLite WAL, and the cluster node is worker-gpu-01."
           },
           {
             "turn": 3,
@@ -1416,7 +1416,7 @@
             "llmLatencyMs": 12581,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database decision is SQLite WAL. The current primary cluster node is spark-gpu-01, and 0 net grams of oats and honey were added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database decision is SQLite WAL. The current primary cluster node is worker-gpu-01, and 0 net grams of oats and honey were added."
           },
           {
             "turn": 20,
@@ -1430,7 +1430,7 @@
             "llmLatencyMs": 42705.3,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is spark-gpu-01, and 0 net grams of oats and honey were added on the kitc"
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is worker-gpu-01, and 0 net grams of oats and honey were added on the kitc"
           },
           {
             "turn": 25,
@@ -1458,7 +1458,7 @@
             "llmLatencyMs": 14169.8,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-spark-5090-cluster, with 150g of oats and 100g of honey added to "
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-worker-cluster, with 150g of oats and 100g of honey added to "
           },
           {
             "turn": 40,
@@ -1472,7 +1472,7 @@
             "llmLatencyMs": 13569.7,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database decision is SQLite WAL. The current primary cluster node is dual-spark-5090-cluster, and 200 grams of oats and 150 grams "
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database decision is SQLite WAL. The current primary cluster node is dual-worker-cluster, and 200 grams of oats and 150 grams "
           },
           {
             "turn": 47,
@@ -1486,7 +1486,7 @@
             "llmLatencyMs": 13800.1,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-spark-5090-cluster, and 0 net grams of oats and honey were added."
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-worker-cluster, and 0 net grams of oats and honey were added."
           },
           {
             "turn": 50,
@@ -1500,7 +1500,7 @@
             "llmLatencyMs": 43908.4,
             "recallPassed": false,
             "matchedCount": "3/5",
-            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-spark-5090-cluster, and 150 grams of oats and 100 grams of honey "
+            "replyPreview": "The Vault Passphrase is Cobalt-99 and the primary database is SQLite WAL. The current primary cluster node is dual-worker-cluster, and 150 grams of oats and 100 grams of honey "
           }
         ]
       }

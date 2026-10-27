@@ -1,0 +1,15 @@
+{
+  "version": "long-horizon-v2",
+  "files": {
+    "fixtures.ts": {
+      "sha256": "c260038c6455e0e0f916cb53716b5a9668892fb5ca2616134696f6623f71633a",
+      "bytes": 10097,
+      "lines": 70
+    },
+    "oracles.ts": {
+      "sha256": "5b071e32b748532d4566dff0109ad685c1a0d31971851e194aca7f0ab3b0eabe",
+      "bytes": 3618,
+      "lines": 41
+    }
+  }
+}

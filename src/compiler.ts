@@ -159,7 +159,11 @@ function decimalSubtract(a:string,b:string):string {
   if(!places)return result; const negative=result.startsWith('-'); if(negative)result=result.slice(1);
   result=result.padStart(places+1,'0');return (negative?'-':'')+result.slice(0,-places)+'.'+result.slice(-places);
 }
-/** Conservative versioned grammars. Unstructured prose stays extractive L0/L2. */
+// String-only normalization preserves exact integers beyond Number.MAX_SAFE_INTEGER.
+function normalizedDecimal(value:string):string {
+  return value.includes('.')?value.replace(/0+$/u,'').replace(/\.$/u,''):value;
+}
+/** Conservative versioned grammars. Unsupported prose stays extractive L0/L2. */
 export function extractAssertions(text:string): Parsed[] {
   const line=text.trim(); const out:Parsed[]=[];
   if(line.startsWith('{')) {
@@ -182,17 +186,38 @@ export function extractAssertions(text:string): Parsed[] {
     } else out.push({entity:'record',predicate:tag.replaceAll(' ','_'),object:body,polarity:tag==='negative fact'?-1:1,kind:'explicit'});
     return out;
   }
-  // A bare sequence of gram readings is a supported cumulative kitchen-scale grammar.
+  // Legacy comma lists stay supported. Prose requires an explicit cumulative/tare
+  // cue and an ordered empty/tare -> after-addition grammar; ordinary readings
+  // must never silently become subtraction claims.
   const scale=/^(?:cumulative(?: kitchen)?(?: scale)?|scale)\s*:\s*/i.test(line);
-  const readings=[...line.replace(/^(?:cumulative(?: kitchen)?(?: scale)?|scale)\s*:\s*/i,'').matchAll(/(?:^|,\s*)(\d+(?:\.\d+)?)\s*g\s+([^,]+)/g)];
+  type Reading = {value:string; unit:string; entity:string; reported:string};
+  let readings:Reading[]=[...line.replace(/^(?:cumulative(?: kitchen)?(?: scale)?|scale)\s*:\s*/i,'').matchAll(/(?:^|,\s*)(\d+(?:\.\d+)?)\s*g\s+([^,]+)/g)]
+    .map(r=>({value:r[1],unit:'g',entity:r[2].trim(),reported:r[0].replace(/^,\s*/, '')}));
+  if(readings.length<2) {
+    readings=[];
+    const colon=line.indexOf(':'), intro=colon>=0?line.slice(0,colon):line;
+    const explicitCue=/\b(?:not\s+tared|untared|cumulative(?:\s+(?:scale|readings))?|running\s+total|successive\s+readings)\b/iu.test(intro);
+    if(explicitCue) {
+      // Context names are lexical prefixes, not a closed list of benchmark names.
+      const context=colon<0?'':intro.replace(/\b(?:The|In|A|An|Cumulative|Scale|Successive|Readings|Running|Total|Balance|Vessel|Container)\b/giu,' ').match(/\b[\p{Lu}][\p{L}\p{N}_-]*\b/gu)?.join(' ')??'';
+      const body=(colon>=0?line.slice(colon+1):line.replace(/^.*?\b(?=(?:the\s+)?(?:empty|tare)\s+)/iu,'')).trim();
+      const steps=[...body.matchAll(/(?:^|[:,;]\s*|\band\s+)(?:and\s+)?(?:the\s+)?(?:(empty|tare)\s+|after\s+(?:adding\s+)?)([\p{L}][\p{L}\p{N}_ /-]*?)\s+(?:it\s+)?read\s+(\d+(?:\.\d+)?)\s*(kg|mg|ml|mL|oz|lb|g|L)\b/giu)];
+      if(steps.length>=2&&steps[0][1]&&steps.slice(1).every(r=>!r[1])&&steps.every(r=>r[4].toLowerCase()===steps[0][4].toLowerCase())) {
+        readings=steps.map(r=>{
+          const name=r[2].trim().replace(/^(?:the|a|an)\s+/iu,'');
+          return {value:r[3],unit:steps[0][4],entity:context&&!routingKey(name).includes(routingKey(context))?`${context} ${name}`:name,reported:r[0].trim()};
+        });
+      }
+    }
+  }
   if((scale||readings.length>=2)&&readings.length>=2) {
-    let previous='0';
+    let previous='0',previousTotalIndex:number|undefined;
     readings.forEach((r,index)=>{
       const totalIndex=out.length;
-      out.push({entity:r[2].trim(),predicate:'cumulative_mass',object:{value:r[1],unit:'g',reported:r[0].replace(/^,\s*/, '')},polarity:1,kind:'parsed_measurement',unit:'g'});
-      const net=decimalSubtract(r[1],previous);
-      if(!net.startsWith('-'))out.push({entity:r[2].trim(),predicate:'net_mass',object:{value:net,unit:'g'},polarity:1,kind:'derived_calculation',unit:'g',formula:{op:'subtract',left:r[1],right:previous,rounding:'exact_decimal',baseline:index===0?'zero_tare':null},operandIndexes:index===0?[totalIndex]:[totalIndex,totalIndex-2]});
-      previous=r[1];
+      out.push({entity:r.entity,predicate:'cumulative_mass',object:{value:r.value,unit:r.unit,reported:r.reported},polarity:1,kind:'parsed_measurement',unit:r.unit});
+      const net=decimalSubtract(r.value,previous);
+      if(!net.startsWith('-'))out.push({entity:r.entity,predicate:'net_mass',object:{value:net,unit:r.unit},polarity:1,kind:'derived_calculation',unit:r.unit,formula:{op:'subtract',left:r.value,right:previous,rounding:'exact_decimal',baseline:index===0?'zero_tare':null},operandIndexes:previousTotalIndex===undefined?[totalIndex]:[totalIndex,previousTotalIndex]});
+      previous=r.value;previousTotalIndex=totalIndex;
     });return out;
   }
   const measurement=/^([\p{L}\p{N}_ .\/-]+?)\s*:\s*(-?\d+(?:\.\d+)?)\s*(g|kg|mg|ml|mL|L|kcal|cal|cm|mm|m|bpm|%|ms|s|°C|°F)\s*$/u.exec(line);
@@ -236,8 +261,9 @@ export class ContextForgeCompiler {
             const val = String((parsed.object as Record<string, unknown>).value ?? '');
             const unit = String((parsed.object as Record<string, unknown>).unit ?? parsed.unit ?? '').trim();
             const fRec = parsed.formula && typeof parsed.formula === 'object' && !Array.isArray(parsed.formula) ? (parsed.formula as Record<string, unknown>) : null;
-            const calcStr = fRec && fRec.left && fRec.right ? ` (calculated: ${fRec.left} - ${fRec.right} = ${val}${unit ? ' ' + unit : ''})` : '';
-            formattedFactBody = `${parsed.entity} ${parsed.predicate} (net added amount) = ${val}${unit ? ' ' + unit : ''}${calcStr}`;
+            const clean = normalizedDecimal(val);
+            const calcStr = fRec && fRec.left && fRec.right ? `; calculated: ${fRec.left} - ${fRec.right} = ${clean}${unit ? ' ' + unit : ''}` : '';
+            formattedFactBody = `${parsed.entity} ${parsed.predicate} (net added amount) = ${clean} (unit: ${unit}; exact: ${val}${unit ? ' ' + unit : ''}${calcStr})`;
           } else if (parsed.kind === 'parsed_measurement' && parsed.object && typeof parsed.object === 'object' && !Array.isArray(parsed.object) && 'value' in parsed.object) {
             const val = String((parsed.object as Record<string, unknown>).value ?? '');
             const unit = String((parsed.object as Record<string, unknown>).unit ?? parsed.unit ?? '').trim();
@@ -257,7 +283,7 @@ export class ContextForgeCompiler {
         const body=(f.assertion_kind==='unresolved_candidate'?'Unresolved candidate: ':'')+String(f.body);
         const facets=extractRoutingFacets(body);
         factEntries.push({textKind:'derived',entryId:stableId('cf-wiki-fact-entry-v2',f.node_id,body),text:body,spanIds:provenance.map(p=>p.spanId),dependencyNodeIds:[String(f.node_id)],
-          entityKeys:unique([...facets.entityKeys,...(f.entity_key==='record'?[]:[routingKey(String(f.entity_key))])]),topicKeys:unique([...facets.topicKeys,routingKey(String(f.predicate))]),
+          entityKeys:unique([...facets.entityKeys,...(f.entity_key==='record'?[]:[routingKey(String(f.entity_key))])]),topicKeys:unique([...facets.topicKeys,routingKey(String(f.predicate)),...(['net_mass','cumulative_mass'].includes(String(f.predicate))?String(f.entity_key).split(/\s+/u).map(routingKey):[])]),
           facetKinds:unique([...facets.facetKinds,...(f.polarity===-1?['negative']:[]),...(['decision','constraint','concept'].includes(String(f.predicate))?[String(f.predicate)]:[])]),
           ordinal:collected.l2.find(e=>e.span_id===primary.spanId)?.ordinal??0,observedAt:Number(f.observed_at),sourceId:primary.sourceId,artifactId:primary.artifactId,trustClass:source.trustClass,
           fidelity:String(db.prepare('SELECT fidelity FROM artifacts WHERE artifact_id=?').get(primary.artifactId)!.fidelity),

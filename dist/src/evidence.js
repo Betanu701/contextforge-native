@@ -350,6 +350,29 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
             scoreFacetCoverage(recall, h.title + ' ' + h.body).matchedFacetIds.forEach((f)=>covered.add(f));
         }
     }
+    let rawCursor = raw.nextRowid ?? 0, rawPages = 0, continuedInspected = 0, continuedStatistics = 0;
+    while(raw.truncated && rawPages < 3 && Date.now() < deadlineAt && budget.inspected < budget.maxInspected && budget.bytes < budget.maxBytes){
+        const page = store.search(query, {
+            namespaceId,
+            layers: [
+                0
+            ],
+            limit: 128,
+            afterRowid: rawCursor,
+            deadlineAt,
+            budget,
+            maxInspected: 256
+        });
+        rawPages++;
+        continuedInspected += page.inspected ?? page.length;
+        continuedStatistics += page.statisticsInspected ?? 0;
+        if ((page.nextRowid ?? rawCursor) <= rawCursor) break;
+        rawCursor = page.nextRowid;
+        for (const h of page)if (!raw.some((r)=>r.chunkId === h.chunkId)) raw.push(h);
+        if (!page.truncated) break;
+    }
+    inspectedChunks += continuedInspected;
+    statisticsInspected = statisticsInspected + continuedStatistics;
     const nodes = Date.now() < deadlineAt ? store.search(query, {
         namespaceId,
         layers: [

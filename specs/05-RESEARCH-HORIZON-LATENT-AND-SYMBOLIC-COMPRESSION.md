@@ -1,9 +1,9 @@
 # Research Horizon: Computer-Native Prompt & Context Compression
 ## Symbolic DSLs, Pre-Compiled KV States, and Continuous Latent "Gist" Vectors (`inputs_embeds`)
 
-**Author**: Edith (`gemini-4-argon`) & Derek Thomas (`Betanu701`)  
-**Date**: October 26, 2026  
-**Target Repositories**: `Betanu701/ContextForge-Research` (`research/latent-context-compression/README.md`) & `specs/contextforge-v2/05-RESEARCH-HORIZON-LATENT-AND-SYMBOLIC-COMPRESSION.md`  
+**Author**: ContextForge contributors
+**Date**: October 26, 2026
+**Target Repositories**: the optional latent-compression research track & `specs/contextforge-v2/05-RESEARCH-HORIZON-LATENT-AND-SYMBOLIC-COMPRESSION.md`
 **Status**: Research Proposal & Feasibility Analysis
 
 ---
@@ -17,7 +17,7 @@ Can we convert system prompts and compiled context from human-readable English w
 To evaluate this rigorously, we separate **three distinct physical layers** of the LLM inference stack:
 1. **Above the BPE Tokenizer (Discrete Token IDs):** Symbolic / Code-Native DSLs vs. the "Binary/Hex Trap".
 2. **Inside the Attention Cache (Pre-Compiled KV States):** Binary KV-tensor state snapshots (`llama_state_seq_save_file`).
-3. **Below the Embedding Lookup (`inputs_embeds` / Layer 0):** Continuous Latent "Gist" Vectors (10x–40x sequence compression) and their connection to **Neural Knowledge Modules (NKM)**.
+3. **Below the Embedding Lookup (`inputs_embeds` / Layer 0):** Continuous Latent "Gist" Vectors (10x–40x sequence compression) and their connection to shared semantic representations.
 
 ---
 
@@ -68,9 +68,9 @@ Recent literature demonstrates that a small compressor/projector can pack **4,00
 - **xRAG** (Cheng et al.): Projects entire document embeddings into **a single continuous token** in the LLM's representation space via a lightweight MLP modality bridge (exact same mathematical structure as LLaVA vision tokens!).
 - **Activation Beacons / AutoCompressor** (Chevalier et al.): Compresses streaming context windows into recurrent latent summary vectors.
 
-### 4.2 Direct Synergy with Derek's Neural Knowledge Modules (`Betanu701/neural-knowledge-modules`)
-This latent context compression path directly intersects your **Neural Knowledge Modules (NKM) / Knowledge Genome** architecture:
-- In NKM, you separated a **model-independent semantic bus** from **tiny model-specific projection heads**.
+### 4.2 Model-Independent Representations and Projection Adapters
+This latent context compression path can separate shared representations from model-specific adapters:
+- Separate a **model-independent semantic bus** from **tiny model-specific projection heads**.
 - In ContextForge Latent Compression:
   1. ContextForge's SQLite `L1/L2` graph (or a small frozen encoder like a 100M–300M bidirectional encoder) produces a **model-agnostic semantic representation** of a memory branch or system-prompt module.
   2. A tiny **per-model MLP Projection Adapter** ($\sim 10\text{–}30\text{ MB}$, trained via self-supervised reconstruction / distillation—just like a vision projector in `llava` / `mmproj.gguf`!) maps those semantic vectors directly into the target model's Layer-0 `inputs_embeds` space.
@@ -88,7 +88,7 @@ Can we bypass the discrete tokenizer and inject continuous `inputs_embeds` or ra
 | **OpenAI / Anthropic / Google Public Serverless APIs** | ✅ **Yes** | ✅ Prefix caching (`prompt_cache_key` / `cache_control`) | ❌ **No** | Proprietary weights; exposing raw `inputs_embeds` is blocked both by their HTTP schema and because continuous embedding access allows model-inversion / safety-filter bypass attacks. |
 | **Microsoft Foundry — Serverless MaaS (Pay-per-token OpenAI / Cohere / Meta endpoints)** | ✅ **Yes** | ✅ Automatic prefix caching | ❌ **No** | Managed Serverless endpoints expose the standard OpenAI `/chat/completions` or `/responses` REST contract, which requires discrete text/image inputs. |
 | **Microsoft Foundry — Managed Compute / Custom Container / AKS (`vLLM` / `SGLang` / `Triton` / `HuggingFace` on Azure GPUs)** | ✅ **Yes** | ✅ **Full Control** (LMCache / KV-cache offloading / prefix pinning) | ✅ **YES!** (`prompt_embeds` in vLLM / HF pipeline) | When you deploy open-weight or custom models on **Foundry Managed Compute** (or Azure ML / AKS with `vLLM`), **you own the inference container**! `vLLM` natively supports passing `prompt_embeds` (raw PyTorch tensors) directly into `LLM.generate()` / OpenAI-compatible extensions! |
-| **Local / Self-Hosted (`llama.cpp` on Spark / Overwatch / Blue)** | ✅ **Yes** | ✅ **Full Control** (`/slots?action=save`) | ✅ **YES!** (`llama_batch.embd` / `--mmproj` pathway) | Full C++ access to `llama_decode` and `llama_batch.embd`, allowing direct injection of continuous `float32`/`float16` embedding vectors alongside normal text tokens. |
+| **Local / Self-Hosted (`llama.cpp` on configured local hosts)** | ✅ **Yes** | ✅ **Full Control** (`/slots?action=save`) | ✅ **YES!** (`llama_batch.embd` / `--mmproj` pathway) | Full C++ access to `llama_decode` and `llama_batch.embd`, allowing direct injection of continuous `float32`/`float16` embedding vectors alongside normal text tokens. |
 
 ---
 
@@ -97,8 +97,8 @@ Can we bypass the discrete tokenizer and inject continuous `inputs_embeds` or ra
 1. **Phase R1 — Deterministic Symbolic IR Compiler (Works Everywhere Today: Copilot, Foundry Serverless, Local):**
    - Build a dual-channel prompt compiler in ContextForge:
      - **Channel A (Persona & Tone):** Kept in natural English prose (~250 tokens) so the model's conversational warmth and emotional intelligence never sound robotic.
-     - **Channel B (Operational Rules, Tool Contracts & L1/L2 Memory Facts):** Compiled into a compact **Typed Symbolic IR** (`@rule`, compact tuple tables) and benchmarked head-to-head against verbose Markdown on both `Gemma 4 26B-A4B` and `gpt-6.1-sol` for token savings vs. instruction adherence.
+     - **Channel B (Operational Rules, Tool Contracts & L1/L2 Memory Facts):** Compiled into a compact **Typed Symbolic IR** (`@rule`, compact tuple tables) and benchmarked head-to-head against verbose Markdown on both `Gemma 4 26B-A4B` and `cloud-model-C` for token savings vs. instruction adherence.
 2. **Phase R2 — `llama.cpp` Binary KV-State Slot Persistence (Local Zero-Prefill):**
    - Wire ContextForge `epochs` to `llama-server`'s `/slots/0?action=save` and `?action=restore` endpoints so switching between conversations (e.g., Dev-Main $\leftrightarrow$ Health Journal) swaps pre-compiled binary KV states from disk in `< 1 second` instead of re-prefilling.
 3. **Phase R3 — Continuous Latent Memory Cartridges (`mmproj`-style `inputs_embeds` on Local & Foundry Managed Compute):**
-   - Train a lightweight **ContextForge Latent Projector** (connecting your `neural-knowledge-modules` architecture to `llama.cpp`'s `embd` / `vLLM`'s `prompt_embeds` interface) that compresses a 2,000-token L2 Wiki page into **32 continuous soft tokens**, measuring exact fact-recall fidelity vs. token compression ratio.
+   - Train a lightweight **ContextForge Latent Projector** (connecting a shared representation encoder to `llama.cpp`'s `embd` / `vLLM`'s `prompt_embeds` interface) that compresses a 2,000-token L2 Wiki page into **32 continuous soft tokens**, measuring exact fact-recall fidelity vs. token compression ratio.

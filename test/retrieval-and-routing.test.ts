@@ -74,7 +74,7 @@ test('R8 explicit representation binds only rendered artifacts and all selection
 
 test('R9 source trust and external snapshot fidelity remain visible in wire and receipt',()=>{const f=fixture();try{const s=f.store.ingestSource({originKey:'trust',text:'Zircon snapshot qualification.',kind:'external_snapshot',trustClass:'external_untrusted',metadata:{fidelity:'lossy'}});const p=plan(f.store,'Zircon snapshot');assert.match(text(p),/external_untrusted/);assert.match(text(p),/source_fidelity:lossy/);assert.equal(p.receipt.selections[0].trace?.sourceFidelity,'lossy');const t=f.store.ingestSource({originKey:'tool-trust',text:'Karth tool qualification.',kind:'tool_result',role:'tool'});const q=plan(f.store,'Karth tool qualification');assert.match(text(q),/tool_output/);assert.equal(q.receipt.selections[0].trace?.trustClass,'tool_output');}finally{f.clean();}});
 
-// Independent Astra recheck witnesses: do not weaken these to whole-window
+// Independent review recheck witnesses: do not weaken these to whole-window
 // equality, source-ID-only coverage, or the pre-compiler path.
 import { hydrateProvenanceSupport } from '../src/planner.ts';
 
@@ -252,3 +252,42 @@ test('R3 exact support span hydration can share the same deadline and byte budge
  assert.throws(()=>s.readEvidenceSpan(chunk.spanId,{budget}),/EvidenceReadBudgetExceeded/);
  assert.throws(()=>s.readEvidenceSpan(chunk.spanId,{maxBytes:1}),/EvidenceReadBudgetExceeded/);
 }));
+
+test('natural cumulative prose produces exact BigInt facts and original L0 hydration across entities and units',()=>{
+ for(const c of [
+  {name:'Orvi',intro:'The Orvi lab balance was not tared',unit:'g',a:'218.5',b:'643.75',c:'901.25',nets:['218.5','425.25','257.50']},
+  {name:'Kelvo',intro:'In Kelvo, the scale was untared',unit:'g',a:'218.5',b:'643.75',c:'901.25',nets:['218.5','425.25','257.50']},
+  {name:'Rulven',intro:'Rulven cumulative readings',unit:'ml',a:'10.00',b:'36.15',c:'50.20',nets:['10.00','26.15','14.05']},
+  {name:'Tavren',intro:'Tavren running total',unit:'kg',a:'9007199254740993.00',b:'9007199254741019.15',c:'9007199254741041.15',nets:['9007199254740993.00','26.15','22.00']},
+  ...['mg','mL','L','oz','lb'].map((unit,i)=>({name:'Unitlab'+i,intro:'Unitlab'+i+' successive readings',unit,a:'1.00',b:'2.25',c:'3.50',nets:['1.00','1.25','1.25']}))
+ ]){const f=fixture();try{
+  const quote=`${c.intro}: the empty vessel read ${c.a} ${c.unit}, after adding resin it read ${c.b} ${c.unit}, and after solvent read ${c.c} ${c.unit}`;
+  const source=f.store.ingestSource({originKey:'natural-scale',text:quote,role:'user'});const compiler=new ContextForgeCompiler(f.store);compiler.compile();
+  const rows=f.store.db.prepare("SELECT f.*,n.body,n.canonical_json,e.display_name FROM facts f JOIN derived_nodes n USING(node_id) JOIN entities e USING(entity_id) WHERE f.predicate='net_mass' ORDER BY e.display_name").all();
+  assert.equal(rows.length,3,c.name);for(const [name,index] of [['vessel',0],['resin',1],['solvent',2]] as const){const row=rows.find(r=>r.display_name===`${c.name} ${name}`)!;assert.ok(row,`${c.name} ${name}`);assert.deepEqual(JSON.parse(String(row.object_json)),{value:c.nets[index],unit:c.unit});assert.equal(row.assertion_kind,'derived_calculation');assert.equal(JSON.parse(String(row.canonical_json)).formula.rounding,'exact_decimal');assert.ok(f.store.getProvenance(String(row.node_id)).some(p=>p.sourceId===source.sourceId));}
+  for(const name of ['resin','solvent']){const result=plan(f.store,`${c.name} ${name} net added amount`),wire=text(result);assert.ok(wire.includes(quote),c.name+' missing original quote');assert.ok(wire.includes(`${c.name} ${name} net_mass`),c.name+' missing derived calculation');assert.ok(result.receipt.selections.some(s=>s.sourceId===source.sourceId));}
+  if(c.name==='Tavren'){const wire=text(plan(f.store,'Tavren solvent net added amount'));assert.match(wire,/= 22 \(unit: kg; exact: 22\.00 kg;/);}
+  if(c.name==='Orvi'){const wire=text(plan(f.store,'Orvi resin solvent net added amount'));assert.match(wire,/= 257\.5 \(unit: g; exact: 257\.50 g; calculated: 901\.25 - 643\.75 = 257\.5 g\)/);assert.match(wire,/= 425\.25 \(unit: g;/);}
+  assert.equal(compiler.lintWiki().provenanceGaps,0);
+ }finally{f.clean();}}
+});
+
+test('prose scale grammar rejects missing cues, mixed units and missing ordered tare; legacy lists retain exact values',()=>{
+ const f=fixture();try{
+  for(const [i,text] of [
+   'A scale: the empty vessel read 10 g, after resin it read 30 g',
+   'The scale was untared: empty vessel read 10 g, after resin read 30 kg',
+   'Cumulative readings: after resin read 10 g, after solvent read 30 g'
+  ].entries())f.store.ingestSource({originKey:'invalid'+i,text});
+  new ContextForgeCompiler(f.store).compile();assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM facts WHERE predicate='net_mass'").get()!.n,0);
+  f.store.ingestSource({originKey:'legacy',text:'Cumulative kitchen scale: 104g bowl, 130g cheese, 152g sour cream'});new ContextForgeCompiler(f.store).compile();assert.deepEqual(f.store.db.prepare("SELECT object_json FROM facts WHERE predicate='net_mass' ORDER BY CAST(json_extract(object_json,'$.value') AS REAL)").all().map(r=>JSON.parse(String(r.object_json)).value),['22','26','104']);
+  f.store.ingestSource({originKey:'legacy-decimal',text:'scale: 10g cup, 36.15g oil'});new ContextForgeCompiler(f.store).compile();assert.ok(f.store.db.prepare("SELECT object_json FROM facts WHERE predicate='net_mass'").all().some(r=>JSON.parse(String(r.object_json)).value==='26.15'));
+ }finally{f.clean();}
+});
+
+test('opaque normalized protocol JSON cannot crowd out decoded original causal premises',()=>{const f=fixture();try{
+ for(let i=0;i<40;i++)f.store.commitTurn({sessionId:'noise',advancementKey:String(i),messages:[{role:'user',id:'n'+i,content:'padding '.repeat(400)+'Juniper runtime investigation'},{role:'assistant',content:'Recorded'}]});
+ const result=f.store.ingestSource({originKey:'diagram',role:'user',text:'Juniper deployment diagram connects public gateway to process listener.'});
+ new ContextForgeCompiler(f.store).compile();const p=plan(f.store,'Juniper deployment diagram process listener');assert.ok(text(p).includes('Juniper deployment diagram connects public gateway to process listener.'));assert.ok(p.receipt.selections.some(s=>s.sourceId===result.sourceId));
+ for(const hit of f.store.search('Juniper',{layers:[0],limit:256})){const artifact=f.store.db.prepare('SELECT kind FROM artifacts WHERE artifact_id=?').get(hit.artifactId);assert.notEqual(artifact?.kind,'normalized_message');}
+ }finally{f.clean();}});

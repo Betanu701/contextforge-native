@@ -1,11 +1,11 @@
 # ContextForge v2 Native Engine (`contextforge-native`)
 ## 01 — Architecture Decision Review, OpenClaw Interception Contract & System Overview
 
-**Authors**: Edith (`gemini-4-argon`) & Astra (`gpt-6-astra`)  
-**Date**: October 25, 2026  
-**Status**: Complete Design & Specification Kit (Awaiting Derek's Review)  
-**Target Location**: `/home/node/.openclaw/workspace/extensions/contextforge-native`  
-**Native Database**: `/home/node/.openclaw/state/contextforge.sqlite` (via built-in Node v24 `node:sqlite`)
+**Authors**: ContextForge contributors
+**Date**: October 25, 2026
+**Status**: Complete Design & Specification Kit (Awaiting the owner's Review)
+**Target Location**: `<workspace>/extensions/contextforge-native`
+**Native Database**: `~/.openclaw/state/contextforge.sqlite` (via built-in Node v24 `node:sqlite`)
 
 ---
 
@@ -38,17 +38,17 @@ That legacy design breaks down in two ways:
 
 ## 2. Decision Chronology & Recovered Architectural Lineage
 
-Per the Architecture Decision Review protocol, we audited prior ContextForge, Atlas, and Prometheus records to ensure every proven invariant is preserved and every superseded bottleneck is retired:
+Per the Architecture Decision Review protocol, we audited prior ContextForge and predecessor context-engine records to ensure every proven invariant is preserved and every superseded bottleneck is retired:
 
 | Date | Source / Repository | Decision / Finding | Status in ContextForge v2 |
 | :--- | :--- | :--- | :--- |
-| **2026-04-08** | Session `358ab868` (`second-brain-interests`) | User requested a ContextForge-style solution to maintain coherent context over long sessions without losing facts. | **Core Requirement** — realized via `contextEngine.assemble()`. |
+| **2026-04-08** | Early memory requirements review | User requested a ContextForge-style solution to maintain coherent context over long sessions without losing facts. | **Core Requirement** — realized via `contextEngine.assemble()`. |
 | **2026-05-01 & 2026-06-20** | `Betanu701/ContextForge` (`docs/wiki_memory.md`, `docs/methodology.md`) | **Raw sources (`L0`) remain authoritative.** Compiled wiki pages (`L2`) are derived routing/compression indexes that must carry explicit `Source: <id>` citations so the loader can pull raw evidence when needed. | **Preserved & Enforced** — `sources` / `artifacts` (`L0`) vs `facts` (`L1`) and `derived_nodes` (`L2`) with foreign-key `provenance` links. |
 | **2026-06-20** | `Betanu701/ContextForge` (`ProactiveLoader.load_wiki`) | **Staged Budget Expansion:** Spend budget in stages (25% -> 50% -> 75% -> 100%) only when evidence density/query complexity requires it, splitting budget between compiled wiki routing and raw source evidence. | **Extended** — generalized into the **Elastic Demand-Driven Planner** (scaling from 2k conversational turns up to 100k+ Heavy RAG / Multimodal). |
-| **2026-08-25 & 2026-09-13** | Session `0e55b335` & `0b1d4e12` (`C1 Compaction`) | **Separate Active-Model Projection from Archive Storage:** Active model context should shrink/stay bounded as knowledge is factorized into structured state, while raw turns/spans remain in cold/archive SQLite storage without petabyte duplication. | **Preserved** — `sources`, `artifacts`, and `blobs` hold full raw turns/documents in SQLite/CAS; `assemble()` projects only the active semantic state + verbatim tail. |
+| **2026-08-25 & 2026-09-13** | Compaction architecture reviews | **Separate Active-Model Projection from Archive Storage:** Active model context should shrink/stay bounded as knowledge is factorized into structured state, while raw turns/spans remain in cold/archive SQLite storage without petabyte duplication. | **Preserved** — `sources`, `artifacts`, and `blobs` hold full raw turns/documents in SQLite/CAS; `assemble()` projects only the active semantic state + verbatim tail. |
 | **2026-09-02** | `Betanu701/openclaw-contextforge` (`24ca1487651a`) | **Planner Ownership Reversal:** *"OpenClaw provides the envelope; ContextForge owns selection, promotion, compaction, and exclusion"* (`recallMaxTokens`, `allowedCategories`, `blockedCategories`, `minScore`, `maxSourceTokens`, planner receipts). | **Preserved & Upgraded** — ContextForge owns the entire `AssembleResult` and emits a structured `ContextForgePlanReceipt` every turn. |
 | **2026-09-02** | `Betanu701/openclaw-contextforge` (Python HTTP sidecar + `kind: "memory"`) | Used an external Python HTTP sidecar (`localhost:8765`) and registered in `plugins.slots.memory`, which displaced `memory-core` and could only prepend text via `before_prompt_build` rather than replacing the transcript stack. | **Superseded** — Replaced by in-process TypeScript + `node:sqlite` registered in `plugins.slots.contextEngine`, keeping `memory-core` alive and eliminating the Python HTTP sidecar. |
-| **2026-10-25** | Current Session (`44344a56`) | **New Requirements from Derek:** (1) Start fresh for the cleanest architecture; (2) Control the actual context layer + 22k system prompt so we never have to compact again; (3) Store natively in SQLite inside OpenClaw; (4) **No hard cap on context length**—scale to 100k+ for heavy RAG, documents, images, audio, and video. | **Canonical Spec v2** (this Spec Kit). |
+| **2026-10-25** | Native engine requirements review | **New Requirements from the owner:** (1) Start fresh for the cleanest architecture; (2) Control the actual context layer + 22k system prompt so we never have to compact again; (3) Store natively in SQLite inside OpenClaw; (4) **No hard cap on context length**—scale to 100k+ for heavy RAG, documents, images, audio, and video. | **Canonical Spec v2** (this Spec Kit). |
 
 ---
 
@@ -65,7 +65,7 @@ flowchart TB
     subgraph OpenClaw_Gateway ["OpenClaw Gateway Process (Node v24.21.0)"]
         direction TB
         UserReq["Incoming Turn (Text / Image / Audio / Video / PDF / RAG)"]
-        
+
         subgraph HookLayer ["1. Prompt & Tool Surface Controller (before_prompt_build)"]
             BPB["ContextForge Prompt Slimmer & Cache Locker"]
             SysOverride["systemPrompt Override (Stable Prefix + L3 Permanent Context)"]
@@ -127,7 +127,7 @@ ContextForge determines its prompt/tool budget purely from the **discovered `Cap
 #### B. Intercepting the Conversation History (`contextEngine.assemble`)
 When OpenClaw calls `contextEngine.assemble(params)`, ContextForge receives:
 - `messages`: The full session transcript snapshot.
-- `tokenBudget`: The model's available input token budget (e.g., `32,768` or `65,536` on local `llama.cpp`; `922,000+` on `gpt-6.1-sol` / `gpt-6-astra` / `gemini-4-argon`).
+- `tokenBudget`: The model's available input token budget (e.g., `32,768` or `65,536` on local `llama.cpp`; `922,000+` on `cloud-model-C` / `cloud-model-B` / `cloud-model-A`).
 - `model` & `runtimeSettings`: Exact provider, model ID, family, and limits.
 
 Instead of returning all 2,500 historical messages, `assemble()` returns a **curated, prefix-cache-aligned `messages` array**:
@@ -149,7 +149,7 @@ Because `info.ownsCompaction = true`:
 
 ## 4. Complete Spec Kit Index
 
-This Spec Kit is organized into four modular documents in `/home/node/.openclaw/workspace/specs/contextforge-v2/`:
+This Spec Kit is organized into four modular documents in `specs/`:
 
 1. **`01-ARCHITECTURE-AND-INTERCEPTION-SPEC.md`** *(This document)*:
    - Executive summary, recovered decision chronology, OpenClaw `contextEngine` + `before_prompt_build` interception architecture, and system prompt modes.
@@ -158,4 +158,4 @@ This Spec Kit is organized into four modular documents in `/home/node/.openclaw/
 3. **`03-ELASTIC-CONTEXT-PLANNER-AND-KV-CACHE.md`**:
    - Demand-driven Elastic Planner (scaling from 1.5k conversational turns to 100k–900k+ Heavy RAG/Multimodal with no hard cap), Staged Budget Expansion, KV-Cache Prefix Locking (`Epoch` architecture), and `ContextForgePlanReceipt` schemas.
 4. **`04-TOOLS-MIGRATION-AND-IMPLEMENTATION-PLAN.md`**:
-   - Agent tool contracts (`cf_recall`, `cf_remember`, `cf_permanent`, `cf_ingest`, `cf_wiki_lint`, `cf_status`), Health Journal & global workspace migration plan, verification benchmark suite, and parallel build milestones for Edith + `gpt-6-astra`.
+   - Agent tool contracts (`cf_recall`, `cf_remember`, `cf_permanent`, `cf_ingest`, `cf_wiki_lint`, `cf_status`), Health Journal & global workspace migration plan, verification benchmark suite, and parallel build milestones for implementation team + `cloud-model-B`.

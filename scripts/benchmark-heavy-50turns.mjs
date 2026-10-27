@@ -10,7 +10,7 @@ import {
 } from "../dist/index.js";
 import { estimateTokens } from "../dist/src/symbolic-ir.js";
 
-const LLAMA_BASE = "http://host.docker.internal:18080/v1";
+const LLAMA_BASE = process.env.CONTEXTFORGE_API_BASE ?? "http://127.0.0.1:8080/v1";
 
 const MODELS = [
   {
@@ -58,7 +58,7 @@ function buildHeavyScenario(turnIndex) {
     return {
       kind: "fact_plant",
       prompt:
-        "Fact: Vault Passphrase is Cobalt-99.\nDecision: Primary DB is SQLite WAL.\nState: Cluster Node | primary = spark-gpu-01\nAcknowledge in 1 short sentence.",
+        "Fact: Vault Passphrase is Cobalt-99.\nDecision: Primary DB is SQLite WAL.\nState: Cluster Node | primary = worker-gpu-01\nAcknowledge in 1 short sentence.",
     };
   }
   if (turnIndex === 3) {
@@ -72,12 +72,12 @@ function buildHeavyScenario(turnIndex) {
     return {
       kind: "state_supersede",
       prompt:
-        "State: Cluster Node | primary = dual-spark-5090-cluster\nAcknowledge the updated cluster node state in 1 short sentence.",
+        "State: Cluster Node | primary = dual-worker-cluster\nAcknowledge the updated cluster node state in 1 short sentence.",
     };
   }
   // Checkpoints on Turn 10, 20, 30, 40, 47 (explicitly requested by Derek!), and 50
   if (turnIndex === 47 || [10, 20, 30, 40, 50].includes(turnIndex)) {
-    const expectedNode = turnIndex > 25 ? "dual-spark-5090-cluster" : "spark-gpu-01";
+    const expectedNode = turnIndex > 25 ? "dual-worker-cluster" : "worker-gpu-01";
     return {
       kind: "analytical_recall",
       prompt: `Turn ${turnIndex} audit: From our earlier turns (including Turn 1 and Turn 3), answer concisely in 2 sentences: (1) What is the Vault Passphrase and Primary DB Decision? (2) What is the current primary Cluster Node, and how many net grams of oats and honey were added on the kitchen scale?`,
@@ -507,7 +507,7 @@ async function main() {
   const rawSystemPrompt = loadWorkspaceSystemPrompt();
   const results = [];
   const outPath =
-    "/home/node/.openclaw/workspace/extensions/contextforge-native/benchmark-heavy-50turns-results.json";
+    "benchmark-heavy-50turns-results.json";
   for (const m of MODELS) {
     const res = await runHeavyModelBenchmark(m, rawSystemPrompt);
     results.push(res);
