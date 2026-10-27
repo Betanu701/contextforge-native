@@ -1,0 +1,15 @@
+{
+  "version": "deep-research-100turns-v1",
+  "files": {
+    "fixtures.ts": {
+      "sha256": "696e9451679815c42f9d22e15cf9bbea28f7c6ec037bf94a6d434cc98005b536",
+      "bytes": 27613,
+      "lines": 168
+    },
+    "oracles.ts": {
+      "sha256": "0f870bb8cccc5ad28b45dbe619951ef37e69fccacded91470f2e9d81a70c3476",
+      "bytes": 4618,
+      "lines": 67
+    }
+  }
+}
