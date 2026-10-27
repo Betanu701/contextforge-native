@@ -517,13 +517,16 @@ export function createContextForgeEngine(options: ContextForgePluginOptions = {}
             : "";
 
       // Ensure any unindexed historical messages passed in `params.messages` are committed
-      // Group each user-initiated turn slice into its own logical turn so earlier turns stay optional
-      if (normalizedMessages.length > 0) {
+      // Only perform initial historical bootstrap sync if the session has zero prior occurrences.
+      // Once bootstrapped, OpenClaw's durable turn outbox (`commitTurn`) is the sole writer for
+      // closed turns so in-flight steps never collide with `commitTurn`.
+      const existingOccurrences = store.occurrenceCount(sessionId);
+      if (existingOccurrences === 0 && normalizedMessages.length > 0) {
         let turnIndex = 0;
         let currentTurn: AcceptedMessage[] = [];
         const flushSlice = (slice: AcceptedMessage[], tIdx: number) => {
           if (slice.length === 0) return;
-          const syncKey = `turn-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m) => m.id ?? m.role))).slice(0, 12)}`;
+          const syncKey = `bootstrap-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m) => m.id ?? m.role))).slice(0, 12)}`;
           try {
             store.commitTurn({
               sessionId,
@@ -608,7 +611,7 @@ export function createContextForgeEngine(options: ContextForgePluginOptions = {}
         additionSections.length > 0 ? additionSections.join("\n\n") : undefined;
 
       return {
-        messages: plan.messages,
+        messages: plan.messages.filter((m) => m.role !== "system" && m.role !== "developer"),
         estimatedTokens: plan.estimatedTokens,
         promptAuthority: "assembled" as const,
         ...(systemPromptAddition ? { systemPromptAddition } : {}),

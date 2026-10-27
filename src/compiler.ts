@@ -60,7 +60,7 @@ export class ContextForgeCompiler {
     this.store.assertNamespace(namespaceId,'write');
     return this.store.transaction(() => {
       const db=this.store.db;
-      const evidence=db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,c.span_id,c.body,a.fidelity FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' ORDER BY s.observed_at,s.source_id,c.ordinal,c.chunk_id`).all(namespaceId) as Evidence[];
+      const evidence=db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,c.span_id,c.body,a.fidelity FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' AND s.kind<>'tool_result' ORDER BY s.observed_at,s.source_id,c.ordinal,c.chunk_id`).all(namespaceId) as Evidence[];
       const sourceIds=[...new Set(evidence.map(e=>e.source_id))].sort();
       const made:DerivedNodeRecord[]=[];
       for(const e of evidence) {
@@ -80,14 +80,27 @@ export class ContextForgeCompiler {
             key=`historical-state/${e.span_id}/${index}`;
           }
           const operands=(parsed.operandIndexes??[]).map(i=>extracted[i]).filter(Boolean);
-          const node=this.store.publishNode({namespaceId,layer:1,logicalKey:key,kind:parsed.predicate,title:`${parsed.entity}: ${parsed.predicate}`,body:e.body.trim(),canonical:{entity:parsed.entity,predicate:parsed.predicate,object:parsed.object,polarity:parsed.polarity,assertionKind:kind,formula:parsed.formula??null,inputFactIds:operands,authority:e.trust_class},compilerVersion:COMPILER_VERSION,observedAt:e.observed_at,spanIds:[e.span_id],dependencyNodeIds:operands,extractionRule:'controlled-grammar-v1'});
+          let formattedFactBody = e.body.trim();
+          if (parsed.kind === 'derived_calculation' && parsed.object && typeof parsed.object === 'object' && !Array.isArray(parsed.object) && 'value' in parsed.object) {
+            const val = String((parsed.object as Record<string, unknown>).value ?? '');
+            const unit = String((parsed.object as Record<string, unknown>).unit ?? parsed.unit ?? '').trim();
+            const fRec = parsed.formula && typeof parsed.formula === 'object' && !Array.isArray(parsed.formula) ? (parsed.formula as Record<string, unknown>) : null;
+            const calcStr = fRec && fRec.left && fRec.right ? ` (calculated: ${fRec.left} - ${fRec.right} = ${val}${unit ? ' ' + unit : ''})` : '';
+            formattedFactBody = `${parsed.entity} ${parsed.predicate} (net added amount) = ${val}${unit ? ' ' + unit : ''}${calcStr}`;
+          } else if (parsed.kind === 'parsed_measurement' && parsed.object && typeof parsed.object === 'object' && !Array.isArray(parsed.object) && 'value' in parsed.object) {
+            const val = String((parsed.object as Record<string, unknown>).value ?? '');
+            const unit = String((parsed.object as Record<string, unknown>).unit ?? parsed.unit ?? '').trim();
+            formattedFactBody = `${parsed.entity} ${parsed.predicate} = ${val}${unit ? ' ' + unit : ''}`;
+          }
+          const node=this.store.publishNode({namespaceId,layer:1,logicalKey:key,kind:parsed.predicate,title:`${parsed.entity}: ${parsed.predicate}`,body:formattedFactBody,canonical:{entity:parsed.entity,predicate:parsed.predicate,object:parsed.object,polarity:parsed.polarity,assertionKind:kind,formula:parsed.formula??null,inputFactIds:operands,authority:e.trust_class},compilerVersion:COMPILER_VERSION,observedAt:e.observed_at,spanIds:[e.span_id],dependencyNodeIds:operands,extractionRule:'controlled-grammar-v1'});
           db.prepare('INSERT OR IGNORE INTO facts VALUES(?,?,?,?,?,?,?,?,?,?)').run(node.nodeId,entityId,parsed.predicate,canonicalJson(parsed.object),parsed.polarity,kind,parsed.unit??null,parsed.stateKey??null,e.trust_class,kind==='unresolved_candidate'?null:1);
           extracted.push(node.nodeId); made.push(node);
         });
       }
       const facts=db.prepare(`SELECT n.*,f.entity_id,f.predicate,f.polarity,f.assertion_kind,e.display_name,e.entity_key FROM derived_nodes n JOIN facts f USING(node_id) LEFT JOIN entities e USING(entity_id) WHERE n.namespace_id=? AND n.status='active' ORDER BY n.observed_at,n.node_id`).all(namespaceId);
       const pages=new Map<string,{title:string;lines:Map<string,string>;spans:Set<string>;deps:Set<string>;observed:number}>();
-      const add=(key:string,title:string,body:string,spanIds:string[],deps:string[],observed:number)=>{
+      const add=(key:string,title:string,rawBody:string,spanIds:string[],deps:string[],observed:number)=>{
+        const body=rawBody.replace(/\[span:([a-f0-9]{64})\]/g,'[ref-span:$1]');
         let page=pages.get(key);if(!page){page={title,lines:new Map(),spans:new Set(),deps:new Set(),observed};pages.set(key,page);}
         const citation=spanIds.map(s=>`[span:${s}]`).join(' '); page.lines.set(stableId('cf-wiki-line-v1',body,spanIds),`${body} ${citation}`);
         spanIds.forEach(s=>page!.spans.add(s));deps.forEach(s=>page!.deps.add(s));page.observed=Math.max(page.observed,observed);
@@ -127,13 +140,19 @@ export class ContextForgeCompiler {
   lintWiki(namespaceId=this.store.namespaceId):WikiLintResult {
     this.store.assertNamespace(namespaceId);const issues:WikiLintResult['issues']=[];
     const nodes=this.store.db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND status='active'").all(namespaceId);
+    const blobCache=new Map<string,Buffer>();
     for(const node of nodes) {
       const provenance=this.store.getProvenance(node.node_id as string);
       if(!provenance.length)issues.push({nodeId:node.node_id as string,code:'missing_provenance'});
       for(const p of provenance) {
         const row=this.store.db.prepare('SELECT s.namespace_id,l.status,a.blob_sha256,sp.quote_sha256 FROM spans sp JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) JOIN artifacts a USING(artifact_id) WHERE sp.span_id=?').get(p.spanId)!;
         if(row.namespace_id!==namespaceId||row.status!=='active')issues.push({nodeId:node.node_id as string,code:'invalid_source'});
-        try { const bytes=this.store.readBlob(row.blob_sha256 as string); if(p.byteStart!==null&&sha256(bytes.subarray(p.byteStart,p.byteEnd!))!==row.quote_sha256)throw new Error(); }
+        try {
+          const sha=row.blob_sha256 as string;
+          let bytes=blobCache.get(sha);
+          if(!bytes){bytes=this.store.readBlob(sha);blobCache.set(sha,bytes);}
+          if(p.byteStart!==null&&sha256(bytes.subarray(p.byteStart,p.byteEnd!))!==row.quote_sha256)throw new Error();
+        }
         catch {issues.push({nodeId:node.node_id as string,code:'quote_hash_mismatch'});}
       }
       if(node.layer===2)for(const match of String(node.body).matchAll(/\[span:([a-f0-9]{64})\]/g))if(!provenance.some(p=>p.spanId===match[1]))issues.push({nodeId:node.node_id as string,code:'unlinked_citation'});

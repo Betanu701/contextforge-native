@@ -207,6 +207,33 @@ test("End-to-end cf_* tools and engine.assemble() lifecycle", async () => {
   });
   assert.match(statusRes.content[0].text, /Latest Plan Receipt/);
 
+  // 8. Verify Turn 89 recall from Turn 1 & Turn 4 after 84 noisy turns, with 1 stable Epoch
+  for (let t = 2; t <= 88; t++) {
+    await engine.commitTurn({
+      sessionId: "sess-e2e-1",
+      advancementKey: `turn-${t}`,
+      messages: [
+        { id: `u-${t}`, role: "user", content: `[Turn ${t}] Routine status check.` },
+        { id: `a-${t}`, role: "assistant", content: "Status nominal. " + "metric=ok ".repeat(30) },
+      ],
+    });
+  }
+  const assembled89 = await engine.assemble({
+    sessionId: "sess-e2e-1",
+    messages: [],
+    tokenBudget: 32768,
+    availableTools: new Set(["read", "write", "cf_recall", "cf_remember"]),
+    model: "llamacpp/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+    prompt: "From our earlier turns, how many net grams of cheese and sour cream were added on the lunch scale, and what was our arch-spec.md decision?",
+  });
+  const text89 = JSON.stringify(assembled89.messages);
+  assert.match(text89, /26 g/);
+  assert.match(text89, /22 g/);
+  assert.match(text89, /node:sqlite in WAL mode/);
+  assert.ok(assembled89.messages.every((m: any) => m.role !== "system" && m.role !== "developer"));
+  const epochCount = engine.store.db.prepare("SELECT COUNT(*) AS c FROM epochs WHERE session_id=?").get("sess-e2e-1")!.c;
+  assert.equal(epochCount, 1);
+
   engine.dispose();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });

@@ -341,12 +341,13 @@ export function createContextForgeEngine(options = {}) {
             const rawMessages = Array.isArray(params.messages) ? params.messages : [];
             const normalizedMessages = rawMessages.map((m, idx)=>normalizeHostMessage(m, `hist:${sessionId}:${idx}`, store, sessionId));
             const latestText = typeof params.prompt === "string" && params.prompt.trim() ? params.prompt.trim() : normalizedMessages.length > 0 ? extractTextFromMessage(normalizedMessages[normalizedMessages.length - 1]) : "";
-            if (normalizedMessages.length > 0) {
+            const existingOccurrences = store.occurrenceCount(sessionId);
+            if (existingOccurrences === 0 && normalizedMessages.length > 0) {
                 let turnIndex = 0;
                 let currentTurn = [];
                 const flushSlice = (slice, tIdx)=>{
                     if (slice.length === 0) return;
-                    const syncKey = `turn-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m)=>m.id ?? m.role))).slice(0, 12)}`;
+                    const syncKey = `bootstrap-sync:${sessionId}:t${tIdx}:${sha256(JSON.stringify(slice.map((m)=>m.id ?? m.role))).slice(0, 12)}`;
                     try {
                         store.commitTurn({
                             sessionId,
@@ -424,7 +425,7 @@ export function createContextForgeEngine(options = {}) {
             }
             const systemPromptAddition = additionSections.length > 0 ? additionSections.join("\n\n") : undefined;
             return {
-                messages: plan.messages,
+                messages: plan.messages.filter((m)=>m.role !== "system" && m.role !== "developer"),
                 estimatedTokens: plan.estimatedTokens,
                 promptAuthority: "assembled",
                 ...systemPromptAddition ? {

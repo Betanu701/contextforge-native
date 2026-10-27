@@ -134,7 +134,7 @@ export class ContextForgeCompiler {
         this.store.assertNamespace(namespaceId, 'write');
         return this.store.transaction(()=>{
             const db = this.store.db;
-            const evidence = db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,c.span_id,c.body,a.fidelity FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' ORDER BY s.observed_at,s.source_id,c.ordinal,c.chunk_id`).all(namespaceId);
+            const evidence = db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,c.span_id,c.body,a.fidelity FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' AND s.kind<>'tool_result' ORDER BY s.observed_at,s.source_id,c.ordinal,c.chunk_id`).all(namespaceId);
             const sourceIds = [
                 ...new Set(evidence.map((e)=>e.source_id))
             ].sort();
@@ -164,13 +164,25 @@ export class ContextForgeCompiler {
                         key = `historical-state/${e.span_id}/${index}`;
                     }
                     const operands = (parsed.operandIndexes ?? []).map((i)=>extracted[i]).filter(Boolean);
+                    let formattedFactBody = e.body.trim();
+                    if (parsed.kind === 'derived_calculation' && parsed.object && typeof parsed.object === 'object' && !Array.isArray(parsed.object) && 'value' in parsed.object) {
+                        const val = String(parsed.object.value ?? '');
+                        const unit = String(parsed.object.unit ?? parsed.unit ?? '').trim();
+                        const fRec = parsed.formula && typeof parsed.formula === 'object' && !Array.isArray(parsed.formula) ? parsed.formula : null;
+                        const calcStr = fRec && fRec.left && fRec.right ? ` (calculated: ${fRec.left} - ${fRec.right} = ${val}${unit ? ' ' + unit : ''})` : '';
+                        formattedFactBody = `${parsed.entity} ${parsed.predicate} (net added amount) = ${val}${unit ? ' ' + unit : ''}${calcStr}`;
+                    } else if (parsed.kind === 'parsed_measurement' && parsed.object && typeof parsed.object === 'object' && !Array.isArray(parsed.object) && 'value' in parsed.object) {
+                        const val = String(parsed.object.value ?? '');
+                        const unit = String(parsed.object.unit ?? parsed.unit ?? '').trim();
+                        formattedFactBody = `${parsed.entity} ${parsed.predicate} = ${val}${unit ? ' ' + unit : ''}`;
+                    }
                     const node = this.store.publishNode({
                         namespaceId,
                         layer: 1,
                         logicalKey: key,
                         kind: parsed.predicate,
                         title: `${parsed.entity}: ${parsed.predicate}`,
-                        body: e.body.trim(),
+                        body: formattedFactBody,
                         canonical: {
                             entity: parsed.entity,
                             predicate: parsed.predicate,
@@ -196,7 +208,8 @@ export class ContextForgeCompiler {
             }
             const facts = db.prepare(`SELECT n.*,f.entity_id,f.predicate,f.polarity,f.assertion_kind,e.display_name,e.entity_key FROM derived_nodes n JOIN facts f USING(node_id) LEFT JOIN entities e USING(entity_id) WHERE n.namespace_id=? AND n.status='active' ORDER BY n.observed_at,n.node_id`).all(namespaceId);
             const pages = new Map();
-            const add = (key, title, body, spanIds, deps, observed)=>{
+            const add = (key, title, rawBody, spanIds, deps, observed)=>{
+                const body = rawBody.replace(/\[span:([a-f0-9]{64})\]/g, '[ref-span:$1]');
                 let page = pages.get(key);
                 if (!page) {
                     page = {
@@ -314,6 +327,7 @@ export class ContextForgeCompiler {
         this.store.assertNamespace(namespaceId);
         const issues = [];
         const nodes = this.store.db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND status='active'").all(namespaceId);
+        const blobCache = new Map();
         for (const node of nodes){
             const provenance = this.store.getProvenance(node.node_id);
             if (!provenance.length) issues.push({
@@ -327,7 +341,12 @@ export class ContextForgeCompiler {
                     code: 'invalid_source'
                 });
                 try {
-                    const bytes = this.store.readBlob(row.blob_sha256);
+                    const sha = row.blob_sha256;
+                    let bytes = blobCache.get(sha);
+                    if (!bytes) {
+                        bytes = this.store.readBlob(sha);
+                        blobCache.set(sha, bytes);
+                    }
                     if (p.byteStart !== null && sha256(bytes.subarray(p.byteStart, p.byteEnd)) !== row.quote_sha256) throw new Error();
                 } catch  {
                     issues.push({

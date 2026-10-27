@@ -465,7 +465,7 @@ export class ContextForgeStore {
                 this.db.prepare('UPDATE derived_nodes SET superseded_by=? WHERE node_id=?').run(id, old.node_id);
                 this.db.prepare('INSERT INTO derivation_edges VALUES(?,?,?)').run(old.node_id, id, 'supersedes');
                 this.db.prepare('INSERT INTO lifecycle_events VALUES(?,?,?,?,?,?,?,?,?,?)').run(stableId('cf-event-v1', old.node_id, id), input.namespaceId, null, old.node_id, 'active', 'superseded', spans[0], Date.now(), 'compiler', 'explicit revision');
-                this.retireEpochs(input.namespaceId, 'derived revision');
+                if (input.layer === 3) this.retireEpochs(input.namespaceId, 'derived revision');
             }
             this.db.prepare('INSERT INTO retrieval_documents(namespace_id,node_id,title,body) VALUES(?,?,?,?)').run(input.namespaceId, id, input.title, input.body);
             return nodeRecord(this.db.prepare('SELECT * FROM derived_nodes WHERE node_id=?').get(id));
@@ -630,6 +630,9 @@ export class ContextForgeStore {
       AND (? IS NULL OR created_at<=?)
       AND (? OR CASE WHEN ? IS NULL THEN status ELSE (SELECT to_status FROM lifecycle_events e WHERE e.node_id=n.node_id AND e.occurred_at<=? ORDER BY occurred_at DESC,rowid DESC LIMIT 1) END='active')
       ORDER BY observed_at,node_id`).all(ns, options.observedFrom ?? null, options.observedFrom ?? null, options.observedTo ?? null, options.observedTo ?? null, options.validAt ?? null, options.validAt ?? null, options.validAt ?? null, options.asKnownAt ?? null, options.asKnownAt ?? null, options.includeHistory ? 1 : 0, options.asKnownAt ?? null, options.asKnownAt ?? null).map(nodeRecord);
+    }
+    occurrenceCount(sessionId) {
+        return Number(this.db.prepare('SELECT count(*) AS n FROM message_occurrences WHERE session_id=?').get(sessionId).n);
     }
     getStats() {
         this.assertNamespace(this.namespaceId);
