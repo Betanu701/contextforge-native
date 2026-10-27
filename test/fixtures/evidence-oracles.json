@@ -1,0 +1,850 @@
+{
+  "natural-condition_exception-immediate": {
+    "expected": {
+      "routine_allowed": false,
+      "drill_allowed": true
+    },
+    "docIndices": [
+      0
+    ],
+    "premise": [
+      "purge_fast",
+      "seal_mode",
+      "signed frost-drill window",
+      "routine night shifts"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "must not run while seal_mode is engaged"
+      ],
+      [
+        "exception permits purge_fast during the signed frost-drill window"
+      ],
+      [
+        "routine night shifts are not an exception"
+      ]
+    ]
+  },
+  "natural-condition_exception-delayed": {
+    "expected": {
+      "routine_allowed": false,
+      "drill_allowed": true
+    },
+    "docIndices": [
+      0
+    ],
+    "premise": [
+      "purge_fast",
+      "seal_mode",
+      "signed frost-drill window",
+      "routine night shifts"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "must not run while seal_mode is engaged"
+      ],
+      [
+        "exception permits purge_fast during the signed frost-drill window"
+      ],
+      [
+        "routine night shifts are not an exception"
+      ]
+    ]
+  },
+  "natural-rejected_proposal-immediate": {
+    "expected": {
+      "database": "CedarDB",
+      "proposal_adopted": false,
+      "proposer": "Ivo"
+    },
+    "docIndices": [
+      1
+    ],
+    "premise": [
+      "CedarDB",
+      "Ivo",
+      "RFC-K72",
+      "rejected"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "CedarDB"
+      ],
+      [
+        "Ivo proposed RFC-K72"
+      ],
+      [
+        "rejected RFC-K72"
+      ]
+    ]
+  },
+  "natural-rejected_proposal-delayed": {
+    "expected": {
+      "database": "CedarDB",
+      "proposal_adopted": false,
+      "proposer": "Ivo"
+    },
+    "docIndices": [
+      1
+    ],
+    "premise": [
+      "CedarDB",
+      "Ivo",
+      "RFC-K72",
+      "rejected"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "CedarDB"
+      ],
+      [
+        "Ivo proposed RFC-K72"
+      ],
+      [
+        "rejected RFC-K72"
+      ]
+    ]
+  },
+  "natural-partial_supersession-immediate": {
+    "expected": {
+      "worker_id": "node-T9",
+      "retry_mode": "quorum-5"
+    },
+    "docIndices": [
+      2,
+      3
+    ],
+    "premise": [
+      "node-T9",
+      "quorum-5"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "node-T9"
+      ],
+      [
+        "quorum-5"
+      ]
+    ]
+  },
+  "natural-partial_supersession-delayed": {
+    "expected": {
+      "worker_id": "node-T9",
+      "retry_mode": "quorum-5"
+    },
+    "docIndices": [
+      2,
+      3
+    ],
+    "premise": [
+      "node-T9",
+      "quorum-5"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "node-T9"
+      ],
+      [
+        "quorum-5"
+      ]
+    ]
+  },
+  "natural-cumulative_math-immediate": {
+    "expected": {
+      "resin": 425.25,
+      "solvent": 257.5,
+      "unit": "g"
+    },
+    "docIndices": [
+      4
+    ],
+    "premise": [
+      "218.5",
+      "643.75",
+      "901.25",
+      "g"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "218.5"
+      ],
+      [
+        "643.75"
+      ],
+      [
+        "901.25"
+      ],
+      [
+        "g"
+      ]
+    ]
+  },
+  "natural-cumulative_math-delayed": {
+    "expected": {
+      "resin": 425.25,
+      "solvent": 257.5,
+      "unit": "g"
+    },
+    "docIndices": [
+      4
+    ],
+    "premise": [
+      "218.5",
+      "643.75",
+      "901.25",
+      "g"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "218.5"
+      ],
+      [
+        "643.75"
+      ],
+      [
+        "901.25"
+      ],
+      [
+        "g"
+      ]
+    ]
+  },
+  "natural-exact_identifier-immediate": {
+    "expected": {
+      "registry_key": "vz_8Q-04a-Z9"
+    },
+    "docIndices": [
+      5
+    ],
+    "premise": [
+      "vz_8Q-04a-Z9"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Quenel optical lot"
+      ],
+      [
+        "vz_8Q-04a-Z9"
+      ]
+    ]
+  },
+  "natural-exact_identifier-delayed": {
+    "expected": {
+      "registry_key": "vz_8Q-04a-Z9"
+    },
+    "docIndices": [
+      5
+    ],
+    "premise": [
+      "vz_8Q-04a-Z9"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Quenel optical lot"
+      ],
+      [
+        "vz_8Q-04a-Z9"
+      ]
+    ]
+  },
+  "natural-table_attribution-immediate": {
+    "expected": {
+      "safe_depth_m": 23.8,
+      "inspector": "Uma",
+      "author": "Tavi"
+    },
+    "docIndices": [
+      6
+    ],
+    "premise": [
+      "Kesh",
+      "23.8",
+      "Uma",
+      "Tavi"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Kesh"
+      ],
+      [
+        "23.8"
+      ],
+      [
+        "Uma"
+      ],
+      [
+        "Tavi"
+      ]
+    ]
+  },
+  "natural-table_attribution-delayed": {
+    "expected": {
+      "safe_depth_m": 23.8,
+      "inspector": "Uma",
+      "author": "Tavi"
+    },
+    "docIndices": [
+      6
+    ],
+    "premise": [
+      "Kesh",
+      "23.8",
+      "Uma",
+      "Tavi"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Kesh"
+      ],
+      [
+        "23.8"
+      ],
+      [
+        "Uma"
+      ],
+      [
+        "Tavi"
+      ]
+    ]
+  },
+  "natural-buried_tool_anomaly-immediate": {
+    "expected": {
+      "sample": 83,
+      "fault_code": "AX-731",
+      "correction": "quarantine"
+    },
+    "docIndices": [
+      7
+    ],
+    "premise": [
+      "83",
+      "AX-731",
+      "quarantine"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "83"
+      ],
+      [
+        "AX-731"
+      ],
+      [
+        "quarantine"
+      ]
+    ]
+  },
+  "natural-buried_tool_anomaly-delayed": {
+    "expected": {
+      "sample": 83,
+      "fault_code": "AX-731",
+      "correction": "quarantine"
+    },
+    "docIndices": [
+      7
+    ],
+    "premise": [
+      "83",
+      "AX-731",
+      "quarantine"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "83"
+      ],
+      [
+        "AX-731"
+      ],
+      [
+        "quarantine"
+      ]
+    ]
+  },
+  "natural-unknown_ambiguous-immediate": {
+    "expected": {
+      "keeper": null,
+      "launch_date": null
+    },
+    "docIndices": [
+      8
+    ],
+    "premise": [],
+    "unknown": true,
+    "supportGroups": [
+      [
+        "two boats named Aru"
+      ],
+      [
+        "keeper is Nela"
+      ],
+      [
+        "keeper is Oren"
+      ],
+      [
+        "no launch dates"
+      ]
+    ]
+  },
+  "natural-unknown_ambiguous-delayed": {
+    "expected": {
+      "keeper": null,
+      "launch_date": null
+    },
+    "docIndices": [
+      8
+    ],
+    "premise": [],
+    "unknown": true,
+    "supportGroups": [
+      [
+        "two boats named Aru"
+      ],
+      [
+        "keeper is Nela"
+      ],
+      [
+        "keeper is Oren"
+      ],
+      [
+        "no launch dates"
+      ]
+    ]
+  },
+  "structured-condition_exception-immediate": {
+    "expected": {
+      "routine_allowed": false,
+      "drill_allowed": true
+    },
+    "docIndices": [
+      0
+    ],
+    "premise": [
+      "purge_fast",
+      "seal_mode",
+      "signed frost-drill window",
+      "routine night shifts"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "forbidden while seal_mode is engaged"
+      ],
+      [
+        "permitted only during the signed frost-drill window"
+      ],
+      [
+        "routine night shifts are not an exception"
+      ]
+    ]
+  },
+  "structured-condition_exception-delayed": {
+    "expected": {
+      "routine_allowed": false,
+      "drill_allowed": true
+    },
+    "docIndices": [
+      0
+    ],
+    "premise": [
+      "purge_fast",
+      "seal_mode",
+      "signed frost-drill window",
+      "routine night shifts"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "forbidden while seal_mode is engaged"
+      ],
+      [
+        "permitted only during the signed frost-drill window"
+      ],
+      [
+        "routine night shifts are not an exception"
+      ]
+    ]
+  },
+  "structured-rejected_proposal-immediate": {
+    "expected": {
+      "database": "CedarDB",
+      "proposal_adopted": false,
+      "proposer": "Ivo"
+    },
+    "docIndices": [
+      1
+    ],
+    "premise": [
+      "CedarDB",
+      "Ivo",
+      "RFC-K72",
+      "rejected"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "CedarDB"
+      ],
+      [
+        "Ivo proposed RFC-K72"
+      ],
+      [
+        "rejected RFC-K72"
+      ]
+    ]
+  },
+  "structured-rejected_proposal-delayed": {
+    "expected": {
+      "database": "CedarDB",
+      "proposal_adopted": false,
+      "proposer": "Ivo"
+    },
+    "docIndices": [
+      1
+    ],
+    "premise": [
+      "CedarDB",
+      "Ivo",
+      "RFC-K72",
+      "rejected"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "CedarDB"
+      ],
+      [
+        "Ivo proposed RFC-K72"
+      ],
+      [
+        "rejected RFC-K72"
+      ]
+    ]
+  },
+  "structured-partial_supersession-immediate": {
+    "expected": {
+      "worker_id": "node-T9",
+      "retry_mode": "quorum-5"
+    },
+    "docIndices": [
+      2,
+      3
+    ],
+    "premise": [
+      "node-T9",
+      "quorum-5"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "node-T9"
+      ],
+      [
+        "quorum-5"
+      ]
+    ]
+  },
+  "structured-partial_supersession-delayed": {
+    "expected": {
+      "worker_id": "node-T9",
+      "retry_mode": "quorum-5"
+    },
+    "docIndices": [
+      2,
+      3
+    ],
+    "premise": [
+      "node-T9",
+      "quorum-5"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "node-T9"
+      ],
+      [
+        "quorum-5"
+      ]
+    ]
+  },
+  "structured-cumulative_math-immediate": {
+    "expected": {
+      "resin": 425.25,
+      "solvent": 257.5,
+      "unit": "g"
+    },
+    "docIndices": [
+      4
+    ],
+    "premise": [
+      "218.5",
+      "643.75",
+      "901.25",
+      "g"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "218.5"
+      ],
+      [
+        "643.75"
+      ],
+      [
+        "901.25"
+      ],
+      [
+        "g"
+      ]
+    ]
+  },
+  "structured-cumulative_math-delayed": {
+    "expected": {
+      "resin": 425.25,
+      "solvent": 257.5,
+      "unit": "g"
+    },
+    "docIndices": [
+      4
+    ],
+    "premise": [
+      "218.5",
+      "643.75",
+      "901.25",
+      "g"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "218.5"
+      ],
+      [
+        "643.75"
+      ],
+      [
+        "901.25"
+      ],
+      [
+        "g"
+      ]
+    ]
+  },
+  "structured-exact_identifier-immediate": {
+    "expected": {
+      "registry_key": "vz_8Q-04a-Z9"
+    },
+    "docIndices": [
+      5
+    ],
+    "premise": [
+      "vz_8Q-04a-Z9"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Quenel optical lot"
+      ],
+      [
+        "vz_8Q-04a-Z9"
+      ]
+    ]
+  },
+  "structured-exact_identifier-delayed": {
+    "expected": {
+      "registry_key": "vz_8Q-04a-Z9"
+    },
+    "docIndices": [
+      5
+    ],
+    "premise": [
+      "vz_8Q-04a-Z9"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Quenel optical lot"
+      ],
+      [
+        "vz_8Q-04a-Z9"
+      ]
+    ]
+  },
+  "structured-table_attribution-immediate": {
+    "expected": {
+      "safe_depth_m": 23.8,
+      "inspector": "Uma",
+      "author": "Tavi"
+    },
+    "docIndices": [
+      6
+    ],
+    "premise": [
+      "Kesh",
+      "23.8",
+      "Uma",
+      "Tavi"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Kesh"
+      ],
+      [
+        "23.8"
+      ],
+      [
+        "Uma"
+      ],
+      [
+        "Tavi"
+      ]
+    ]
+  },
+  "structured-table_attribution-delayed": {
+    "expected": {
+      "safe_depth_m": 23.8,
+      "inspector": "Uma",
+      "author": "Tavi"
+    },
+    "docIndices": [
+      6
+    ],
+    "premise": [
+      "Kesh",
+      "23.8",
+      "Uma",
+      "Tavi"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "Kesh"
+      ],
+      [
+        "23.8"
+      ],
+      [
+        "Uma"
+      ],
+      [
+        "Tavi"
+      ]
+    ]
+  },
+  "structured-buried_tool_anomaly-immediate": {
+    "expected": {
+      "sample": 83,
+      "fault_code": "AX-731",
+      "correction": "quarantine"
+    },
+    "docIndices": [
+      7
+    ],
+    "premise": [
+      "83",
+      "AX-731",
+      "quarantine"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "83"
+      ],
+      [
+        "AX-731"
+      ],
+      [
+        "quarantine"
+      ]
+    ]
+  },
+  "structured-buried_tool_anomaly-delayed": {
+    "expected": {
+      "sample": 83,
+      "fault_code": "AX-731",
+      "correction": "quarantine"
+    },
+    "docIndices": [
+      7
+    ],
+    "premise": [
+      "83",
+      "AX-731",
+      "quarantine"
+    ],
+    "unknown": false,
+    "supportGroups": [
+      [
+        "83"
+      ],
+      [
+        "AX-731"
+      ],
+      [
+        "quarantine"
+      ]
+    ]
+  },
+  "structured-unknown_ambiguous-immediate": {
+    "expected": {
+      "keeper": null,
+      "launch_date": null
+    },
+    "docIndices": [
+      8
+    ],
+    "premise": [],
+    "unknown": true,
+    "supportGroups": [
+      [
+        "keeper = Nela"
+      ],
+      [
+        "keeper = Oren"
+      ],
+      [
+        "ambiguous"
+      ],
+      [
+        "no launch dates"
+      ]
+    ]
+  },
+  "structured-unknown_ambiguous-delayed": {
+    "expected": {
+      "keeper": null,
+      "launch_date": null
+    },
+    "docIndices": [
+      8
+    ],
+    "premise": [],
+    "unknown": true,
+    "supportGroups": [
+      [
+        "keeper = Nela"
+      ],
+      [
+        "keeper = Oren"
+      ],
+      [
+        "ambiguous"
+      ],
+      [
+        "no launch dates"
+      ]
+    ]
+  }
+}

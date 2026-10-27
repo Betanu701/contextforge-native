@@ -49,11 +49,14 @@ export interface TokenCharge {
   estimatorVersion: string;
 }
 export interface SelectionItem {
+  chunkIds?: string[]; supportGroupIds?: string[]; matchedFacetIds?: string[]; sourceRevision?: string; trace?: CandidateTrace;
   selectionId: string;
   bundleId: string;
   namespaceId: string;
   layer: Layer;
   nodeId?: string;
+  derivedNodeIds?: string[];
+  claimSignatures?: string[];
   sourceId: string; // primary support; complete support in provenanceSpanIds
   artifactIds: string[];
   provenanceSpanIds: string[];
@@ -205,6 +208,7 @@ export interface ContextForgePlanReceipt {
   warnings: string[];
   compilerLagSourceIds: string[];
   exactWireManifestSha256?: string; // canonical logical wire content, no expiring credentials
+  retrieval?: RetrievalCoverage;
   receiptSha256: string;
 }
 
@@ -271,11 +275,13 @@ export interface IngestSourceInput {
 export interface BlobRecord { sha256: string; byteLength: number; storageKind: 'inline' | 'cas'; relativePath: string | null }
 export interface SearchOptions {
   namespaceId?: string; limit?: number; offset?: number; includeHistory?: boolean;
+  layers?: Array<0 | 1 | 2 | 3>; kinds?: string[];
   observedFrom?: number; observedTo?: number; asKnownAt?: number;
 }
 export interface SearchResult {
   namespaceId: string; sourceId: string | null; nodeId: string | null; chunkId: string | null;
   title: string; body: string; score: number;
+  spanId?: string; artifactId?: string; byteStart?: number; byteEnd?: number; layer?: number; status?: MemoryStatus; logicalKey?: string; fidelity?: string;
 }
 export interface PublishNodeInput {
   namespaceId: string; layer: 1 | 2 | 3; logicalKey: string; kind: string; title: string;
@@ -283,3 +289,8 @@ export interface PublishNodeInput {
   spanIds: string[]; dependencyNodeIds?: string[]; extractionRule: string;
   validFrom?: number; validTo?: number; replace?: boolean;
 }
+
+export interface QueryFacet { id:string; surface:string; aliases:string[]; kind:'entity'|'identifier'|'content'|'field'|'number'|'unit'; weight:number; origin:'question'|'output_schema' }
+export interface CandidateTrace { sourceStatus?:MemoryStatus; nodeStatus?:MemoryStatus; trustClass?:string; fidelity?:string[]; sourceFidelity?:string; exactIdentifiers?:string[]; seedNodeId?:string; entryId?:string; relation?:string; direction?:'incoming'|'outgoing'|'shared_key'; spanIds?:string[]; sourceRevision?:string }
+export interface EvidenceSupportGroup { id:string; seedNodeId?:string; spanIds:string[]; sourceIds:string[]; complete:boolean }
+export interface RetrievalCoverage { lexicalVersion:string; discoveryEnabled:boolean; consideredFacetIds:string[]; selectedFacetIds:string[]; supportGroupDeliveredIds:string[]; supportGroupMissingIds:string[]; truncated:boolean; work:Record<string,number>; adapterStatus?:string; warnings?:string[] }

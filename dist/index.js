@@ -7,6 +7,8 @@ import { ContextForgeCompiler } from "./src/compiler.js";
 import { planContext, resolveCapabilityEnvelope, resolvePromptAndToolProfile } from "./src/planner.js";
 import { compileDualChannelSystemPrompt, estimateTokens } from "./src/symbolic-ir.js";
 import { createContextForgeTools } from "./src/tools.js";
+import { planContextWithRecall, assertContextPlanCurrent, externalRecallStatus, CONTEXTFORGE_SUPPLEMENT_ORIGIN } from "./src/external-recall.js";
+export * from "./src/external-recall.js";
 export { ContextForgeStore, ContextForgeCompiler, planContext, resolveCapabilityEnvelope, resolvePromptAndToolProfile, compileDualChannelSystemPrompt, createContextForgeTools };
 function asRecord(v) {
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
@@ -21,6 +23,97 @@ function extractTextFromMessage(msg) {
         }).filter(Boolean).join("\n");
     }
     return "";
+}
+function isSupplementMessage(message) {
+    const m = asRecord(message);
+    return m.origin === CONTEXTFORGE_SUPPLEMENT_ORIGIN || m.contextForgeOrigin === CONTEXTFORGE_SUPPLEMENT_ORIGIN || asRecord(m.metadata).origin === CONTEXTFORGE_SUPPLEMENT_ORIGIN;
+}
+export function createContextForgeSupplement(getEngine, resolveCallerContext) {
+    const authorize = async (input)=>{
+        const binding = await resolveCallerContext(input);
+        binding.assertCurrent();
+        if (binding.callerContext === undefined) throw new Error("Trusted caller binding required");
+        const { store } = getEngine();
+        store.assertNamespace(binding.namespaceId);
+        return {
+            store,
+            binding
+        };
+    };
+    const handle = (namespaceId, type, id)=>`contextforge:${Buffer.from(JSON.stringify([
+            namespaceId,
+            type,
+            id
+        ])).toString("base64url")}`;
+    return {
+        id: CONTEXTFORGE_SUPPLEMENT_ORIGIN,
+        async search (input) {
+            const { store, binding } = await authorize(input);
+            const hits = store.search(input.query, {
+                namespaceId: binding.namespaceId,
+                limit: Math.max(1, Math.min(input.maxResults ?? 10, 64))
+            });
+            binding.assertCurrent();
+            return hits.map((hit)=>({
+                    ...hit,
+                    origin: CONTEXTFORGE_SUPPLEMENT_ORIGIN,
+                    lookup: handle(binding.namespaceId, hit.nodeId ? "node" : "span", hit.nodeId ?? hit.spanId ?? ""),
+                    derived: !!hit.nodeId,
+                    citationAuthority: hit.nodeId ? "derived navigation; get includes original support" : "original L0"
+                }));
+        },
+        async get (input) {
+            const { store, binding } = await authorize(input);
+            if (!input.lookup.startsWith("contextforge:")) return null;
+            let decoded;
+            try {
+                decoded = JSON.parse(Buffer.from(input.lookup.slice("contextforge:".length), "base64url").toString());
+            } catch  {
+                return null;
+            }
+            if (!Array.isArray(decoded) || decoded.length !== 3 || decoded[0] !== binding.namespaceId) return null;
+            const [ns, kind, id] = decoded;
+            let text, support = [];
+            if (kind === "node") {
+                const node = store.db.prepare("SELECT body FROM derived_nodes WHERE namespace_id=? AND node_id=? AND status='active'").get(ns, id);
+                if (!node) return null;
+                const provenance = store.getProvenance(id);
+                if (!provenance.length) return null;
+                try {
+                    support = provenance.map((p)=>store.readEvidenceSpan(p.spanId, {
+                            namespaceId: ns
+                        }));
+                } catch  {
+                    return null;
+                }
+                text = String(node.body);
+            } else if (kind === "span") {
+                try {
+                    const span = store.readEvidenceSpan(id, {
+                        namespaceId: ns
+                    });
+                    support = [
+                        span
+                    ];
+                    text = span.text;
+                } catch  {
+                    return null;
+                }
+            } else return null;
+            binding.assertCurrent();
+            const start = Math.max(0, Math.floor(input.fromLine ?? 1) - 1);
+            const lines = text.split("\n");
+            return {
+                lookup: input.lookup,
+                origin: CONTEXTFORGE_SUPPLEMENT_ORIGIN,
+                derived: kind === "node",
+                text: lines.slice(start, start + Math.max(1, Math.min(input.lineCount ?? 200, 2000))).join("\n"),
+                support,
+                fromLine: start + 1,
+                totalLines: lines.length
+            };
+        }
+    };
 }
 export function normalizeHostMessage(rawMsg, fallbackId, storeForMedia, sessionId) {
     const rec = asRecord(rawMsg);
@@ -247,9 +340,16 @@ export function createContextForgeEngine(options = {}) {
     const maxFixedOverheadRatio = options.maxFixedOverheadRatio ?? 0.15;
     const symbolicIr = options.symbolicIr !== false;
     const workspaceSystemPrompt = loadWorkspaceSystemPrompt(options.workspaceDir);
+    const recallOptions = {
+        adapter: options.externalRecallAdapter,
+        policy: options.bridgePolicy,
+        resolveCallerContext: options.resolveCallerContext
+    };
     return {
         store,
         compiler,
+        recallOptions,
+        bridgeStatus: ()=>externalRecallStatus(recallOptions),
         info: {
             id: "contextforge",
             name: "ContextForge Native",
@@ -282,6 +382,9 @@ export function createContextForgeEngine(options = {}) {
             };
             const sessionId = String(params.sessionId || params.sessionKey || "default-session");
             const rawMsg = asRecord(params.message);
+            if (isSupplementMessage(rawMsg)) return {
+                ingested: false
+            };
             const normalized = normalizeHostMessage(rawMsg, `msg-${randomUUID()}`, store, sessionId);
             const hasText = extractTextFromMessage(normalized).trim().length > 0;
             const hasToolCalls = Array.isArray(normalized.toolCalls) && normalized.toolCalls.length > 0;
@@ -310,7 +413,7 @@ export function createContextForgeEngine(options = {}) {
             }
             const sessionId = String(params.sessionId || params.sessionKey || "default-session");
             const batchId = `batch:${sessionId}:${Date.now()}:${randomUUID()}`;
-            const normalized = params.messages.map((m, idx)=>normalizeHostMessage(m, `${batchId}:${idx}`, store, sessionId));
+            const normalized = params.messages.filter((m)=>!isSupplementMessage(m)).map((m, idx)=>normalizeHostMessage(m, `${batchId}:${idx}`, store, sessionId));
             store.commitTurn({
                 sessionId,
                 advancementKey: batchId,
@@ -323,7 +426,7 @@ export function createContextForgeEngine(options = {}) {
         },
         async commitTurn (params) {
             const sessionId = String(params.sessionId || params.sessionKey || "default-session");
-            const normalized = (Array.isArray(params.messages) ? params.messages : []).map((m, idx)=>normalizeHostMessage(m, `${params.advancementKey}:${idx}`, store, sessionId));
+            const normalized = (Array.isArray(params.messages) ? params.messages : []).filter((m)=>!isSupplementMessage(m)).map((m, idx)=>normalizeHostMessage(m, `${params.advancementKey}:${idx}`, store, sessionId));
             const status = store.commitTurn({
                 sessionId,
                 advancementKey: params.advancementKey,
@@ -338,7 +441,7 @@ export function createContextForgeEngine(options = {}) {
         },
         async assemble (params) {
             const sessionId = String(params.sessionId || params.sessionKey || "default-session");
-            const rawMessages = Array.isArray(params.messages) ? params.messages : [];
+            const rawMessages = (Array.isArray(params.messages) ? params.messages : []).filter((m)=>!isSupplementMessage(m));
             const normalizedMessages = rawMessages.map((m, idx)=>normalizeHostMessage(m, `hist:${sessionId}:${idx}`, store, sessionId));
             const latestText = typeof params.prompt === "string" && params.prompt.trim() ? params.prompt.trim() : normalizedMessages.length > 0 ? extractTextFromMessage(normalizedMessages[normalizedMessages.length - 1]) : "";
             const existingOccurrences = store.occurrenceCount(sessionId);
@@ -382,7 +485,7 @@ export function createContextForgeEngine(options = {}) {
                 systemTokens: estimateTokens(workspaceSystemPrompt),
                 pendingInputTokens: Math.max(64, estimateTokens(latestText))
             });
-            const plan = planContext({
+            const planInput = {
                 store,
                 sessionId,
                 admissionId: `turn:${Date.now()}:${randomUUID()}`,
@@ -410,7 +513,22 @@ export function createContextForgeEngine(options = {}) {
                     })),
                 mediaAdapter: defaultMediaAdapter,
                 abortSignal: params.abortSignal
-            });
+            };
+            const dispatchOptions = {
+                ...recallOptions,
+                hostContext: params.runtimeContext
+            };
+            let plan = await planContextWithRecall(planInput, dispatchOptions);
+            try {
+                assertContextPlanCurrent(store, plan, params.abortSignal);
+            } catch (error) {
+                if (!(error instanceof Error) || error.message !== "ContextPlanGenerationChanged") throw error;
+                plan = await planContextWithRecall({
+                    ...planInput,
+                    attempt: 1
+                }, dispatchOptions);
+                assertContextPlanCurrent(store, plan, params.abortSignal);
+            }
             const l3Nodes = store.listPermanentContext();
             const additionSections = [];
             if (l3Nodes.length > 0) {
@@ -424,8 +542,10 @@ export function createContextForgeEngine(options = {}) {
                 additionSections.push(`## ContextForge Slim-Domain Symbolic IR (fixedOverhead=${plan.receipt.capabilityEnvelope.systemTokens}/${plan.receipt.capabilityEnvelope.nativeContextTokens} tokens > ${Math.round(maxFixedOverheadRatio * 100)}%)`, compiled.symbolicRulesIr || compiled.compiledSystemPrompt);
             }
             const systemPromptAddition = additionSections.length > 0 ? additionSections.join("\n\n") : undefined;
+            const dispatchMessages = plan.messages.filter((m)=>m.role !== "system" && m.role !== "developer");
+            assertContextPlanCurrent(store, plan, params.abortSignal);
             return {
-                messages: plan.messages.filter((m)=>m.role !== "system" && m.role !== "developer"),
+                messages: dispatchMessages,
                 estimatedTokens: plan.estimatedTokens,
                 promptAuthority: "assembled",
                 ...systemPromptAddition ? {
@@ -470,7 +590,10 @@ export default {
                     workspaceDir: typeof ctxRec.workspaceDir === "string" ? ctxRec.workspaceDir : undefined,
                     openclawConfig: ctxRec.config ?? api?.config,
                     maxFixedOverheadRatio: typeof rawCfg.maxFixedOverheadRatio === "number" ? rawCfg.maxFixedOverheadRatio : 0.15,
-                    symbolicIr: typeof rawCfg.symbolicIr === "boolean" ? rawCfg.symbolicIr : true
+                    symbolicIr: typeof rawCfg.symbolicIr === "boolean" ? rawCfg.symbolicIr : true,
+                    externalRecallAdapter: api?.contextForgeServices?.adapter,
+                    bridgePolicy: asRecord(rawCfg.bridgePolicy),
+                    resolveCallerContext: typeof api?.contextForgeServices?.resolveCallerContext === "function" ? api.contextForgeServices.resolveCallerContext.bind(api.contextForgeServices) : undefined
                 });
             }
             return sharedEngine;
@@ -484,13 +607,16 @@ export default {
                 };
             });
         }
+        if (rawCfg.bridgePolicy && asRecord(rawCfg.bridgePolicy).enabled === true && asRecord(rawCfg.bridgePolicy).supplement === true && typeof api?.registerMemoryCorpusSupplement === "function" && typeof api?.contextForgeServices?.resolveCallerContext === "function") {
+            api.registerMemoryCorpusSupplement(createContextForgeSupplement(()=>getOrCreateEngine(), api.contextForgeServices.resolveCallerContext.bind(api.contextForgeServices)));
+        }
         if (typeof api?.registerTool === "function") {
             api.registerTool((ctx)=>{
                 const eng = getOrCreateEngine(ctx);
                 return createContextForgeTools(()=>({
                         store: eng.store,
                         compiler: eng.compiler
-                    }), ctx);
+                    }), ctx, eng.recallOptions);
             }, {
                 names: [
                     "cf_recall",

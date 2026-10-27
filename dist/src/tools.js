@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ContextForgeStore } from "./store.js";
-import { ContextForgeCompiler } from "./compiler.js";
+import { ContextForgeCompiler, WIKI_COMPILER_VERSION } from "./compiler.js";
+import { prepareExternalRecall, externalRecallStatus } from "./external-recall.js";
+import { LEXICAL_VERSION } from "./retrieval.js";
 function asRecord(v) {
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
-export function createContextForgeTools(getStore, ctx = {}) {
+export function createContextForgeTools(getStore, ctx = {}, options = {}) {
     return [
         {
             name: "cf_recall",
@@ -21,6 +23,14 @@ export function createContextForgeTools(getStore, ctx = {}) {
                         type: "string",
                         description: "Search query or entity name"
                     },
+                    includeSupport: {
+                        type: "boolean",
+                        description: "Include cited original L0 support"
+                    },
+                    external: {
+                        type: "boolean",
+                        description: "Use configured optional external discovery"
+                    },
                     limit: {
                         type: "number",
                         description: "Max results (default 10)"
@@ -35,7 +45,7 @@ export function createContextForgeTools(getStore, ctx = {}) {
                     }
                 }
             },
-            async execute (_id, rawParams) {
+            async execute (_id, rawParams, signal) {
                 const params = asRecord(rawParams);
                 const query = String(params.query ?? "").trim();
                 if (!query) throw new Error("cf_recall requires a non-empty query");
@@ -43,6 +53,16 @@ export function createContextForgeTools(getStore, ctx = {}) {
                 const limit = typeof params.limit === "number" && Number.isSafeInteger(params.limit) && params.limit > 0 ? params.limit : 10;
                 const namespaceId = typeof params.namespaceId === "string" && params.namespaceId.trim() ? params.namespaceId.trim() : store.namespaceId;
                 const includeHistory = params.includeHistory === true;
+                const externalRecall = params.external === true ? await prepareExternalRecall({
+                    store,
+                    query,
+                    namespaceId,
+                    sessionId: ctx.sessionId ?? ctx.sessionKey ?? "tool",
+                    abortSignal: signal
+                }, {
+                    ...options,
+                    hostContext: ctx
+                }) : undefined;
                 const ftsResults = store.search(query, {
                     namespaceId,
                     limit,
@@ -58,11 +78,31 @@ export function createContextForgeTools(getStore, ctx = {}) {
                     `- Entity nodes: ${entityResults.length}`
                 ];
                 for (const [idx, hit] of ftsResults.entries()){
-                    lines.push(`\n[${idx + 1}] ${hit.title} (source=${hit.sourceId ?? "n/a"}, node=${hit.nodeId ?? "n/a"}, score=${hit.score.toFixed(3)})\n${hit.body}`);
+                    lines.push(`\n[${idx + 1}] ${hit.title} [${hit.status}] (source=${hit.sourceId ?? "n/a"}, node=${hit.nodeId ?? "n/a"}, score=${hit.score.toFixed(3)})\n${hit.body}`);
                 }
                 for (const node of entityResults.slice(0, limit)){
                     lines.push(`\n[Entity L${node.layer}] ${node.title} (${node.logicalKey}, rev=${node.revision}, status=${node.status})\n${node.body}`);
                 }
+                const support = [];
+                if (params.includeSupport === true) {
+                    const seen = new Set();
+                    for (const hit of ftsResults){
+                        for (const p of hit.nodeId ? store.getProvenance(hit.nodeId) : []){
+                            if (seen.has(p.spanId)) continue;
+                            seen.add(p.spanId);
+                            try {
+                                const span = store.readEvidenceSpan(p.spanId, {
+                                    namespaceId
+                                });
+                                support.push(span);
+                                lines.push(`\n[L0 support source=${p.sourceId} span=${p.spanId}]\n${span.text}`);
+                            } catch  {
+                                lines.push("\n[Original support currently unavailable]");
+                            }
+                        }
+                    }
+                }
+                if (externalRecall) lines.push(`\nExternal discovery: ${externalRecall.status}; suggestions are discovery-only, not original evidence.`, ...externalRecall.warnings);
                 return {
                     content: [
                         {
@@ -72,7 +112,9 @@ export function createContextForgeTools(getStore, ctx = {}) {
                     ],
                     details: {
                         ftsResults,
-                        entityResults
+                        entityResults,
+                        support,
+                        externalRecall
                     }
                 };
             }
@@ -456,7 +498,14 @@ export function createContextForgeTools(getStore, ctx = {}) {
                     ],
                     details: {
                         stats,
-                        latestReceipt: latestReceiptSummary
+                        latestReceipt: latestReceiptSummary,
+                        versions: {
+                            lexical: LEXICAL_VERSION,
+                            wiki: WIKI_COMPILER_VERSION,
+                            planner: rawReceipt?.plannerVersion ?? "native"
+                        },
+                        bridge: externalRecallStatus(options),
+                        coverage: rawReceipt?.retrieval ?? null
                     }
                 };
             }

@@ -1,4 +1,292 @@
-import { ContextForgeStore, COMPILER_VERSION, canonicalJson, nodeRecord, sha256, stableId } from './store.js';
+import { ContextForgeStore, COMPILER_VERSION, canonicalJson, sha256, stableId } from './store.js';
+export const WIKI_COMPILER_VERSION = 'extractive-facets-v2';
+const compareText = (a, b)=>a < b ? -1 : a > b ? 1 : 0;
+const routingKey = (s)=>s.normalize('NFKC').toLowerCase().trim().replace(/\s+/gu, ' ');
+const unique = (values)=>[
+        ...new Set(values)
+    ].sort(compareText);
+const entryOrder = (a, b)=>a.observedAt - b.observedAt || compareText(a.sourceId, b.sourceId) || compareText(a.artifactId, b.artifactId) || a.ordinal - b.ordinal || compareText(a.entryId, b.entryId);
+export function collectEvidence(store, namespaceId = store.namespaceId) {
+    store.assertNamespace(namespaceId);
+    const rows = store.db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,s.kind AS source_kind,c.span_id,c.body,c.ordinal,a.fidelity,a.artifact_id,a.kind AS artifact_kind,p.byte_start,p.byte_end
+    FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id
+    WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' AND a.text_content IS NOT NULL
+    ORDER BY s.observed_at,s.source_id,a.artifact_id,c.ordinal,c.chunk_id`).all(namespaceId);
+    const sources = new Map();
+    for (const row of rows){
+        let artifacts = sources.get(row.source_id);
+        if (!artifacts) {
+            artifacts = new Map();
+            sources.set(row.source_id, artifacts);
+        }
+        const group = artifacts.get(row.artifact_id) ?? [];
+        group.push(row);
+        artifacts.set(row.artifact_id, group);
+    }
+    const l2 = [];
+    for (const artifacts of sources.values()){
+        const groups = [
+            ...artifacts.values()
+        ];
+        const preference = (e)=>{
+            if ([
+                'turn',
+                'tool_result'
+            ].includes(e.source_kind)) return e.artifact_kind === 'text' ? 0 : e.artifact_kind === 'raw' ? 10 : 20;
+            return e.artifact_kind === 'raw' ? 0 : e.artifact_kind === 'text' ? 1 : 2;
+        };
+        groups.sort((a, b)=>preference(a[0]) - preference(b[0]) || compareText(a[0].artifact_id, b[0].artifact_id));
+        l2.push(...groups[0]);
+    }
+    l2.sort((a, b)=>a.observed_at - b.observed_at || compareText(a.source_id, b.source_id) || compareText(a.artifact_id, b.artifact_id) || a.ordinal - b.ordinal);
+    return {
+        l1: l2.filter((e)=>e.source_kind !== 'tool_result'),
+        l2
+    };
+}
+export function extractRoutingFacets(text) {
+    const entities = [], topics = [], kinds = [];
+    const heading = /^\s*#{1,6}\s+(.+?)\s*#*\s*$/u.exec(text);
+    if (heading) {
+        topics.push(heading[1]);
+        kinds.push('heading', 'topic');
+    }
+    const controlled = /^(?:State|Correction|Decision|Negative fact|Constraint|Concept|Fact):\s*([^|=]+)\|/iu.exec(text);
+    if (controlled) entities.push(controlled[1]);
+    if (text.trim().startsWith('{')) try {
+        const row = JSON.parse(text);
+        if (typeof row.entity === 'string') entities.push(row.entity);
+        if (typeof row.predicate === 'string') topics.push(row.predicate);
+    } catch  {}
+    for (const m of text.matchAll(/(?:^|[\s,;|])([\p{L}_][\p{L}\p{N}_.-]*)\s*[:=]/gu)){
+        topics.push(m[1]);
+        if (/^(?:entity|subject|project|system|subsystem|product|service)$/iu.test(m[1])) {
+            const value = /^\s*([^\s,;|]+)/u.exec(text.slice(m.index + m[0].length));
+            if (value) entities.push(value[1]);
+        }
+    }
+    for (const m of text.matchAll(/\b[\p{Lu}][\p{L}\p{N}]*(?:[-_.][\p{L}\p{N}]+)+\b|\b[\p{Lu}][\p{L}\p{N}]{1,}\b/gu)){
+        if (!/^(?:The|This|That|There|These|Those|It|We|No|Not|Fact|State|Correction|Decision|Constraint|Concept|Negative|Report|Status|Return)$/u.test(m[0])) entities.push(m[0]);
+    }
+    for (const m of text.matchAll(/\b[\p{L}][\p{L}\p{N}]*(?:[-_.][\p{L}\p{N}]+)+\b/gu))if (/[\p{N}\p{Lu}]/u.test(m[0])) entities.push(m[0]);
+    if (/\b(?:status|current)\b/iu.test(text)) kinds.push('status');
+    if (/\b(?:changed?|unchanged|correction|replac\w*|release|previous)\b/iu.test(text)) kinds.push('status', 'change');
+    if (/\b(?:except\w*|unless|only|provided|if|when|without|must|never|constraint|not|cannot|may|might|conditional|unchanged|ambig\w*|unknown|undocumented|absen\w*|no)\b/iu.test(text)) kinds.push('qualification', 'constraint');
+    if (/\b(?:propos\w*|reject\w*|declin\w*|instead)\b/iu.test(text)) kinds.push('proposal');
+    if (/\b(?:anomal\w*|fault\w*|exception\w*|quarantine|outlier|failure|error)\b/iu.test(text)) kinds.push('anomaly');
+    if (/\bdecision\b/iu.test(text)) kinds.push('decision');
+    if (/\bnegative fact\b/iu.test(text)) kinds.push('negative');
+    if (text.includes('|') || text.includes('\t')) kinds.push('table');
+    return {
+        entityKeys: unique(entities.map(routingKey).filter((k)=>k && k !== 'record')),
+        topicKeys: unique(topics.map(routingKey)),
+        facetKinds: unique(kinds.length ? kinds : [
+            'content'
+        ])
+    };
+}
+function evidenceEntry(rows, dependencies = [], extraKinds = []) {
+    const text = rows.map((e, i)=>(i > 0 && !(e.artifact_id === rows[i - 1].artifact_id && e.byte_start === rows[i - 1].byte_end) ? '\n[noncontiguous excerpt]\n' : '') + e.body).join(''), first = rows[0], facets = extractRoutingFacets(text);
+    return {
+        textKind: 'extractive',
+        entryId: stableId('cf-wiki-entry-v2', first.source_id, rows.map((e)=>e.span_id), text),
+        text,
+        spanIds: unique(rows.map((e)=>e.span_id)),
+        dependencyNodeIds: unique(dependencies),
+        entityKeys: facets.entityKeys,
+        topicKeys: facets.topicKeys,
+        facetKinds: unique([
+            ...facets.facetKinds,
+            ...extraKinds
+        ]),
+        ordinal: first.ordinal,
+        observedAt: first.observed_at,
+        sourceId: first.source_id,
+        artifactId: first.artifact_id,
+        trustClass: first.trust_class,
+        fidelity: first.fidelity,
+        spans: rows.map((e)=>({
+                spanId: e.span_id,
+                sourceId: e.source_id,
+                artifactId: e.artifact_id,
+                byteStart: e.byte_start,
+                byteEnd: e.byte_end
+            }))
+    };
+}
+export function buildWikiPages(evidence, facts) {
+    const pages = new Map();
+    const add = (key, title, entry)=>{
+        let page = pages.get(key);
+        if (!page) {
+            page = {
+                title,
+                entries: [],
+                observed: entry.observedAt
+            };
+            pages.set(key, page);
+        }
+        if (!page.entries.some((e)=>e.entryId === entry.entryId)) page.entries.push(entry);
+        page.observed = Math.max(page.observed, entry.observedAt);
+    };
+    const bySource = new Map();
+    for (const e of evidence){
+        const rows = bySource.get(e.source_id) ?? [];
+        rows.push(e);
+        bySource.set(e.source_id, rows);
+    }
+    const spanDeps = new Map();
+    for (const fact of facts)for (const span of fact.spanIds)spanDeps.set(span, unique([
+        ...spanDeps.get(span) ?? [],
+        ...fact.dependencyNodeIds
+    ]));
+    for (const [sourceId, rows] of bySource){
+        let heading;
+        let headingEntities = [];
+        const entries = [];
+        for (const row of rows){
+            const entry = evidenceEntry([
+                row
+            ], spanDeps.get(row.span_id));
+            if (entry.facetKinds.includes('heading')) {
+                heading = row.body.replace(/^\s*#+\s*/u, '').trim();
+                headingEntities = entry.entityKeys;
+            }
+            if (heading) {
+                entry.topicKeys = unique([
+                    ...entry.topicKeys,
+                    routingKey(heading)
+                ]);
+                entry.entityKeys = unique([
+                    ...entry.entityKeys,
+                    ...headingEntities
+                ]);
+            }
+            entries.push(entry);
+            add(`wiki/sources/${sourceId}`, heading ?? `Source ${sourceId}`, entry);
+            add(`wiki/timeline/${new Date(row.observed_at).toISOString().slice(0, 10)}`, 'Timeline', entry);
+        }
+        for(let i = 0; i < rows.length; i++){
+            if (!/[|\t]/u.test(rows[i].body)) continue;
+            const start = i;
+            while(i + 1 < rows.length && /[|\t]/u.test(rows[i + 1].body))i++;
+            const end = i;
+            const prefix = rows.slice(Math.max(0, start - 2), start);
+            const header = rows[start];
+            const divider = start + 1 <= end && /^\s*\|?[\s:|-]+\|?\s*$/u.test(rows[start + 1].body) ? rows[start + 1] : undefined;
+            const suffix = rows.slice(end + 1, Math.min(rows.length, end + 3)).filter((e)=>extractRoutingFacets(e.body).facetKinds.some((k)=>[
+                        'qualification',
+                        'heading'
+                    ].includes(k)) || /\b(?:author|inspector|units?|report)\b/iu.test(e.body));
+            for(let j = start + (divider ? 2 : 1); j <= end; j++){
+                const members = [
+                    ...prefix,
+                    header,
+                    ...divider ? [
+                        divider
+                    ] : [],
+                    rows[j],
+                    ...suffix
+                ];
+                const entry = evidenceEntry(members, unique(members.flatMap((e)=>spanDeps.get(e.span_id) ?? [])), [
+                    'table'
+                ]);
+                const tableHeading = entries.filter((e)=>e.ordinal <= rows[start].ordinal && e.facetKinds.includes('heading')).at(-1);
+                if (tableHeading) {
+                    entry.topicKeys = unique([
+                        ...entry.topicKeys,
+                        ...tableHeading.topicKeys
+                    ]);
+                    entry.entityKeys = unique([
+                        ...entry.entityKeys,
+                        ...tableHeading.entityKeys
+                    ]);
+                }
+                entry.ordinal = rows[j].ordinal;
+                entries.push(entry);
+                add(`wiki/tables/${sourceId}`, 'Table excerpts', entry);
+            }
+        }
+        const summaryEntries = [
+            ...entries
+        ].sort((a, b)=>{
+            const priority = (e)=>e.facetKinds.some((k)=>[
+                        'qualification',
+                        'proposal',
+                        'anomaly'
+                    ].includes(k)) ? 0 : e.facetKinds.includes('change') ? 1 : e.facetKinds.includes('heading') || e.ordinal === rows[0].ordinal ? 2 : 3;
+            return priority(a) - priority(b) || entryOrder(a, b);
+        });
+        let chars = 0;
+        const included = [];
+        for (const entry of summaryEntries)if (included.length < 32 && chars + entry.text.length <= 8192) {
+            included.push(entry);
+            chars += entry.text.length;
+        }
+        if (included.length) {
+            for (const entry of included)add(`wiki/summaries/${sourceId}`, `Source summary: ${heading ?? sourceId}`, entry);
+            pages.get(`wiki/summaries/${sourceId}`).omission = {
+                totalEntries: entries.length,
+                includedEntries: included.length,
+                omittedEntries: entries.length - included.length,
+                complete: included.length === entries.length,
+                sourceHandle: `wiki/sources/${sourceId}`
+            };
+        }
+        for (const entry of entries){
+            for (const entity of entry.entityKeys)add(`wiki/entities/${encodeURIComponent(entity)}`, entity, entry);
+            for (const topic of entry.topicKeys)add(`wiki/concepts/${encodeURIComponent(topic)}`, topic, entry);
+            for (const kind of entry.facetKinds){
+                if ([
+                    'status',
+                    'change',
+                    'proposal',
+                    'anomaly'
+                ].includes(kind)) {
+                    const subjects = entry.entityKeys.length ? entry.entityKeys : [
+                        `source-${sourceId}`
+                    ];
+                    for (const subject of subjects)add(`wiki/status/${encodeURIComponent(subject)}/${kind}`, `${kind}: ${subject}`, entry);
+                }
+                if (kind === 'decision') add('wiki/decisions/decision-log', 'Decision log', entry);
+                if (kind === 'negative') add('wiki/facts/negative-facts', 'Negative facts', entry);
+                if (kind === 'constraint') add('wiki/facts/constraints', 'Constraints', entry);
+            }
+        }
+    }
+    for (const entry of facts){
+        for (const entity of entry.entityKeys)add(`wiki/entities/${encodeURIComponent(entity)}`, entity, entry);
+        for (const topic of entry.topicKeys)add(`wiki/status/${encodeURIComponent(entry.entityKeys[0] ?? `source-${entry.sourceId}`)}/${encodeURIComponent(topic)}`, `Status: ${topic}`, entry);
+        if (entry.facetKinds.includes('decision')) add('wiki/decisions/decision-log', 'Decision log', entry);
+        if (entry.facetKinds.includes('negative')) add('wiki/facts/negative-facts', 'Negative facts', entry);
+        if (entry.facetKinds.includes('constraint')) add('wiki/facts/constraints', 'Constraints', entry);
+    }
+    const bounded = new Map();
+    for (const [key, page] of [
+        ...pages
+    ].sort(([a], [b])=>compareText(a, b))){
+        page.entries.sort(entryOrder);
+        let part = 0, chars = 0, entries = [];
+        const flush = ()=>{
+            if (entries.length) {
+                bounded.set(part === 0 ? key : `${key}/part-${String(part + 1).padStart(4, '0')}`, {
+                    ...page,
+                    entries
+                });
+                part++;
+                entries = [];
+                chars = 0;
+            }
+        };
+        for (const entry of page.entries){
+            if (entries.length && (entries.length >= 64 || chars + entry.text.length > 16384)) flush();
+            entries.push(entry);
+            chars += entry.text.length;
+        }
+        flush();
+    }
+    return bounded;
+}
 function decimalSubtract(a, b) {
     const places = Math.max((a.split('.')[1] ?? '').length, (b.split('.')[1] ?? '').length);
     const integer = (x)=>BigInt(x.replace('.', '') + '0'.repeat(places - (x.split('.')[1] ?? '').length));
@@ -134,10 +422,10 @@ export class ContextForgeCompiler {
         this.store.assertNamespace(namespaceId, 'write');
         return this.store.transaction(()=>{
             const db = this.store.db;
-            const evidence = db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,c.span_id,c.body,a.fidelity FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' AND s.kind<>'tool_result' ORDER BY s.observed_at,s.source_id,c.ordinal,c.chunk_id`).all(namespaceId);
-            const sourceIds = [
-                ...new Set(evidence.map((e)=>e.source_id))
-            ].sort();
+            const collected = collectEvidence(this.store, namespaceId), evidence = collected.l1;
+            const sourceIds = unique(collected.l2.map((e)=>e.source_id));
+            const before = db.prepare("SELECT node_id,logical_key FROM derived_nodes WHERE namespace_id=? AND layer IN (1,2) AND status='active'").all(namespaceId);
+            const beforeIds = new Set(before.map((n)=>String(n.node_id))), beforeKeys = new Set(before.map((n)=>String(n.logical_key)));
             const made = [];
             for (const e of evidence){
                 const assertions = extractAssertions(e.body), extracted = [];
@@ -155,7 +443,9 @@ export class ContextForgeCompiler {
                     const shared = parsed.stateKey && parsed.replace && authoritative;
                     let key = shared ? `state/${parsed.stateKey}` : `fact/${e.span_id}/${index}`;
                     const existing = db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND logical_key=? AND status='active'").get(namespaceId, key);
-                    if (shared && existing && Number(existing.observed_at) > e.observed_at) {
+                    const currentSpan = shared && existing ? db.prepare(`SELECT p.source_id,p.artifact_id,p.byte_start FROM provenance v JOIN spans p USING(span_id) WHERE v.node_id=? ORDER BY p.source_id,p.artifact_id,p.byte_start DESC LIMIT 1`).get(existing.node_id) : undefined;
+                    const older = existing && (Number(existing.observed_at) > e.observed_at || Number(existing.observed_at) === e.observed_at && currentSpan && (compareText(String(currentSpan.source_id), e.source_id) > 0 || currentSpan.source_id === e.source_id && (compareText(String(currentSpan.artifact_id), e.artifact_id) > 0 || currentSpan.artifact_id === e.artifact_id && Number(currentSpan.byte_start) > e.byte_start)));
+                    if (shared && existing && older) {
                         const prior = db.prepare('SELECT n.* FROM derived_nodes n JOIN provenance p USING(node_id) WHERE n.namespace_id=? AND n.logical_key=? AND p.span_id=? LIMIT 1').get(namespaceId, key, e.span_id);
                         if (prior) {
                             extracted.push(prior.node_id);
@@ -207,87 +497,121 @@ export class ContextForgeCompiler {
                 });
             }
             const facts = db.prepare(`SELECT n.*,f.entity_id,f.predicate,f.polarity,f.assertion_kind,e.display_name,e.entity_key FROM derived_nodes n JOIN facts f USING(node_id) LEFT JOIN entities e USING(entity_id) WHERE n.namespace_id=? AND n.status='active' ORDER BY n.observed_at,n.node_id`).all(namespaceId);
-            const pages = new Map();
-            const add = (key, title, rawBody, spanIds, deps, observed)=>{
-                const body = rawBody.replace(/\[span:([a-f0-9]{64})\]/g, '[ref-span:$1]');
-                let page = pages.get(key);
-                if (!page) {
-                    page = {
-                        title,
-                        lines: new Map(),
-                        spans: new Set(),
-                        deps: new Set(),
-                        observed
-                    };
-                    pages.set(key, page);
-                }
-                const citation = spanIds.map((s)=>`[span:${s}]`).join(' ');
-                page.lines.set(stableId('cf-wiki-line-v1', body, spanIds), `${body} ${citation}`);
-                spanIds.forEach((s)=>page.spans.add(s));
-                deps.forEach((s)=>page.deps.add(s));
-                page.observed = Math.max(page.observed, observed);
-            };
-            for (const e of evidence){
-                add(`wiki/sources/${e.source_id}`, `Source ${e.source_id}`, e.body.trim(), [
-                    e.span_id
-                ], [], e.observed_at);
-                add(`wiki/timeline/${new Date(e.observed_at).toISOString().slice(0, 10)}`, 'Timeline', e.body.trim(), [
-                    e.span_id
-                ], [], e.observed_at);
-                for (const heading of e.body.matchAll(/^#+\s+(.+)$/gm))add(`wiki/concepts/${encodeURIComponent(heading[1].trim())}`, heading[1].trim(), e.body.trim(), [
-                    e.span_id
-                ], [], e.observed_at);
-            }
+            const factEntries = [];
             for (const f of facts){
-                const spans = this.store.getProvenance(f.node_id).map((p)=>p.spanId), body = (f.assertion_kind === 'unresolved_candidate' ? 'Unresolved candidate: ' : '') + String(f.body);
-                add(`wiki/entities/${f.entity_id}`, String(f.display_name), body, spans, [
-                    f.node_id
-                ], Number(f.observed_at));
-                if (f.assertion_kind === 'unresolved_candidate') continue;
-                if (f.predicate === 'decision') add('wiki/decisions/decision-log', 'Decision log', body, spans, [
-                    f.node_id
-                ], Number(f.observed_at));
-                if (f.polarity === -1) add('wiki/facts/negative-facts', 'Negative facts', body, spans, [
-                    f.node_id
-                ], Number(f.observed_at));
-                if (f.predicate === 'constraint') add('wiki/facts/constraints', 'Constraints', body, spans, [
-                    f.node_id
-                ], Number(f.observed_at));
-                if (f.predicate === 'concept') add(`wiki/concepts/${encodeURIComponent(String(f.body))}`, 'Concept', body, spans, [
-                    f.node_id
-                ], Number(f.observed_at));
-                add(`wiki/status/${f.entity_id}/${encodeURIComponent(String(f.predicate))}`, 'Status: ' + f.display_name, body, spans, [
-                    f.node_id
-                ], Number(f.observed_at));
+                const provenance = this.store.getProvenance(String(f.node_id));
+                if (!provenance.length) continue;
+                const primary = provenance[0], source = this.store.getSource(primary.sourceId);
+                const body = (f.assertion_kind === 'unresolved_candidate' ? 'Unresolved candidate: ' : '') + String(f.body);
+                const facets = extractRoutingFacets(body);
+                factEntries.push({
+                    textKind: 'derived',
+                    entryId: stableId('cf-wiki-fact-entry-v2', f.node_id, body),
+                    text: body,
+                    spanIds: provenance.map((p)=>p.spanId),
+                    dependencyNodeIds: [
+                        String(f.node_id)
+                    ],
+                    entityKeys: unique([
+                        ...facets.entityKeys,
+                        ...f.entity_key === 'record' ? [] : [
+                            routingKey(String(f.entity_key))
+                        ]
+                    ]),
+                    topicKeys: unique([
+                        ...facets.topicKeys,
+                        routingKey(String(f.predicate))
+                    ]),
+                    facetKinds: unique([
+                        ...facets.facetKinds,
+                        ...f.polarity === -1 ? [
+                            'negative'
+                        ] : [],
+                        ...[
+                            'decision',
+                            'constraint',
+                            'concept'
+                        ].includes(String(f.predicate)) ? [
+                            String(f.predicate)
+                        ] : []
+                    ]),
+                    ordinal: collected.l2.find((e)=>e.span_id === primary.spanId)?.ordinal ?? 0,
+                    observedAt: Number(f.observed_at),
+                    sourceId: primary.sourceId,
+                    artifactId: primary.artifactId,
+                    trustClass: source.trustClass,
+                    fidelity: String(db.prepare('SELECT fidelity FROM artifacts WHERE artifact_id=?').get(primary.artifactId).fidelity),
+                    spans: provenance.map((p)=>({
+                            spanId: p.spanId,
+                            sourceId: p.sourceId,
+                            artifactId: p.artifactId,
+                            byteStart: p.byteStart,
+                            byteEnd: p.byteEnd
+                        }))
+                });
             }
-            for (const [key, p] of [
-                ...pages
-            ].sort(([a], [b])=>a.localeCompare(b))){
+            const routingEvidence = [];
+            const ordinals = new Map();
+            for (const row of collected.l2){
+                const bytes = Buffer.from(row.body);
+                for(let start = 0; start < bytes.length;){
+                    let end = Math.min(bytes.length, start + 2048);
+                    while(end < bytes.length && (bytes[end] & 0xc0) === 0x80)end--;
+                    const ordinal = ordinals.get(row.source_id) ?? 0;
+                    ordinals.set(row.source_id, ordinal + 1);
+                    routingEvidence.push({
+                        ...row,
+                        ordinal,
+                        body: bytes.subarray(start, end).toString('utf8'),
+                        byte_start: row.byte_start + start,
+                        byte_end: row.byte_start + end,
+                        span_id: start === 0 && end === bytes.length ? row.span_id : this.store.createSpan(row.source_id, row.artifact_id, row.byte_start + start, row.byte_start + end)
+                    });
+                    start = end;
+                }
+            }
+            const pages = buildWikiPages(routingEvidence, factEntries);
+            for (const [key, p] of pages){
+                const deps = unique(p.entries.flatMap((e)=>e.dependencyNodeIds)), spans = unique(p.entries.flatMap((e)=>e.spanIds));
+                const render = (text)=>text.replace(/\[span:([a-f0-9]{64})\]/g, '[ref-span:$1]');
                 made.push(this.store.publishNode({
                     namespaceId,
                     layer: 2,
                     logicalKey: key,
                     kind: 'wiki',
                     title: p.title,
-                    body: [
-                        ...p.lines
-                    ].sort(([a], [b])=>a.localeCompare(b)).map(([, v])=>v).join('\n'),
+                    body: p.entries.map((e)=>`${render(e.text)} ${e.spanIds.map((s)=>`[span:${s}]`).join(' ')}`).join('\n'),
                     canonical: {
-                        template: 'extractive-v1',
-                        dependencies: [
-                            ...p.deps
-                        ].sort()
+                        template: WIKI_COMPILER_VERSION,
+                        entries: p.entries,
+                        dependencies: deps,
+                        ...p.omission ? {
+                            omission: p.omission
+                        } : {}
                     },
-                    compilerVersion: COMPILER_VERSION,
+                    compilerVersion: WIKI_COMPILER_VERSION,
                     observedAt: p.observed,
-                    spanIds: [
-                        ...p.spans
-                    ],
-                    dependencyNodeIds: [
-                        ...p.deps
-                    ],
-                    extractionRule: 'extractive-wiki-v1'
+                    spanIds: spans,
+                    dependencyNodeIds: deps,
+                    extractionRule: WIKI_COMPILER_VERSION
                 }));
+            }
+            const retiredNodeIds = [];
+            const obsolete = db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND layer=2 AND kind='wiki' AND status='active' ORDER BY logical_key,node_id").all(namespaceId);
+            for (const node of obsolete){
+                const template = JSON.parse(String(node.canonical_json)).template;
+                if (!String(node.logical_key).startsWith('wiki/') || ![
+                    COMPILER_VERSION,
+                    WIKI_COMPILER_VERSION
+                ].includes(String(node.compiler_version)) || ![
+                    'extractive-v1',
+                    WIKI_COMPILER_VERSION
+                ].includes(template) || pages.has(String(node.logical_key))) continue;
+                const cause = collected.l2[0]?.span_id ?? this.store.getProvenance(String(node.node_id))[0]?.spanId;
+                if (!cause) throw new Error('Compiler page retirement requires a source span');
+                db.prepare("UPDATE derived_nodes SET status='withdrawn' WHERE node_id=? AND status='active'").run(node.node_id);
+                db.prepare('INSERT INTO lifecycle_events VALUES(?,?,?,?,?,?,?,?,?,?)').run(stableId('cf-wiki-retirement-v2', node.node_id), namespaceId, null, node.node_id, 'active', 'withdrawn', cause, Date.now(), 'compiler', 'obsolete compiler-owned wiki partition');
+                retiredNodeIds.push(String(node.node_id));
             }
             const nodes = db.prepare("SELECT node_id,content_sha256 FROM derived_nodes WHERE namespace_id=? AND layer IN (1,2) AND status='active' ORDER BY node_id").all(namespaceId);
             const manifest = canonicalJson(nodes.map((r)=>({
@@ -295,18 +619,38 @@ export class ContextForgeCompiler {
                     sha256: r.content_sha256
                 }))), hash = sha256(manifest);
             const jobs = db.prepare("SELECT * FROM compile_jobs WHERE source_id IN (SELECT source_id FROM sources WHERE namespace_id=?) AND state IN ('queued','leased') ORDER BY job_id").all(namespaceId);
-            const generation = jobs.length ? this.store.bumpGeneration(namespaceId) : Number(db.prepare('SELECT generation FROM namespaces WHERE namespace_id=?').get(namespaceId).generation);
-            for (const job of jobs){
-                db.prepare('INSERT INTO compile_receipts VALUES(?,?,?,?,?,?,?,?,?)').run(stableId('cf-receipt-v1', job.job_id, hash), job.job_id, namespaceId, job.input_sha256, COMPILER_VERSION, manifest, canonicalJson({
+            const createdNodeIds = unique(made.filter((n)=>!beforeIds.has(n.nodeId) && !beforeKeys.has(n.logicalKey)).map((n)=>n.nodeId));
+            const revisedNodeIds = unique(made.filter((n)=>!beforeIds.has(n.nodeId) && beforeKeys.has(n.logicalKey)).map((n)=>n.nodeId));
+            const unchangedNodeIds = unique(made.filter((n)=>beforeIds.has(n.nodeId)).map((n)=>n.nodeId));
+            const activeSourceIds = db.prepare("SELECT s.source_id FROM sources s JOIN source_lifecycle l USING(source_id) WHERE s.namespace_id=? AND l.status='active' ORDER BY s.source_id").all(namespaceId).map((s)=>String(s.source_id));
+            const unprocessedSourceIds = activeSourceIds.filter((id)=>!sourceIds.includes(id));
+            const changed = createdNodeIds.length + revisedNodeIds.length + retiredNodeIds.length > 0;
+            const generation = changed ? this.store.bumpGeneration(namespaceId) : Number(db.prepare('SELECT generation FROM namespaces WHERE namespace_id=?').get(namespaceId).generation);
+            const receiptJobs = jobs.length ? jobs : changed ? db.prepare("SELECT * FROM compile_jobs WHERE source_id IN (SELECT source_id FROM sources WHERE namespace_id=?) AND state='done' ORDER BY job_id LIMIT 1").all(namespaceId) : [];
+            for (const job of receiptJobs){
+                db.prepare('INSERT OR IGNORE INTO compile_receipts VALUES(?,?,?,?,?,?,?,?,?)').run(stableId('cf-receipt-v1', job.job_id, hash), job.job_id, namespaceId, job.input_sha256, COMPILER_VERSION, manifest, canonicalJson({
                     sourceCount: sourceIds.length,
-                    parser: 'controlled-grammar-v1'
+                    parser: 'controlled-grammar-v1',
+                    compilerVersion: COMPILER_VERSION,
+                    wikiCompilerVersion: WIKI_COMPILER_VERSION,
+                    createdNodeIds,
+                    revisedNodeIds,
+                    unchangedNodeIds,
+                    retiredNodeIds,
+                    unprocessedSourceIds
                 }), generation, Date.now());
-                db.prepare("UPDATE compile_jobs SET state='done',lease_until=NULL WHERE job_id=?").run(job.job_id);
+                if (job.state !== 'done') db.prepare("UPDATE compile_jobs SET state='done',lease_until=NULL WHERE job_id=?").run(job.job_id);
             }
             const lint = this.lintWiki(namespaceId);
             if (!lint.ok) throw new Error('Compiler provenance validation failed: ' + canonicalJson(lint.issues));
             return {
                 compilerVersion: COMPILER_VERSION,
+                wikiCompilerVersion: WIKI_COMPILER_VERSION,
+                createdNodeIds,
+                revisedNodeIds,
+                unchangedNodeIds,
+                retiredNodeIds,
+                unprocessedSourceIds,
                 namespaceId,
                 sourceIds,
                 nodeIds: nodes.map((r)=>r.node_id),
@@ -356,6 +700,104 @@ export class ContextForgeCompiler {
                 }
             }
             if (node.layer === 2) {
+                let canonical;
+                try {
+                    canonical = JSON.parse(String(node.canonical_json));
+                } catch  {
+                    issues.push({
+                        nodeId: String(node.node_id),
+                        code: 'invalid_canonical'
+                    });
+                }
+                if (canonical?.template === WIKI_COMPILER_VERSION) {
+                    const issue = (code)=>issues.push({
+                            nodeId: String(node.node_id),
+                            code
+                        });
+                    const pageSpans = new Set(provenance.map((p)=>p.spanId)), seen = new Set(), entrySpans = new Set(), entryDeps = new Set();
+                    if (node.compiler_version !== WIKI_COMPILER_VERSION) issue('invalid_wiki_version');
+                    if (!Array.isArray(canonical.entries) || !canonical.entries.length) issue('missing_entries');
+                    else {
+                        for (const entry of canonical.entries){
+                            if (!entry || typeof entry.entryId !== 'string' || seen.has(entry.entryId) || typeof entry.text !== 'string' || !Array.isArray(entry.spanIds) || !entry.spanIds.length || !Array.isArray(entry.spans) || !Array.isArray(entry.dependencyNodeIds)) {
+                                issue('invalid_entry');
+                                continue;
+                            }
+                            seen.add(entry.entryId);
+                            if (!Number.isSafeInteger(entry.ordinal) || entry.ordinal < 0 || ![
+                                'extractive',
+                                'derived'
+                            ].includes(entry.textKind) || typeof entry.trustClass !== 'string' || typeof entry.fidelity !== 'string') issue('invalid_entry_metadata');
+                            if (!entry.spans.some((span)=>span.sourceId === entry.sourceId && span.artifactId === entry.artifactId)) issue('entry_source_mismatch');
+                            for (const spanId of entry.spanIds){
+                                entrySpans.add(spanId);
+                                if (!pageSpans.has(spanId)) issue('entry_unlinked_span');
+                            }
+                            const exactParts = [];
+                            for (const span of entry.spans){
+                                const p = provenance.find((p)=>p.spanId === span.spanId);
+                                if (!p || !entry.spanIds.includes(span.spanId) || p.sourceId !== span.sourceId || p.artifactId !== span.artifactId || p.byteStart !== span.byteStart || p.byteEnd !== span.byteEnd) {
+                                    issue('entry_span_mismatch');
+                                    continue;
+                                }
+                                const artifact = this.store.db.prepare('SELECT blob_sha256,fidelity FROM artifacts WHERE artifact_id=?').get(p.artifactId);
+                                const source = this.store.getSource(p.sourceId);
+                                if (entry.textKind === 'extractive' && (entry.sourceId !== p.sourceId || entry.artifactId !== p.artifactId || entry.trustClass !== source?.trustClass || entry.fidelity !== artifact.fidelity)) issue('entry_authority_mismatch');
+                                try {
+                                    const sha = String(artifact.blob_sha256);
+                                    let bytes = blobCache.get(sha);
+                                    if (!bytes) {
+                                        bytes = this.store.readBlob(sha);
+                                        blobCache.set(sha, bytes);
+                                    }
+                                    const index = entry.spans.indexOf(span), previous = entry.spans[index - 1];
+                                    if (previous && !(previous.artifactId === span.artifactId && previous.byteEnd === span.byteStart)) exactParts.push(Buffer.from('\n[noncontiguous excerpt]\n'));
+                                    exactParts.push(bytes.subarray(p.byteStart, p.byteEnd));
+                                } catch  {
+                                    issue('quote_hash_mismatch');
+                                }
+                            }
+                            if (unique(entry.spans.map((s)=>String(s.spanId))).join(',') !== unique(entry.spanIds).join(',')) issue('entry_span_mismatch');
+                            if (entry.textKind === 'extractive') {
+                                if (Buffer.concat(exactParts).toString('utf8') !== entry.text) issue('entry_quote_mismatch');
+                                if (entry.entryId !== stableId('cf-wiki-entry-v2', entry.sourceId, entry.spans.map((s)=>s.spanId), entry.text)) issue('entry_id_mismatch');
+                            } else if (!entry.dependencyNodeIds.length) issue('derived_entry_missing_dependency');
+                            for (const id of entry.dependencyNodeIds){
+                                entryDeps.add(id);
+                                const dependency = this.store.db.prepare('SELECT namespace_id,status FROM derived_nodes WHERE node_id=?').get(id);
+                                if (!dependency || dependency.namespace_id !== namespaceId || dependency.status !== 'active') issue('invalid_entry_dependency');
+                                else {
+                                    const support = new Set(this.store.getProvenance(id).map((p)=>p.spanId));
+                                    if (!entry.spanIds.some((id)=>support.has(id)) || entry.textKind === 'derived' && [
+                                        ...support
+                                    ].some((id)=>!entry.spanIds.includes(id))) issue('entry_dependency_unlinked');
+                                }
+                            }
+                        }
+                        if ([
+                            ...pageSpans
+                        ].some((id)=>!entrySpans.has(id))) issue('unmapped_page_provenance');
+                        const expected = canonical.entries.filter((e)=>e && typeof e.text === 'string' && Array.isArray(e.spanIds)).map((e)=>`${e.text.replace(/\[span:([a-f0-9]{64})\]/g, '[ref-span:$1]')} ${e.spanIds.map((id)=>`[span:${id}]`).join(' ')}`).join('\n');
+                        if (expected !== node.body) issue('unmapped_page_text');
+                    }
+                    if (!Array.isArray(canonical.dependencies) || unique(canonical.dependencies).join(',') !== unique([
+                        ...entryDeps
+                    ]).join(',')) issue('invalid_page_dependencies');
+                    const edges = this.store.db.prepare("SELECT parent_node_id FROM derivation_edges WHERE child_node_id=? AND relation IN ('compiles','depends_on') ORDER BY parent_node_id").all(node.node_id).map((r)=>String(r.parent_node_id));
+                    if (unique(edges).join(',') !== unique([
+                        ...entryDeps
+                    ]).join(',')) issue('invalid_dependency_edges');
+                    if (canonical.omission) {
+                        const o = canonical.omission;
+                        if (!Number.isSafeInteger(o.totalEntries) || !Number.isSafeInteger(o.includedEntries) || !Number.isSafeInteger(o.omittedEntries) || o.omittedEntries < 0 || o.includedEntries < 0 || o.totalEntries !== o.includedEntries + o.omittedEntries || o.includedEntries !== (canonical.entries?.length ?? 0) || o.complete !== (o.omittedEntries === 0) || typeof o.sourceHandle !== 'string' || !o.sourceHandle.startsWith('wiki/sources/')) issue('invalid_omission_metadata');
+                        else {
+                            const fallback = this.store.db.prepare("SELECT namespace_id FROM derived_nodes WHERE namespace_id=? AND logical_key=? AND layer=2 AND status='active'").get(namespaceId, o.sourceHandle);
+                            if (!fallback) issue('missing_source_fallback');
+                        }
+                    }
+                }
+            }
+            if (node.layer === 2) {
                 for (const match of String(node.body).matchAll(/\[span:([a-f0-9]{64})\]/g))if (!provenance.some((p)=>p.spanId === match[1])) issues.push({
                     nodeId: node.node_id,
                     code: 'unlinked_citation'
@@ -368,7 +810,16 @@ export class ContextForgeCompiler {
                     'missing_provenance',
                     'invalid_source',
                     'unlinked_citation',
-                    'quote_hash_mismatch'
+                    'quote_hash_mismatch',
+                    'entry_unlinked_span',
+                    'entry_span_mismatch',
+                    'entry_quote_mismatch',
+                    'entry_authority_mismatch',
+                    'entry_source_mismatch',
+                    'entry_dependency_unlinked',
+                    'invalid_entry_dependency',
+                    'unmapped_page_provenance',
+                    'unmapped_page_text'
                 ].includes(i.code)).length,
             issues
         };

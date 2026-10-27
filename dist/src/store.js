@@ -1,10 +1,40 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, lstatSync, chmodSync, openSync, closeSync, writeFileSync, fsyncSync, renameSync, readFileSync, unlinkSync, existsSync, constants } from 'node:fs';
+import { mkdirSync, lstatSync, chmodSync, openSync, closeSync, readSync, fstatSync, writeFileSync, fsyncSync, renameSync, readFileSync, unlinkSync, existsSync, constants } from 'node:fs';
 import { resolve, dirname, join, parse } from 'node:path';
+import { analyzeRecallQuery, tokenizeRecallText, buildFtsQuery, lexicalProjectionTitle, canonicalRecallTitle, LEXICAL_VERSION } from './retrieval.js';
 import { configureDatabase, migrate } from './schema.js';
 export const COMPILER_VERSION = 'deterministic-v1';
 export const INLINE_THRESHOLD = 64 * 1024;
+export const EVIDENCE_CHUNK_BYTES = 2048;
+export function createStoreReadBudget(options = {}) {
+    const b = {
+        maxInspected: options.maxInspected ?? 4096,
+        maxBytes: options.maxBytes ?? 8 * 1024 * 1024,
+        deadlineAt: options.deadlineAt ?? Infinity,
+        inspected: 0,
+        bytes: 0
+    };
+    if (!Number.isSafeInteger(b.maxInspected) || b.maxInspected < 0 || !Number.isSafeInteger(b.maxBytes) || b.maxBytes < 0 || Number.isNaN(b.deadlineAt)) throw new Error('Invalid read budget');
+    return b;
+}
+function available(b) {
+    return b.inspected < b.maxInspected && b.bytes < b.maxBytes && Date.now() < b.deadlineAt;
+}
+function readBudget(options) {
+    return options.budget ?? createStoreReadBudget({
+        deadlineAt: options.deadlineAt
+    });
+}
+function readMetadata(rows, metadata) {
+    return Object.defineProperties(rows, Object.fromEntries(Object.entries(metadata).map(([k, value])=>[
+            k,
+            {
+                value,
+                enumerable: false
+            }
+        ])));
+}
 export function canonicalJson(value) {
     if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
     if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
@@ -92,6 +122,7 @@ export class ContextForgeStore {
     ownerId;
     depth = 0;
     writtenBlobs = new Set();
+    recallStatistics = new Map();
     constructor(config){
         if (typeof config === 'string') config = {
             dbPath: config
@@ -109,6 +140,9 @@ export class ContextForgeStore {
             chmodSync(path, 0o600);
             configureDatabase(this.db);
             migrate(this.db);
+            this.db.exec('CREATE INDEX IF NOT EXISTS cf_edges_child ON derivation_edges(child_node_id,parent_node_id,relation)');
+            this.db.exec('CREATE INDEX IF NOT EXISTS cf_spans_artifact_range ON spans(artifact_id,byte_start,span_id)');
+            this.db.exec('CREATE INDEX IF NOT EXISTS cf_chunks_span ON chunks(span_id,chunk_id)');
             if (this.db.prepare('PRAGMA journal_mode').get()?.journal_mode !== 'wal') throw new Error('WAL unavailable');
             this.namespaceId = this.resolveNamespace({
                 namespaceId: config.namespaceId,
@@ -306,35 +340,48 @@ export class ContextForgeStore {
             const mime = input.mimeType ?? 'text/plain';
             if (!/^[\w.+-]+\/[\w.+-]+(?:;[^\r\n]*)?$/.test(mime)) throw new Error('Invalid MIME');
             const fidelity = input.fidelity ?? (input.parentSpanId ? 'machine_inferred' : 'exact');
-            this.db.prepare('INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(id, source.sourceId, input.kind, blob.sha256, mime, input.text ?? null, producer, version, config, fidelity, source.observedAt, canonicalJson(input.metadata ?? {}));
+            const inserted = this.db.prepare('INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(id, source.sourceId, input.kind, blob.sha256, mime, input.text ?? null, producer, version, config, fidelity, source.observedAt, canonicalJson(input.metadata ?? {}));
+            let changed = Number(inserted.changes) > 0;
             if (input.parentSpanId) {
                 const parent = this.db.prepare('SELECT artifact_id,source_id FROM spans WHERE span_id=?').get(input.parentSpanId);
                 if (!parent || parent.source_id !== source.sourceId || parent.artifact_id === id) throw new Error('Invalid artifact lineage');
-                this.db.prepare('INSERT OR IGNORE INTO artifact_lineage VALUES(?,?,?)').run(id, input.parentSpanId, canonicalJson({
+                const lineage = this.db.prepare('INSERT OR IGNORE INTO artifact_lineage VALUES(?,?,?)').run(id, input.parentSpanId, canonicalJson({
                     producer,
                     version,
                     config
                 }));
+                changed = changed || Number(lineage.changes) > 0;
             }
             if (input.asset) {
                 const a = input.asset;
-                this.db.prepare('INSERT OR IGNORE INTO asset_metadata VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(id, a.widthPx ?? null, a.heightPx ?? null, a.durationMs ?? null, a.sampleRateHz ?? null, a.channels ?? null, a.pageCount ?? null, a.frameRateNum ?? null, a.frameRateDen ?? null, a.codec ?? null, a.language ?? null, canonicalJson(a));
+                const asset = this.db.prepare('INSERT OR IGNORE INTO asset_metadata VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(id, a.widthPx ?? null, a.heightPx ?? null, a.durationMs ?? null, a.sampleRateHz ?? null, a.channels ?? null, a.pageCount ?? null, a.frameRateNum ?? null, a.frameRateDen ?? null, a.codec ?? null, a.language ?? null, canonicalJson(a));
+                changed = changed || Number(asset.changes) > 0;
             }
-            this.createSpan(source.sourceId, id, 0, blob.byteLength);
+            const bytes = Buffer.from(input.bytes ?? Buffer.from(input.text ?? ''));
+            this.insertSpan(source.sourceId, id, 0, bytes.length, bytes, source.observedAt, input.text !== undefined);
             if (input.text !== undefined) {
-                if (!Buffer.from(input.text).equals(this.readBlobUnchecked(blob.sha256))) throw new Error('Text artifact bytes differ from indexed text');
+                if (!Buffer.from(input.text).equals(bytes)) throw new Error('Text artifact bytes differ from indexed text');
                 let offset = 0, ordinal = 0;
                 for (const line of input.text.split(/(?<=\n)/u)){
-                    const end = offset + Buffer.byteLength(line);
-                    const span = this.createSpan(source.sourceId, id, offset, end);
-                    if (line.trim()) {
+                    const lineEnd = offset + Buffer.byteLength(line);
+                    while(offset < lineEnd){
+                        let end = Math.min(lineEnd, offset + EVIDENCE_CHUNK_BYTES);
+                        while(end < lineEnd && (bytes[end] & 0xc0) === 0x80)end--;
+                        const text = bytes.subarray(offset, end).toString('utf8');
+                        const span = this.insertSpan(source.sourceId, id, offset, end, bytes, source.observedAt, true);
                         const chunk = stableId('cf-chunk-v1', span, COMPILER_VERSION);
-                        this.db.prepare('INSERT OR IGNORE INTO chunks VALUES(?,?,?,?,?,?,?,?,?,?)').run(chunk, source.namespaceId, span, null, ordinal++, 'paragraph', '', line, '{}', COMPILER_VERSION);
-                        this.db.prepare('INSERT OR IGNORE INTO retrieval_documents(namespace_id,chunk_id,title,body) VALUES(?,?,?,?)').run(source.namespaceId, chunk, '', line);
+                        this.db.prepare('INSERT OR IGNORE INTO chunks VALUES(?,?,?,?,?,?,?,?,?,?)').run(chunk, source.namespaceId, span, null, ordinal++, 'paragraph', '', text, canonicalJson({
+                            byteStart: offset,
+                            byteEnd: end,
+                            lineContinues: end < lineEnd
+                        }), COMPILER_VERSION);
+                        const projection = this.db.prepare('INSERT OR IGNORE INTO retrieval_documents(namespace_id,chunk_id,title,body) VALUES(?,?,?,?)').run(source.namespaceId, chunk, lexicalProjectionTitle('', text), text);
+                        changed = changed || Number(projection.changes) > 0;
+                        offset = end;
                     }
-                    offset = end;
                 }
             }
+            if (changed) this.bumpGeneration(source.namespaceId);
             this.queueCompile(source.sourceId);
             return {
                 artifactId: id,
@@ -359,10 +406,13 @@ export class ContextForgeStore {
         const artifact = this.db.prepare('SELECT * FROM artifacts WHERE artifact_id=? AND source_id=?').get(artifactId, sourceId);
         if (!artifact) throw new Error('Span source mismatch');
         const bytes = this.readBlobUnchecked(artifact.blob_sha256);
+        return this.insertSpan(sourceId, artifactId, start, end, bytes, source.observedAt, artifact.text_content !== null);
+    }
+    insertSpan(sourceId, artifactId, start, end, bytes, observedAt, isText) {
         if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > bytes.length) throw new Error('Span bounds invalid');
-        if (artifact.text_content !== null && (start < bytes.length && (bytes[start] & 0xc0) === 0x80 || end < bytes.length && (bytes[end] & 0xc0) === 0x80)) throw new Error('Span splits UTF-8 codepoint');
+        if (isText && (start < bytes.length && (bytes[start] & 0xc0) === 0x80 || end < bytes.length && (bytes[end] & 0xc0) === 0x80)) throw new Error('Span splits UTF-8 codepoint');
         const id = stableId('cf-span-v1', artifactId, start, end);
-        this.db.prepare('INSERT OR IGNORE INTO spans(span_id,source_id,artifact_id,byte_start,byte_end,selector_json,quote_sha256,observed_at) VALUES(?,?,?,?,?,?,?,?)').run(id, sourceId, artifactId, start, end, '{}', sha256(bytes.subarray(start, end)), source.observedAt);
+        this.db.prepare('INSERT OR IGNORE INTO spans(span_id,source_id,artifact_id,byte_start,byte_end,selector_json,quote_sha256,observed_at) VALUES(?,?,?,?,?,?,?,?)').run(id, sourceId, artifactId, start, end, '{}', sha256(bytes.subarray(start, end)), observedAt);
         return id;
     }
     commitTurn(input) {
@@ -416,6 +466,7 @@ export class ContextForgeStore {
         });
     }
     bumpGeneration(ns) {
+        this.recallStatistics.delete(ns);
         this.db.prepare('UPDATE namespaces SET generation=generation+1 WHERE namespace_id=?').run(ns);
         return Number(this.db.prepare('SELECT generation FROM namespaces WHERE namespace_id=?').get(ns).generation);
     }
@@ -467,7 +518,8 @@ export class ContextForgeStore {
                 this.db.prepare('INSERT INTO lifecycle_events VALUES(?,?,?,?,?,?,?,?,?,?)').run(stableId('cf-event-v1', old.node_id, id), input.namespaceId, null, old.node_id, 'active', 'superseded', spans[0], Date.now(), 'compiler', 'explicit revision');
                 if (input.layer === 3) this.retireEpochs(input.namespaceId, 'derived revision');
             }
-            this.db.prepare('INSERT INTO retrieval_documents(namespace_id,node_id,title,body) VALUES(?,?,?,?)').run(input.namespaceId, id, input.title, input.body);
+            this.db.prepare('INSERT INTO retrieval_documents(namespace_id,node_id,title,body) VALUES(?,?,?,?)').run(input.namespaceId, id, lexicalProjectionTitle(input.title, input.body), input.body);
+            this.bumpGeneration(input.namespaceId);
             return nodeRecord(this.db.prepare('SELECT * FROM derived_nodes WHERE node_id=?').get(id));
         });
     }
@@ -573,6 +625,7 @@ export class ContextForgeStore {
                 this.db.prepare("UPDATE derived_nodes SET status='withdrawn' WHERE node_id=?").run(row.node_id);
                 this.db.prepare('INSERT INTO lifecycle_events VALUES(?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), row.namespace_id, null, row.node_id, 'active', 'withdrawn', causeSpanId, Date.now(), 'owner', reason);
             }
+            if (rows.length) this.bumpGeneration(String(node.namespace_id));
             this.retireEpochs(node.namespace_id, reason);
         });
     }
@@ -593,28 +646,434 @@ export class ContextForgeStore {
     search(query, options = {}) {
         const ns = options.namespaceId ?? this.namespaceId;
         this.assertNamespace(ns);
-        const words = query.match(/[\p{L}\p{N}_]+/gu);
-        if (!words?.length) return [];
-        const match = words.map((w)=>'"' + w.replaceAll('"', '""') + '"').join(' OR ');
-        const limit = options.limit ?? 100, offset = options.offset ?? 0;
-        if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(offset) || offset < 0) throw new Error('Invalid search pagination');
-        const rows = this.db.prepare(`SELECT d.*,bm25(retrieval_fts) AS score FROM retrieval_fts JOIN retrieval_documents d ON d.rowid=retrieval_fts.rowid
+        const recall = analyzeRecallQuery(query), match = buildFtsQuery(recall);
+        const limit = options.limit ?? 100, offset = options.offset ?? 0, maxInspected = options.maxInspected ?? Math.max(256, limit + offset), maxBytes = options.maxBytes ?? 2 * 1024 * 1024, maxRowBytes = options.maxRowBytes ?? 16384, after = options.afterRowid ?? 0;
+        for (const n of [
+            limit,
+            offset,
+            maxInspected,
+            maxBytes,
+            maxRowBytes,
+            after,
+            options.maxStatisticsInspected ?? 1024
+        ])if (!Number.isSafeInteger(n) || n < 0) throw new Error('Invalid search bounds');
+        if (limit < 1 || maxRowBytes < 1) throw new Error('Invalid search bounds');
+        const budget = readBudget(options), startWork = budget.inspected, startBytes = budget.bytes, deadline = Math.min(options.deadlineAt ?? Infinity, budget.deadlineAt);
+        let inspected = 0, bytes = 0, nextRowid = after, truncated = false, statisticsInspected = 0;
+        const rows = [];
+        const done = ()=>readMetadata(rows.map((r)=>({
+                    namespaceId: r.namespace_id,
+                    sourceId: r.resolved_source_id,
+                    nodeId: r.node_id,
+                    chunkId: r.chunk_id,
+                    title: canonicalRecallTitle(String(r.canonical_title)),
+                    body: r.body,
+                    score: r.score,
+                    spanId: r.span_id,
+                    artifactId: r.artifact_id,
+                    byteStart: r.byte_start,
+                    byteEnd: r.byte_end,
+                    layer: r.layer,
+                    status: r.lifecycle_status,
+                    logicalKey: r.logical_key
+                })), {
+                inspected,
+                bytes,
+                truncated,
+                nextRowid,
+                statisticsInspected,
+                workInspected: budget.inspected - startWork,
+                workBytes: budget.bytes - startBytes
+            });
+        if (!match) return done();
+        if (!available(budget) || Date.now() >= deadline || !maxInspected || !maxBytes) {
+            truncated = true;
+            return done();
+        }
+        const statistics = this.activeSourceStatistics(ns, {
+            ...options,
+            budget,
+            deadlineAt: deadline,
+            maxInspected: options.maxStatisticsInspected ?? 1024
+        });
+        statisticsInspected = statistics.inspected;
+        truncated = statistics.truncated;
+        if (!available(budget) || Date.now() >= deadline) {
+            truncated = true;
+            return done();
+        }
+        const terms = new Set(recall.facets.flatMap((f)=>f.aliases));
+        const rowAllowance = Math.min(maxBytes, budget.maxBytes - budget.bytes), titleCap = Math.min(2048, Math.floor(rowAllowance / 4)), bodyCap = Math.min(maxRowBytes, rowAllowance - titleCap);
+        const statement = this.db.prepare(`SELECT d.rowid AS discovery_rowid,d.namespace_id,d.node_id,d.chunk_id,d.source_id,substr(CAST(d.body AS BLOB),1,?) AS bounded_body,length(CAST(d.body AS BLOB)) AS body_bytes,coalesce(d.source_id,sp.source_id) AS resolved_source_id,sp.span_id,sp.artifact_id,sp.byte_start,sp.byte_end,coalesce(n.layer,0) AS layer,coalesce(n.status,sl.status) AS lifecycle_status,n.logical_key,substr(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB),1,?) AS bounded_title,length(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB)) AS title_bytes,0 AS score FROM retrieval_fts JOIN retrieval_documents d ON d.rowid=retrieval_fts.rowid
       LEFT JOIN chunks c ON c.chunk_id=d.chunk_id LEFT JOIN spans sp ON sp.span_id=c.span_id
       LEFT JOIN sources s ON s.source_id=coalesce(d.source_id,sp.source_id) LEFT JOIN source_lifecycle sl ON sl.source_id=s.source_id
       LEFT JOIN derived_nodes n ON n.node_id=d.node_id
       WHERE retrieval_fts MATCH ? AND d.namespace_id=?
+      AND (? IS NULL OR coalesce(n.layer,0) IN (SELECT value FROM json_each(?)))
+      AND (? IS NULL OR (n.kind IN (SELECT value FROM json_each(?)) OR c.chunk_kind IN (SELECT value FROM json_each(?)) OR s.kind IN (SELECT value FROM json_each(?))))
       AND (? OR (coalesce(sl.status,n.status)='active' AND NOT EXISTS(SELECT 1 FROM provenance p JOIN spans ps USING(span_id) JOIN source_lifecycle pl ON pl.source_id=ps.source_id WHERE p.node_id=n.node_id AND pl.status<>'active')))
       AND (? IS NULL OR coalesce(s.observed_at,n.observed_at)>=?) AND (? IS NULL OR coalesce(s.observed_at,n.observed_at)<?)
-      ORDER BY score,d.rowid LIMIT ? OFFSET ?`).all(match, ns, options.includeHistory ? 1 : 0, options.observedFrom ?? null, options.observedFrom ?? null, options.observedTo ?? null, options.observedTo ?? null, limit, offset);
-        return rows.map((r)=>({
-                namespaceId: r.namespace_id,
-                sourceId: r.source_id,
-                nodeId: r.node_id,
-                chunkId: r.chunk_id,
-                title: r.title,
-                body: r.body,
-                score: r.score
-            }));
+      AND d.rowid>? ORDER BY retrieval_fts.rowid LIMIT ?
+      `);
+        const rowCap = Math.min(maxInspected, budget.maxInspected - budget.inspected);
+        const rowCeiling = bodyCap + titleCap;
+        const iterator = statement.iterate(bodyCap, titleCap, match, ns, options.layers ? JSON.stringify(options.layers) : null, options.layers ? JSON.stringify(options.layers) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.includeHistory ? 1 : 0, options.observedFrom ?? null, options.observedFrom ?? null, options.observedTo ?? null, options.observedTo ?? null, after, rowCap);
+        let exhausted = false;
+        try {
+            while(inspected < rowCap && maxBytes - bytes >= rowCeiling && budget.maxBytes - budget.bytes >= rowCeiling && available(budget) && Date.now() < deadline){
+                const next = iterator.next();
+                if (next.done) {
+                    exhausted = true;
+                    break;
+                }
+                const r = next.value;
+                inspected++;
+                budget.inspected++;
+                nextRowid = Math.max(nextRowid, Number(r.discovery_rowid));
+                const body = Buffer.from(r.bounded_body ?? new Uint8Array()), title = Buffer.from(r.bounded_title ?? new Uint8Array()), cost = body.length + title.length;
+                r.canonical_title = title.toString('utf8');
+                if (Number(r.title_bytes) > title.length) truncated = true;
+                bytes += cost;
+                budget.bytes += cost;
+                if (bytes > maxBytes || budget.bytes > budget.maxBytes) {
+                    truncated = true;
+                    break;
+                }
+                r.body = body.toString('utf8');
+                if (Number(r.body_bytes) > body.length) truncated = true;
+                const tokens = new Set(tokenizeRecallText(String(r.canonical_title) + ' ' + r.body));
+                if (![
+                    ...tokens
+                ].some((t)=>terms.has(t))) continue;
+                let relevance = 0;
+                for (const facet of recall.facets){
+                    let best = 0;
+                    for (const term of facet.aliases)if (tokens.has(term)) {
+                        const df = statistics.df.get(term) ?? 0;
+                        best = Math.max(best, Math.log(1 + (statistics.sourceCount - df + 0.5) / (df + 0.5)));
+                    }
+                    relevance += facet.weight * best;
+                }
+                r.score = -relevance / (1 + 0.05 * Math.log1p(tokens.size));
+                rows.push(r);
+            }
+        } finally{
+            iterator.return?.();
+        }
+        if (!exhausted) truncated = true;
+        const key = (r)=>String(r.node_id ?? r.chunk_id ?? r.resolved_source_id ?? r.discovery_rowid);
+        rows.sort((a, b)=>a.score - b.score || key(a).localeCompare(key(b)));
+        if (rows.length > offset + limit) truncated = true;
+        rows.splice(0, offset);
+        rows.splice(limit);
+        return done();
+    }
+    activeSourceStatistics(ns, options = {}) {
+        const budget = readBudget(options), deadline = Math.min(options.deadlineAt ?? Infinity, budget.deadlineAt), cap = options.maxInspected ?? 1024, maxBytes = options.maxBytes ?? 2 * 1024 * 1024;
+        let inspected = 0, bytes = 0, truncated = false;
+        const generation = Number(this.db.prepare('SELECT generation FROM namespaces WHERE namespace_id=?').get(ns).generation);
+        const cached = this.recallStatistics.get(ns);
+        if (cached?.generation === generation) return {
+            ...cached,
+            inspected,
+            truncated: cached.truncated ?? false
+        };
+        const bySource = new Map();
+        if (!available(budget) || Date.now() >= deadline || !cap || !maxBytes) return {
+            generation,
+            sourceCount: 0,
+            df: new Map(),
+            inspected,
+            truncated: true
+        };
+        const iterator = this.db.prepare(`SELECT p.source_id,substr(CAST(c.body AS BLOB),1,2048) AS body,length(CAST(c.body AS BLOB)) AS body_bytes FROM chunks c JOIN spans p USING(span_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE s.namespace_id=? AND l.status='active' LIMIT ?`).iterate(ns, Math.min(cap, budget.maxInspected - budget.inspected));
+        let exhausted = false;
+        try {
+            while(inspected < cap && maxBytes - bytes >= 2048 && budget.maxBytes - budget.bytes >= 2048 && available(budget) && Date.now() < deadline){
+                const next = iterator.next();
+                if (next.done) {
+                    exhausted = true;
+                    break;
+                }
+                const row = next.value;
+                inspected++;
+                budget.inspected++;
+                const body = Buffer.from(row.body ?? new Uint8Array());
+                bytes += body.length;
+                budget.bytes += body.length;
+                if (bytes > maxBytes || budget.bytes > budget.maxBytes) {
+                    truncated = true;
+                    break;
+                }
+                if (Number(row.body_bytes) > body.length) truncated = true;
+                const id = String(row.source_id), tokens = bySource.get(id) ?? new Set();
+                for (const token of tokenizeRecallText(body.toString('utf8')))tokens.add(token);
+                bySource.set(id, tokens);
+            }
+        } finally{
+            iterator.return?.();
+        }
+        if (!exhausted) truncated = true;
+        const df = new Map();
+        for (const tokens of bySource.values())for (const token of tokens)df.set(token, (df.get(token) ?? 0) + 1);
+        const result = {
+            generation,
+            sourceCount: bySource.size,
+            df,
+            truncated
+        };
+        if (!truncated || cap === 1024 && inspected === cap && Date.now() < deadline) this.recallStatistics.set(ns, result);
+        return {
+            ...result,
+            inspected,
+            truncated
+        };
+    }
+    readEvidenceSpan(spanId, options = {}) {
+        const ns = options.namespaceId ?? this.namespaceId;
+        this.assertNamespace(ns);
+        const budget = options.budget ?? (options.deadlineAt !== undefined || options.maxBytes !== undefined || options.maxInspected !== undefined ? readBudget(options) : undefined);
+        if (budget && (!available(budget) || Date.now() >= (options.deadlineAt ?? Infinity) || options.maxInspected === 0)) throw new Error('EvidenceReadBudgetExceeded');
+        if (budget) budget.inspected++;
+        const row = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(spanId, ns);
+        if (!row || row.status === 'withdrawn' || row.status !== 'active' && !options.allowSupersededSource) throw new Error('EvidenceSpanUnavailable');
+        const start = Number(row.byte_start), end = Number(row.byte_end);
+        if (budget && (end - start > Math.min(options.maxBytes ?? Infinity, budget.maxBytes - budget.bytes) || Date.now() >= Math.min(options.deadlineAt ?? Infinity, budget.deadlineAt))) throw new Error('EvidenceReadBudgetExceeded');
+        const bytes = budget ? this.readBlobRange(String(row.blob_sha256), start, end) : this.readBlobUnchecked(String(row.blob_sha256)).subarray(start, end);
+        if (budget) budget.bytes += bytes.length;
+        if (sha256(bytes) !== row.quote_sha256) throw new Error('EvidenceQuoteMismatch');
+        return {
+            spanId,
+            sourceId: String(row.source_id),
+            namespaceId: ns,
+            sourceRevision: String(row.origin_revision),
+            artifactId: String(row.artifact_id),
+            artifactKind: String(row.artifact_kind),
+            fidelity: String(row.fidelity),
+            byteStart: Number(row.byte_start),
+            byteEnd: Number(row.byte_end),
+            text: bytes.toString('utf8'),
+            bytes,
+            status: String(row.status)
+        };
+    }
+    readBlobRange(hash, start, end) {
+        if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('Invalid SHA-256');
+        const row = this.db.prepare('SELECT byte_length,storage_kind,relative_path,state FROM blobs WHERE sha256=?').get(hash);
+        if (!row || row.state !== 'ready' || start < 0 || end < start || end > Number(row.byte_length)) throw new Error('BlobUnavailable');
+        if (row.storage_kind === 'inline') return Buffer.from(this.db.prepare('SELECT substr(inline_bytes,?,?) AS bytes FROM blobs WHERE sha256=?').get(start + 1, end - start, hash).bytes);
+        const expected = join(hash.slice(0, 2), hash.slice(2, 4), hash);
+        if (row.relative_path !== expected) throw new Error('Unsafe CAS path');
+        const path = join(this.blobRoot, expected);
+        secureDirectory(dirname(path));
+        safeFile(path);
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            if (fstatSync(fd).size !== Number(row.byte_length)) throw new Error('Blob hash mismatch');
+            const bytes = Buffer.alloc(end - start);
+            let offset = 0;
+            while(offset < bytes.length){
+                const n = readSync(fd, bytes, offset, bytes.length - offset, start + offset);
+                if (!n) throw new Error('BlobUnavailable');
+                offset += n;
+            }
+            return bytes;
+        } finally{
+            closeSync(fd);
+        }
+    }
+    getEvidenceChunks(sourceId, options = {}) {
+        const ns = options.namespaceId ?? this.namespaceId;
+        this.assertNamespace(ns);
+        const budget = readBudget(options), deadline = Math.min(options.deadlineAt ?? Infinity, budget.deadlineAt), cap = options.maxInspected ?? 512, maxBytes = options.maxBytes ?? 1024 * 1024;
+        const after = options.afterByteStart ?? -1, from = options.byteStart ?? 0, to = options.byteEnd ?? Number.MAX_SAFE_INTEGER;
+        for (const n of [
+            cap,
+            maxBytes,
+            from,
+            to
+        ])if (!Number.isSafeInteger(n) || n < 0) throw new Error('Invalid evidence bounds');
+        if (!Number.isSafeInteger(after) || after < -1 || to < from) throw new Error('Invalid evidence bounds');
+        const result = [];
+        let inspected = 0, bytes = 0, truncated = false, nextByteStart = after;
+        const done = ()=>readMetadata(result, {
+                inspected,
+                bytes,
+                truncated,
+                nextByteStart
+            });
+        if (!available(budget) || Date.now() >= deadline || !cap || !maxBytes) {
+            truncated = true;
+            return done();
+        }
+        const source = this.getSource(sourceId);
+        if (!source || source.namespaceId !== ns || source.status === 'withdrawn' || source.status !== 'active' && !options.allowSupersededSource) return done();
+        const preferred = this.db.prepare(`SELECT a.artifact_id,a.blob_sha256,a.kind,a.fidelity FROM artifacts a WHERE a.source_id=? AND EXISTS(SELECT 1 FROM spans p JOIN chunks c USING(span_id) WHERE p.artifact_id=a.artifact_id)
+      ORDER BY CASE WHEN a.kind=? THEN -1 WHEN a.kind='text' THEN 0 WHEN a.kind='raw' THEN 1 WHEN a.kind='transcript' THEN 2 WHEN a.kind='ocr' THEN 3 WHEN a.kind='caption' THEN 4 WHEN a.kind='normalized_message' THEN 10 ELSE 9 END,a.artifact_id LIMIT 1`).get(sourceId, source.kind === 'turn' || source.kind === 'tool_result' ? 'text' : 'raw');
+        if (!preferred) return done();
+        const iterator = this.db.prepare(`SELECT c.chunk_id,c.ordinal,p.* FROM spans p INDEXED BY cf_spans_artifact_range JOIN chunks c INDEXED BY cf_chunks_span USING(span_id) WHERE p.artifact_id=? AND p.byte_start>? AND p.byte_end>? AND p.byte_start<? ORDER BY p.byte_start,p.span_id LIMIT ?`).iterate(preferred.artifact_id, after, from, to, Math.min(cap, budget.maxInspected - budget.inspected));
+        let exhausted = false;
+        try {
+            while(inspected < cap && bytes < maxBytes && available(budget) && Date.now() < deadline){
+                const next = iterator.next();
+                if (next.done) {
+                    exhausted = true;
+                    break;
+                }
+                const r = next.value;
+                inspected++;
+                budget.inspected++;
+                const start = Number(r.byte_start), end = Number(r.byte_end), size = end - start;
+                if (start < 0 || end < start) throw new Error('EvidenceQuoteMismatch');
+                if (size > maxBytes - bytes || size > budget.maxBytes - budget.bytes) {
+                    truncated = true;
+                    break;
+                }
+                if (Date.now() >= deadline) {
+                    truncated = true;
+                    break;
+                }
+                const quote = this.readBlobRange(String(preferred.blob_sha256), start, end);
+                bytes += quote.length;
+                budget.bytes += quote.length;
+                if (sha256(quote) !== r.quote_sha256) throw new Error('EvidenceQuoteMismatch');
+                nextByteStart = start;
+                result.push({
+                    spanId: String(r.span_id),
+                    sourceId,
+                    namespaceId: ns,
+                    sourceRevision: source.originRevision,
+                    artifactId: String(preferred.artifact_id),
+                    artifactKind: String(preferred.kind),
+                    fidelity: String(preferred.fidelity),
+                    byteStart: start,
+                    byteEnd: end,
+                    text: quote.toString('utf8'),
+                    bytes: quote,
+                    status: source.status,
+                    chunkId: String(r.chunk_id),
+                    ordinal: Number(r.ordinal)
+                });
+            }
+        } finally{
+            iterator.return?.();
+        }
+        if (!exhausted) truncated = true;
+        return done();
+    }
+    getRelatedNodes(seedIds, options = {}) {
+        const ns = options.namespaceId ?? this.namespaceId;
+        this.assertNamespace(ns);
+        const limit = options.limit ?? 64, maxInspected = options.maxInspected ?? 256, deadlineAt = options.deadlineAt ?? Infinity;
+        if (!Number.isSafeInteger(limit) || limit < 0 || !Number.isSafeInteger(maxInspected) || maxInspected < 0 || Number.isNaN(deadlineAt)) throw new Error('Invalid relation bounds');
+        const result = [];
+        let inspected = 0, truncated = false;
+        const seen = new Set();
+        const stop = ()=>{
+            if (result.length >= limit || inspected >= maxInspected || Date.now() >= deadlineAt) {
+                truncated = true;
+                return true;
+            }
+            return false;
+        };
+        const valid = (row)=>row.namespace_id === ns && (row.status === 'active' || options.includeSuperseded && row.status === 'superseded');
+        function* boundedRows(iterator) {
+            try {
+                while(!stop()){
+                    const next = iterator.next();
+                    if (next.done) return;
+                    inspected++;
+                    yield next.value;
+                }
+            } finally{
+                iterator.return?.();
+            }
+        }
+        const current = (row)=>{
+            const iterator = this.db.prepare(`SELECT l.status FROM provenance p JOIN spans s USING(span_id) JOIN source_lifecycle l USING(source_id) WHERE p.node_id=?`).iterate(row.node_id);
+            for (const p of boundedRows(iterator))if (p.status !== 'active') return false;
+            return !truncated;
+        };
+        const add = (seed, row, relation, direction)=>{
+            const key = seed.node_id + '\0' + row.node_id + '\0' + relation;
+            if (seen.has(key) || !valid(row) || !current(row)) return;
+            seen.add(key);
+            result.push({
+                seedNodeId: String(seed.node_id),
+                node: nodeRecord(row),
+                relation,
+                direction
+            });
+        };
+        const keys = (row)=>{
+            const c = JSON.parse(String(row.canonical_json));
+            return [
+                c.entity,
+                ...Array.isArray(c.entityKeys) ? c.entityKeys : [],
+                ...(Array.isArray(c.entries) ? c.entries : []).flatMap((e)=>Array.isArray(e.entityKeys) ? e.entityKeys : [])
+            ].filter((x)=>typeof x === 'string' && !/^(record|fact|timeline|status|sample)$/i.test(x));
+        };
+        const seedSeen = new Set();
+        for (const id of seedIds){
+            if (stop()) break;
+            inspected++;
+            if (seedSeen.has(id)) continue;
+            seedSeen.add(id);
+            const seed = this.db.prepare('SELECT * FROM derived_nodes WHERE node_id=? AND namespace_id=?').get(id, ns);
+            if (!seed || !valid(seed) || !current(seed)) continue;
+            for (const direction of [
+                'outgoing',
+                'incoming'
+            ]){
+                if (stop()) break;
+                const outgoing = direction === 'outgoing';
+                const sql = outgoing ? `SELECT e.relation,n.* FROM derivation_edges e JOIN derived_nodes n ON n.node_id=e.child_node_id WHERE e.parent_node_id=?` : `SELECT e.relation,n.* FROM derivation_edges e INDEXED BY cf_edges_child JOIN derived_nodes n ON n.node_id=e.parent_node_id WHERE e.child_node_id=?`;
+                for (const row of boundedRows(this.db.prepare(sql).iterate(id))){
+                    add(seed, row, String(row.relation), direction);
+                }
+            }
+            if (stop()) break;
+            const shared = new Set(keys(seed));
+            if (!shared.size) continue;
+            for (const row of boundedRows(this.db.prepare("SELECT * FROM derived_nodes INDEXED BY derived_lookup WHERE namespace_id=?").iterate(ns))){
+                if (row.status === 'active' && row.node_id !== seed.node_id && keys(row).some((k)=>shared.has(k))) add(seed, row, 'shared_key', 'shared_key');
+            }
+        }
+        return Object.defineProperties(result, {
+            inspected: {
+                value: inspected,
+                enumerable: false
+            },
+            truncated: {
+                value: truncated,
+                enumerable: false
+            }
+        });
+    }
+    rebuildRecallProjection(namespaceId = this.namespaceId) {
+        this.assertNamespace(namespaceId, 'write');
+        return this.transaction(()=>{
+            let updated = 0;
+            for (const row of this.db.prepare(`SELECT d.rowid,d.title,d.body,coalesce(n.title,c.title,'') AS canonical_title FROM retrieval_documents d LEFT JOIN derived_nodes n USING(node_id) LEFT JOIN chunks c USING(chunk_id) WHERE d.namespace_id=? ORDER BY d.rowid`).all(namespaceId)){
+                const title = lexicalProjectionTitle(String(row.canonical_title), String(row.body));
+                if (title !== row.title) {
+                    this.db.prepare('UPDATE retrieval_documents SET title=? WHERE rowid=?').run(title, row.rowid);
+                    updated++;
+                }
+            }
+            const row = this.db.prepare('SELECT policy_json FROM namespaces WHERE namespace_id=?').get(namespaceId);
+            const policy = JSON.parse(String(row.policy_json));
+            if (policy.lexicalVersion !== LEXICAL_VERSION) {
+                policy.lexicalVersion = LEXICAL_VERSION;
+                this.db.prepare('UPDATE namespaces SET policy_json=? WHERE namespace_id=?').run(canonicalJson(policy), namespaceId);
+                updated++;
+            }
+            if (updated) this.bumpGeneration(namespaceId);
+            return {
+                updated,
+                lexicalVersion: LEXICAL_VERSION
+            };
+        });
     }
     searchEntity(entityKey, options = {}) {
         const ns = options.namespaceId ?? this.namespaceId;
