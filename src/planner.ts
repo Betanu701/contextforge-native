@@ -645,10 +645,59 @@ export async function executeTrancheStream(
         }
       }
     } else {
+      // Zero-oracle autonomous pass selection:
+      // 1. Score each admitted source's selected spans against the query facets + code identifiers,
+      //    retaining sources/spans with positive facet coverage or symbol definitions.
+      const passRecall = analyzeRecallQuery(input.query);
+      const querySyms = passRecall.facets
+        .filter(f => f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'entity') && f.surface.length >= 3)
+        .map(f => f.surface);
       for (const s of passPlan.receipt.selections.filter(x => x.role === 'quoted_evidence')) {
+        const spanTexts: Array<{ spanId: string; text: string; score: number }> = [];
         for (const spanId of s.provenanceSpanIds) {
-          verifiedKeepSpans.add(spanId);
-          passVerifiedSpans.push(spanId);
+          try {
+            const sp = store.readEvidenceSpan(spanId, { namespaceId: ns });
+            const sc = scoreFacetCoverage(passRecall, sp.text).gain
+              + querySyms.filter(sym => sp.text.includes(sym)).length * 8;
+            spanTexts.push({ spanId, text: sp.text, score: sc });
+          } catch {}
+        }
+        const totalScore = spanTexts.reduce((acc, x) => acc + x.score, 0);
+        const originKey = store.getSource(s.sourceId)?.originKey ?? '';
+        const pathMatch = querySyms.some(sym => originKey.toLowerCase().includes(sym.toLowerCase()));
+        if (totalScore > 0 || pathMatch || resolvedSymbolSources.has(s.sourceId)) {
+          retainedSourceIds.add(s.sourceId);
+          for (const st of spanTexts) {
+            if (st.score > 0 || pathMatch || resolvedSymbolSources.has(s.sourceId) || spanTexts.length <= 16) {
+              verifiedKeepSpans.add(st.spanId);
+              passVerifiedSpans.push(st.spanId);
+            }
+          }
+        }
+        // 2. Automatically extract imported symbols (`from X import a, b`) and unresolved query identifiers
+        //    and resolve them via the L2 entity/symbol graph (`wiki/entities/<symbol>`) into the next tranche!
+        const combinedText = spanTexts.map(x => x.text).join('\n');
+        const autoSyms = new Set<string>(querySyms);
+        for (const m of combinedText.matchAll(/from\s+[\w.]+\s+import\s+(?:\(([\s\S]*?)\)|([^\n#]+))/g)) {
+          const body = m[1] || m[2] || '';
+          for (const part of body.split(',')) {
+            const clean = part.replace(/#.*$/, '').trim().split(/\s+as\s+/)[0].trim();
+            if (/^[A-Za-z_]\w{2,}$/.test(clean)) autoSyms.add(clean);
+          }
+        }
+        for (const sym of autoSyms) {
+          const cleanSym = sym.normalize('NFKC').trim();
+          const key = `wiki/entities/${encodeURIComponent(cleanSym.toLowerCase())}`;
+          const nodes = store.db.prepare("SELECT node_id FROM derived_nodes WHERE namespace_id=? AND status='active' AND (logical_key=? OR logical_key LIKE ?)").all(ns, key, `${key}/part-%`);
+          for (const n of nodes) {
+            for (const p of store.getProvenance(String(n.node_id))) {
+              resolvedSymbolSources.add(p.sourceId);
+              if (!visitedSources.has(p.sourceId) && !pendingQueue.includes(p.sourceId)) {
+                pendingQueue.push(p.sourceId);
+                resolvedSymbols.push(sym);
+              }
+            }
+          }
         }
       }
     }

@@ -38,8 +38,8 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
         namespaceId,
         deadlineAt,
         budget,
-        maxInspected: 1024,
-        maxBytes: 1024 * 1024
+        maxInspected: 8192,
+        maxBytes: 2 * 1024 * 1024
     });
     let required;
     try {
@@ -71,9 +71,9 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
                 if (s <= 0) break;
                 const m = scoreFacetCoverage(recall, chunks[i].text).matchedFacetIds;
                 const addsNewFacet = m.some((f)=>!coveredWindowFacets.has(f));
-                if ((indexes.size < 48 || addsNewFacet) && totalChars < 7200) {
+                if ((indexes.size < 36 || addsNewFacet) && totalChars < 4800) {
                     for(let j = Math.max(0, i - 2); j <= Math.min(chunks.length - 1, i + 2); j++){
-                        if (!indexes.has(j) && totalChars + chunks[j].text.length <= 7500) {
+                        if (!indexes.has(j) && totalChars + chunks[j].text.length <= 5200) {
                             indexes.add(j);
                             totalChars += chunks[j].text.length;
                         }
@@ -81,26 +81,46 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
                     m.forEach((f)=>coveredWindowFacets.add(f));
                 }
             }
-            if (totalChars < 6500 && chunks.length > 1 && chunks[chunks.length - 1].byteEnd === Buffer.byteLength(full)) {
+            if (totalChars < 7200 && chunks.length > 1 && chunks[chunks.length - 1].byteEnd === Buffer.byteLength(full)) {
                 try {
                     const tree = decomposeCodeSource(full, {
                         originKey: source.originKey,
                         grammarId: grammar.id,
-                        maxBlockBytes: 1600
+                        maxBlockBytes: 2400
                     });
                     const matchedByteOffsets = ranked.slice(0, 4).map((r)=>chunks[r.i].byteStart);
                     for (const offset of matchedByteOffsets){
-                        const enclosing = tree.flatNodes.filter((n)=>n.depth >= 1 && n.byteStart <= offset && n.byteEnd > offset && n.byteEnd - n.byteStart <= 1200).sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart))[0];
+                        const enclosing = tree.flatNodes.filter((n)=>n.depth >= 1 && n.byteStart <= offset && n.byteEnd > offset && n.byteEnd - n.byteStart <= 1600).sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart))[0];
                         if (enclosing) {
                             const blockIdxs = chunks.map((c, idx)=>({
                                     c,
                                     idx
                                 })).filter(({ c })=>c.byteStart >= enclosing.byteStart && c.byteEnd <= enclosing.byteEnd).map((x)=>x.idx);
                             const addedChars = blockIdxs.filter((idx)=>!indexes.has(idx)).reduce((n, idx)=>n + chunks[idx].text.length, 0);
-                            if (addedChars > 0 && totalChars + addedChars <= 7200) {
+                            if (addedChars > 0 && totalChars + addedChars <= 7500) {
                                 blockIdxs.forEach((idx)=>indexes.add(idx));
                                 totalChars += addedChars;
                             }
+                        }
+                    }
+                    const candidateNodes = tree.flatNodes.filter((n)=>n.depth >= 1 && n.byteEnd - n.byteStart >= 32 && n.byteEnd - n.byteStart <= 3000).map((n)=>{
+                        const nodeText = Buffer.from(full).subarray(n.byteStart, n.byteEnd).toString('utf8');
+                        const pathBonus = recall.facets.filter((f)=>f.origin === 'question' && f.surface.length >= 3 && n.symbolPath.toLowerCase().includes(f.surface.toLowerCase())).reduce((acc, f)=>acc + f.weight * 4, 0);
+                        const cov = scoreFacetCoverage(recall, `${n.symbolPath}\n${nodeText}`);
+                        return {
+                            n,
+                            score: cov.gain + pathBonus
+                        };
+                    }).filter((x)=>x.score > 0).sort((a, b)=>b.score - a.score || a.n.byteEnd - a.n.byteStart - (b.n.byteEnd - b.n.byteStart));
+                    for (const cand of candidateNodes.slice(0, 3)){
+                        const blockIdxs = chunks.map((c, idx)=>({
+                                c,
+                                idx
+                            })).filter(({ c })=>c.byteStart >= cand.n.byteStart && c.byteEnd <= cand.n.byteEnd).map((x)=>x.idx);
+                        const addedChars = blockIdxs.filter((idx)=>!indexes.has(idx)).reduce((n, idx)=>n + chunks[idx].text.length, 0);
+                        if (addedChars > 0 && totalChars + addedChars <= 7500) {
+                            blockIdxs.forEach((idx)=>indexes.add(idx));
+                            totalChars += addedChars;
                         }
                     }
                 } catch  {}

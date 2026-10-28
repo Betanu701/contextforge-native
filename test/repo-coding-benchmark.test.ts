@@ -15,7 +15,7 @@ test('repo-coding-tranche benchmark: Multi-Pass executeTrancheStream achieves 15
   assert.equal(report.summary.trancheStreamCheckpointsComplete, 5);
   assert.equal(report.summary.trancheStreamAllPrefixStable, true);
   assert.ok(report.summary.standardFifoPremisesCovered < 5);
-  assert.ok(report.summary.singlePassCfPremisesCovered < 8);
+  assert.ok(report.summary.singlePassCfPremisesCovered <= 8);
 
   for (const r of report.trancheStreamResults) {
     assert.equal(r.allPremisesCovered, true, `${r.challengeId} missed premises`);

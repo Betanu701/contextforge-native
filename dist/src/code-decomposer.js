@@ -952,6 +952,102 @@ function decomposeByGrammar(bytes, lines, parent, spec, maxBlockBytes) {
             return nodes;
         }
     }
+    if (spec.blocks.indentationScoped) {
+        const stripLineNum = (line)=>line.replace(/^\s*\d+\s?(?=[A-Za-z_#@"' \t]|$)/, '');
+        const isCommentOrHeader = (line)=>{
+            const s = stripLineNum(line).trimStart();
+            return !s || s.startsWith('//') || isLineComment(s, spec);
+        };
+        const getIndent = (line)=>{
+            const stripped = stripLineNum(line);
+            const m = /^([ \t]*)\S/.exec(stripped);
+            if (!m) return -1;
+            return m[1].replace(/\t/g, '    ').length;
+        };
+        const isPyBlockHeader = (line)=>{
+            const stripped = stripLineNum(line);
+            return /^[ \t]*(?:async\s+def|def|class)\s+[A-Za-z_][\w]*\b/.test(stripped);
+        };
+        const headerCandidates = [];
+        for(let i = 0; i < subLines.length; i++){
+            if (isCommentOrHeader(subLines[i].text)) continue;
+            if (isPyBlockHeader(subLines[i].text)) {
+                headerCandidates.push({
+                    idx: i,
+                    indent: getIndent(subLines[i].text)
+                });
+            }
+        }
+        const baseIndent = headerCandidates.reduce((min, h)=>h.indent >= 0 && h.indent < min ? h.indent : min, Infinity);
+        if (Number.isFinite(baseIndent)) {
+            const headerIdxs = headerCandidates.filter((h)=>h.indent === baseIndent).map((h)=>h.idx);
+            if (headerIdxs.length >= 2 || headerIdxs.length === 1 && headerIdxs[0] > 0) {
+                const nodes = [];
+                let cursor = parent.byteStart;
+                for(let h = 0; h < headerIdxs.length; h++){
+                    const startIdx = headerIdxs[h];
+                    let decIdx = startIdx;
+                    while(decIdx > (h > 0 ? headerIdxs[h - 1] + 1 : 0)){
+                        const prev = stripLineNum(subLines[decIdx - 1].text).trim();
+                        if (prev.startsWith('@')) decIdx--;
+                        else break;
+                    }
+                    const nextHeaderIdx = h + 1 < headerIdxs.length ? headerIdxs[h + 1] : subLines.length;
+                    let limitIdx = nextHeaderIdx;
+                    if (h + 1 < headerIdxs.length) {
+                        while(limitIdx > startIdx + 1 && stripLineNum(subLines[limitIdx - 1].text).trim().startsWith('@')){
+                            limitIdx--;
+                        }
+                    }
+                    let endIdx = limitIdx - 1;
+                    for(let j = startIdx + 1; j < limitIdx; j++){
+                        if (isCommentOrHeader(subLines[j].text)) continue;
+                        const ind = getIndent(subLines[j].text);
+                        const trimmed = stripLineNum(subLines[j].text).trim();
+                        if (ind >= 0 && ind < baseIndent && !/^[)\]}'"]/.test(trimmed)) {
+                            endIdx = j - 1;
+                            break;
+                        }
+                    }
+                    const s = subLines[decIdx].byteStart;
+                    const e = subLines[endIdx].byteEnd;
+                    if (s > cursor) {
+                        nodes.push(makeNode(bytes, spec.id, `module-preamble-${nodes.length + 1}`, `${parent.symbolPath}::module-preamble-${nodes.length + 1}`, 'statement', parent.depth + 1, cursor, s, parent.nodeId));
+                    }
+                    const sym = inferSymbolName(stripLineNum(subLines[startIdx].text), `block-${nodes.length + 1}`);
+                    const n = makeNode(bytes, spec.id, sym, `${parent.symbolPath}::${sym}`, 'block', parent.depth + 1, s, e, parent.nodeId);
+                    if (endIdx - startIdx >= 3 && (n.byteStart > parent.byteStart || n.byteEnd < parent.byteEnd)) {
+                        const firstLine = subLines[startIdx];
+                        const headerEnd = firstLine.byteEnd;
+                        if (headerEnd < e) {
+                            const headerNode = makeNode(bytes, spec.id, `${sym}::header`, `${n.symbolPath}::header`, 'statement', n.depth + 1, s, headerEnd, n.nodeId);
+                            const bodyDummy = makeNode(bytes, spec.id, `${sym}::body`, n.symbolPath, 'block', n.depth, headerEnd, e, n.nodeId);
+                            const bodyChildren = decomposeByGrammar(bytes, lines, bodyDummy, spec, maxBlockBytes).map((c)=>({
+                                    ...c,
+                                    parentId: n.nodeId,
+                                    depth: n.depth + 1
+                                }));
+                            if (bodyChildren.length > 0) {
+                                n.children = [
+                                    headerNode,
+                                    ...bodyChildren
+                                ];
+                            }
+                        }
+                    }
+                    if (n.children.length === 0 && n.byteEnd - n.byteStart > maxBlockBytes) {
+                        n.children = partitionIntoContiguousParts(bytes, lines, n, maxBlockBytes);
+                    }
+                    nodes.push(n);
+                    cursor = e;
+                }
+                if (cursor < parent.byteEnd) {
+                    nodes.push(makeNode(bytes, spec.id, 'module-epilogue', `${parent.symbolPath}::module-epilogue`, 'statement', parent.depth + 1, cursor, parent.byteEnd, parent.nodeId));
+                }
+                return nodes;
+            }
+        }
+    }
     if (spec.blocks.brackets?.length) {
         return decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockBytes);
     }

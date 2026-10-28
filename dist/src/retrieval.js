@@ -130,7 +130,8 @@ export function scoreFacetCoverage(query, text, covered = []) {
         return matchMemo.get(f.id);
     };
     const entities = strong.filter((f)=>f.kind === 'entity' && f.surface.length > 1);
-    const anchored = entities.length ? entities.some((f)=>match(f) >= 0.9) : !strong.length || strong.some((f)=>match(f) >= 0.9) || q.facets.filter((f)=>f.origin === 'question' && f.kind === 'content' && match(f) >= 0.9 && !generic.has(norm(f.surface))).length >= 2;
+    const identifiers = strong.filter((f)=>f.kind === 'identifier' && f.surface.length > 1);
+    const anchored = entities.length ? entities.some((f)=>match(f) >= 0.9) || identifiers.some((f)=>match(f) >= 0.9) : !strong.length || strong.some((f)=>match(f) >= 0.9) || q.facets.filter((f)=>f.origin === 'question' && f.kind === 'content' && match(f) >= 0.9 && !generic.has(norm(f.surface))).length >= 2;
     const matched = q.facets.filter((f)=>match(f) > 0 && (anchored || f.origin === 'question' && !generic.has(norm(f.surface))));
     const marginal = matched.filter((f)=>!seen.has(f.id));
     const result = {

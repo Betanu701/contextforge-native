@@ -14,7 +14,7 @@ export function renderExcerpts(excerpts:Excerpt[]):string {
 function bind(c:EvidenceCandidate,excerpts:Excerpt[]):EvidenceCandidate {c.excerpts=[...new Map(excerpts.map(e=>[e.spanId,e])).values()];c.excerpts.sort((a,b)=>a.artifactId.localeCompare(b.artifactId)||a.byteStart-b.byteStart||a.byteEnd-b.byteEnd);c.text=renderExcerpts(c.excerpts);c.spanIds=c.excerpts.map(e=>e.spanId);c.artifactIds=[...new Set(c.excerpts.map(e=>e.artifactId))];return c;}
 export function buildEvidenceWindow(store:ContextForgeStore,sourceId:string,recall:RecallQuery,spanIds:string[]=[],namespaceId=store.namespaceId,deadlineAt=Infinity,budget?:StoreReadBudget):EvidenceCandidate|null {
  const source=store.getSource(sourceId);if(!source||source.namespaceId!==namespaceId||source.status!=='active')return null;
- const chunks=store.getEvidenceChunks(sourceId,{namespaceId,deadlineAt,budget,maxInspected:1024,maxBytes:1024*1024});
+ const chunks=store.getEvidenceChunks(sourceId,{namespaceId,deadlineAt,budget,maxInspected:8192,maxBytes:2*1024*1024});
  let required:ReturnType<ContextForgeStore['readEvidenceSpan']>[];try{required=spanIds.map(id=>store.readEvidenceSpan(id,{namespaceId,budget,deadlineAt})).filter(p=>p.sourceId===sourceId);}catch{return null;}
  if(!chunks.length&&!required.length)return null;
  const full=chunks.map(c=>c.text).join(''),small=estimateTokens(full)<=2048;
@@ -31,36 +31,56 @@ export function buildEvidenceWindow(store:ContextForgeStore,sourceId:string,reca
   if(grammar){
    const coveredWindowFacets=new Set<string>();
    let totalChars=chunks[0].text.length+(chunks.length>1?chunks[chunks.length-1].text.length:0);
-   // Greedily include top-scoring chunks (plus +/-2 adjacent lines for code/context)
-   // and any chunk that covers a previously uncovered query facet, up to ~7,500 chars (~2,000 tokens).
+   // 1. Greedily include top-scoring line chunks (plus +/-2 adjacent lines for code/context)
+   // and any chunk that covers a previously uncovered query facet, up to ~4,800 chars (~1,350 tokens).
    for(const {i,s} of ranked){
     if(s<=0)break;
     const m=scoreFacetCoverage(recall,chunks[i].text).matchedFacetIds;
     const addsNewFacet=m.some(f=>!coveredWindowFacets.has(f));
-    if((indexes.size<48||addsNewFacet)&&totalChars<7200){
+    if((indexes.size<36||addsNewFacet)&&totalChars<4800){
      for(let j=Math.max(0,i-2);j<=Math.min(chunks.length-1,i+2);j++){
-      if(!indexes.has(j)&&totalChars+chunks[j].text.length<=7500){indexes.add(j);totalChars+=chunks[j].text.length;}
+      if(!indexes.has(j)&&totalChars+chunks[j].text.length<=5200){indexes.add(j);totalChars+=chunks[j].text.length;}
      }
      m.forEach(f=>coveredWindowFacets.add(f));
     }
    }
-   // After all primary facet hits are secured, if budget remains (< 6,500 chars) and this is a
-   // recognized code/markup/mainframe file, expand top matched chunks to complete surgical block boundaries!
-   if(totalChars<6500&&chunks.length>1&&chunks[chunks.length-1].byteEnd===Buffer.byteLength(full)){
+   // 2. AST-Block Expansion & Hierarchical Symbol-Path Selection:
+   // After all high-specificity line/facet hits are secured, use the remaining window budget (up to ~7,500 chars)
+   // to (a) expand top matched line chunks to complete enclosing AST blocks (`class`/`def`/`function`), and
+   // (b) pull in high-scoring AST blocks whose hierarchical `symbolPath` + body match the query (e.g. `AlterField::reduce`)!
+   if(totalChars<7200&&chunks.length>1&&chunks[chunks.length-1].byteEnd===Buffer.byteLength(full)){
     try{
-     const tree=decomposeCodeSource(full,{originKey:source.originKey,grammarId:grammar.id,maxBlockBytes:1600});
+     const tree=decomposeCodeSource(full,{originKey:source.originKey,grammarId:grammar.id,maxBlockBytes:2400});
      const matchedByteOffsets=ranked.slice(0,4).map(r=>chunks[r.i].byteStart);
      for(const offset of matchedByteOffsets){
       const enclosing=tree.flatNodes
-       .filter(n=>n.depth>=1&&n.byteStart<=offset&&n.byteEnd>offset&&(n.byteEnd-n.byteStart)<=1200)
+       .filter(n=>n.depth>=1&&n.byteStart<=offset&&n.byteEnd>offset&&(n.byteEnd-n.byteStart)<=1600)
        .sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart))[0];
       if(enclosing){
        const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=enclosing.byteStart&&c.byteEnd<=enclosing.byteEnd).map(x=>x.idx);
        const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
-       if(addedChars>0&&totalChars+addedChars<=7200){
+       if(addedChars>0&&totalChars+addedChars<=7500){
         blockIdxs.forEach(idx=>indexes.add(idx));
         totalChars+=addedChars;
        }
+      }
+     }
+     const candidateNodes=tree.flatNodes
+      .filter(n=>n.depth>=1&&(n.byteEnd-n.byteStart)>=32&&(n.byteEnd-n.byteStart)<=3000)
+      .map(n=>{
+       const nodeText=Buffer.from(full).subarray(n.byteStart,n.byteEnd).toString('utf8');
+       const pathBonus=recall.facets.filter(f=>f.origin==='question'&&f.surface.length>=3&&n.symbolPath.toLowerCase().includes(f.surface.toLowerCase())).reduce((acc,f)=>acc+f.weight*4,0);
+       const cov=scoreFacetCoverage(recall,`${n.symbolPath}\n${nodeText}`);
+       return {n,score:cov.gain+pathBonus};
+      })
+      .filter(x=>x.score>0)
+      .sort((a,b)=>b.score-a.score||(a.n.byteEnd-a.n.byteStart)-(b.n.byteEnd-b.n.byteStart));
+     for(const cand of candidateNodes.slice(0,3)){
+      const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=cand.n.byteStart&&c.byteEnd<=cand.n.byteEnd).map(x=>x.idx);
+      const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
+      if(addedChars>0&&totalChars+addedChars<=7500){
+       blockIdxs.forEach(idx=>indexes.add(idx));
+       totalChars+=addedChars;
       }
      }
     }catch{/* fallback to line-window if custom grammar throws */}
