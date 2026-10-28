@@ -90,3 +90,21 @@ no inference is performed by the offline suite. See the benchmark README for CLI
 model-file schema, reporting semantics, and resource envelopes.
 
 Natural-prose untared/cumulative balance sequences now compile exact BigInt deltas in consistent g/kg/mg/ml/mL/L/oz/lb units, with original quotes and explicit normalized-number/unit rendering.
+
+## Part 3: 100-Turn Zero-Filler Deep Research Benchmark
+
+The [`benchmarks/deep-research-100turns`](benchmarks/deep-research-100turns/README.md) suite exercises **100 substantive analytical turns with zero filler**, five interleaved scientific tracks (20 observations each), 10 multi-hop checkpoints (**108 required original premise deliveries**, including 80+ turn backward lags and 20-step `BigInt` 18-decimal-place `10^12 g` tare calorimetry subtraction), and 3 window-filling pressure spikes (`161k–178k` wire tokens) with `100%` immediate next-turn shedding.
+
+Because `planContext()` enforces an automatic working-set knee (`optionalKneeCap` in `src/planner.ts`) on non-exhaustive optional historical recall while allowing required obligations (`sourceIds` and named document references) to expand to the full model window, normal analytical turns remain naturally bounded (`<= 11.8k` wire tokens) even when `hostTokenBudget` is left at the full `262,144`-token window.
+
+## Architectural Boundary: Deterministic Lexical + Entity Routing vs. Optional Semantic/Embedding Fallback Dial (`fallbackMinCoverage`)
+
+ContextForge v2 is intentionally **deterministic-first**:
+1. **Primary Retrieval Path (`src/retrieval.ts`, `src/evidence.ts`, `src/compiler.ts`):** All core retrieval uses SQLite FTS5 lexical matching (`tokenizeRecallText` with identifier/camelCase/snake_case/numeric splitting) combined with L1/L2 compiled entity and concept graph traversal (`hydrateProvenanceSupport`, `expandRelatedPremises`). No embedding model or external vector daemon is shipped or required by default. This guarantees zero embedding-inference latency, 100% deterministic reproducibility, and exact `[span:...]` byte-offset provenance custody.
+2. **Known Boundary:** When a query uses domain vocabulary, identifiers, or entity names present in the corpus (or connected via L2 entity/concept pages), recall is exact even 85+ turns later. However, if a query is phrased as a pure abstract paraphrase sharing *zero* lexical tokens and *zero* entity names with the target evidence, deterministic lexical search will have low facet coverage.
+3. **Optional Semantic/Embedding Fallback Dial (`bridgePolicy.fallbackMinCoverage` in `src/external-recall.ts`):**
+   - For deployments that want an embedding model or external semantic index as a safety net when lexical coverage is sparse, `prepareExternalRecall` / `planContextWithRecall` provides an explicit coverage dial: `bridgePolicy.fallbackMinCoverage` (a float in `[0, 1]`, default `0.05` / `5%` in `openclaw.plugin.json`).
+   - Before invoking an injected `ExternalRecallAdapter`, `measureNativeLexicalCoverage()` computes the weighted question-facet coverage ratio (`0.0` to `1.0`) achieved by native L0/L1/L2 search.
+   - If native coverage is **`>= fallbackMinCoverage`**, the external/embedding adapter is **skipped completely** (zero latency or cost).
+   - If native coverage falls **`< fallbackMinCoverage`** (e.g., `< 5%` on an abstract paraphrase), ContextForge automatically invokes the injected `ExternalRecallAdapter` (which can wrap an embedding model, vector DB, or hybrid index), validates every returned `nativeRef` against the current SQLite generation/SHA-256/ACL boundary (`validateNativeRecallReference`), and hydrates the exact native L0 provenance spans into the plan.
+

@@ -18,14 +18,14 @@ export function parseArgs(args:string[]):Options {
   v[key]=args[++i];
  }
  const num=(key:string,fallback:number)=>v[key]===undefined?fallback:Number(v[key]);
- const turns=num('turns',100),pressureSpikes=num('pressure-spikes',3),window=num('window',262144),maxOutput=num('max-output',512),timeoutMs=num('timeout-ms',300000),researchBudget=num('research-budget',12000);
+ const turns=num('turns',100),pressureSpikes=num('pressure-spikes',3),window=num('window',262144),maxOutput=num('max-output',2048),timeoutMs=num('timeout-ms',300000),researchBudget=num('research-budget',window);
  if(![50,100].includes(turns))throw new Error('turns must be 50 or 100');
  if(!Number.isInteger(pressureSpikes)||pressureSpikes<0||pressureSpikes>5)throw new Error('pressure-spikes must be 0..5');
  if(v['spike-tokens']&&v['spike-ratio'])throw new Error('Use spike-tokens OR spike-ratio');
  const ratio=num('spike-ratio',0);if(v['spike-ratio']&&(!Number.isFinite(ratio)||ratio<=0||ratio>=1))throw new Error('spike-ratio must be >0 and <1');
- const spikeTokens=v['spike-ratio']?Math.ceil(window*ratio):num('spike-tokens',150000);
+ const spikeTokens=v['spike-ratio']?Math.min(Math.ceil(window*ratio),window-maxOutput-6000):num('spike-tokens',150000);
  for(const [key,n] of Object.entries({window,maxOutput,timeoutMs,spikeTokens,researchBudget}))if(!Number.isSafeInteger(n)||n<=0)throw new Error(`Invalid ${key}`);
- if(researchBudget<3000||researchBudget>14000||researchBudget>window)throw new Error('research-budget must be 3000..14000 and fit window');
+ if(researchBudget<3000||researchBudget>window)throw new Error('research-budget must be >=3000 and fit window');
  if(pressureSpikes&&spikeTokens+maxOutput+6000>window)throw new Error('Window cannot fit spike and research reservations');
  return {turns,pressureSpikes,spikeTokens,window,maxOutput,timeoutMs,researchBudget,...(v.output?{output:v.output}:{})};
 }

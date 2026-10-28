@@ -2,13 +2,13 @@
   "version": "deep-research-100turns-v1",
   "files": {
     "fixtures.ts": {
-      "sha256": "696e9451679815c42f9d22e15cf9bbea28f7c6ec037bf94a6d434cc98005b536",
-      "bytes": 27613,
-      "lines": 168
+      "sha256": "92e87f4d931f554b33b4c5448ceb9d5f8247d2f2ecae3bb9baa563f23ce6c0cd",
+      "bytes": 27899,
+      "lines": 169
     },
     "oracles.ts": {
-      "sha256": "0f870bb8cccc5ad28b45dbe619951ef37e69fccacded91470f2e9d81a70c3476",
-      "bytes": 4618,
+      "sha256": "50bafb1aa8c2f2b33a1b7dc5275e2f63cc0b106c90361ab3d146873fb76423af",
+      "bytes": 4650,
       "lines": 67
     }
   }

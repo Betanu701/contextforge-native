@@ -1,6 +1,6 @@
-import { ContextForgeStore, sha256 } from './store.ts';
+import { ContextForgeStore, sha256, createStoreReadBudget } from './store.ts';
 import { planContext, type PlanContextInput, type ContextPlan } from './planner.ts';
-import { analyzeRecallQuery } from './retrieval.ts';
+import { analyzeRecallQuery, scoreFacetCoverage } from './retrieval.ts';
 
 export const CONTEXTFORGE_SUPPLEMENT_ORIGIN = 'contextforge-native';
 export interface ExternalRecallRef { providerId:string; corpus:string; key:string; revision:string }
@@ -31,7 +31,12 @@ export interface ExternalRecallAdapter {
 export interface TrustedRecallBinding { callerContext:unknown; namespaceId:string; assertCurrent:()=>void }
 export interface ExternalRecallOptions {
   adapter?:ExternalRecallAdapter;
-  policy?:{enabled?:boolean; importSnapshots?:boolean; supplement?:boolean; limit?:number; timeoutMs?:number};
+  /**
+   * fallbackMinCoverage (0..1, e.g. 0.05 for 5%): optional semantic/embedding fallback dial.
+   * When set in [0, 1], external/semantic recall is skipped if native deterministic lexical/entity
+   * facet coverage is already >= fallbackMinCoverage, and only triggered when native coverage < fallbackMinCoverage.
+   */
+  policy?:{enabled?:boolean; importSnapshots?:boolean; supplement?:boolean; fallbackMinCoverage?:number; limit?:number; timeoutMs?:number};
   resolveCallerContext?:(hostContext:unknown)=>TrustedRecallBinding|Promise<TrustedRecallBinding>;
   hostContext?:unknown;
 }
@@ -39,12 +44,34 @@ export interface PreparedRecall {
   querySha256:string; namespaceId:string; namespaceGeneration:number;
   adapterId?:string; adapterVersion?:string;
   status:'disabled'|'unavailable'|'ready'|'degraded'; complete:boolean; warnings:string[];
+  nativeCoverageRatio?:number;
   candidates:Array<ExternalRecallCandidate & { sourceIds:string[]; discoveryPrior:number }>;
   suggestions:Array<ExternalRecallCandidate & {discoveryOnly:true}>;
+}
+/**
+ * Measure the weighted question-facet coverage ratio [0, 1] achieved by native deterministic
+ * lexical + L1/L2 entity routing before deciding whether to invoke an external/embedding adapter.
+ */
+export function measureNativeLexicalCoverage(store:ContextForgeStore, query:string, namespaceId=store.namespaceId, deadlineAt=Infinity):number {
+  store.assertNamespace(namespaceId);
+  const recall=analyzeRecallQuery(query);
+  const qFacets=recall.facets.filter(f=>f.origin==='question');
+  const totalWeight=qFacets.reduce((n,f)=>n+f.weight,0);
+  if(totalWeight<=0)return 1;
+  const budget=createStoreReadBudget({maxInspected:256,maxBytes:512*1024,deadlineAt});
+  const hits=store.search(query,{namespaceId,layers:[0,1,2],limit:32,maxInspected:128,maxStatisticsInspected:64,deadlineAt,budget});
+  const covered=new Set<string>();
+  for(const h of hits){
+    const sc=scoreFacetCoverage(recall,h.title+' '+h.body);
+    if(sc.anchored&&sc.score>0)for(const id of sc.matchedFacetIds)covered.add(id);
+  }
+  const coveredWeight=qFacets.filter(f=>covered.has(f.id)).reduce((n,f)=>n+f.weight,0);
+  return coveredWeight/totalWeight;
 }
 export function externalRecallStatus(options:ExternalRecallOptions = {}) {
   const enabled=options.policy?.enabled===true;
   return {enabled, available:enabled&&!!options.adapter&&!!options.resolveCallerContext,
+    fallbackMinCoverage:options.policy?.fallbackMinCoverage??null,
     reason:!enabled?'disabled':!options.adapter?'adapter_unavailable':!options.resolveCallerContext?'trusted_caller_binding_unavailable':'injected_adapter',
     snapshotLifecycle:'Snapshots are immutable observations; refresh/invalidation requires explicit host lifecycle management.'};
 }
@@ -96,6 +123,13 @@ export async function prepareExternalRecall(input:Pick<PlanContextInput,'store'|
   if(options.policy?.enabled!==true) return result;
   const recall=analyzeRecallQuery(input.query);
   if(!recall.substantiveTerms.length&&!input.sourceIds?.length&&!input.attachments?.length) return result;
+  const fallbackThreshold=options.policy.fallbackMinCoverage;
+  if(fallbackThreshold!==undefined) {
+    if(!Number.isFinite(fallbackThreshold)||fallbackThreshold<0||fallbackThreshold>1) throw new Error('Invalid fallbackMinCoverage: must be 0..1');
+    const ratio=measureNativeLexicalCoverage(input.store,input.query,ns,input.deadlineAt);
+    result.nativeCoverageRatio=ratio;
+    if(ratio>=fallbackThreshold) return result;
+  }
   result.status='unavailable';
   if(!options.adapter||!options.resolveCallerContext){result.warnings.push('External recall unavailable: injected adapter and trusted caller binding are required.');return result;}
   const adapter=options.adapter;

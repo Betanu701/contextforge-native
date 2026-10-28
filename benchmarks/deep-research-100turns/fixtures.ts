@@ -125,16 +125,16 @@ export const seeds:Observation[]=TRACKS.map((track,i)=>({turn:0,track,anchor:nam
  ][i]}`}));
 // Query-side notebook references are normal research requests, NOT source IDs.
 const checkpoints:[number,Track,number[]][]=[
- [45,'scaling-law',[2,19,27,32,42]],
- [47,'calorimetry-assay',[3,8,13,18,23,28,33,38,43]],
+ [45,'clinical-cohort',[5,10,15,20,25,35,40]],
+ [47,'scaling-law',[2,19,27,32,42]],
  [49,'distributed-consensus',[4,9,14,24,29,34,44]],
- [51,'clinical-cohort',[5,10,15,20,25,35,40]],
- [53,'cross-track-synthesis',[2,19,47,3,8,13,4,9,14,5,20,40]],
+ [51,'cross-track-synthesis',[2,19,47,3,8,13,4,9,14,5,20,40]],
+ [53,'calorimetry-assay',[3,8,13,18,23,28,33,38,43]],
  [92,'scaling-law',[2,19,27,32,47,57,71,87]],
- [94,'calorimetry-assay',[3,8,13,18,23,28,33,38,43,48,53,60,63,68,73,78,83,88,93]],
- [96,'distributed-consensus',[4,9,14,24,29,34,54,64,79,89]],
- [98,'clinical-cohort',[5,10,20,35,40,50,55,58,65,90,95]],
- [100,'cross-track-synthesis',[2,19,27,47,71,3,8,13,98,4,9,14,79,94,5,20,40,55,95,15]]
+ [94,'distributed-consensus',[4,9,14,24,29,34,54,64,79,89]],
+ [96,'cross-track-synthesis',[2,19,27,47,71,3,8,13,93,4,9,14,79,94,5,20,40,55,95,15]],
+ [98,'calorimetry-assay',[3,8,13,18,23,28,33,38,43,48,53,60,63,68,73,78,83,88,93]],
+ [100,'clinical-cohort',[5,10,20,35,40,50,55,58,65,90,95]]
 ];
 const tasks:Record<Track,string>={
  'scaling-law':'Compare the initial power-law hypothesis with the warmup trace, negative entropy ablation, token-drop correction and hardware roofline where available. Which causal claims survive exposure matching, and why is throughput not a loss exponent?',
@@ -150,7 +150,8 @@ export function scenario(turns=100,pressureSpikes=3):ResearchTurn[] {
  const original=observations(), selected=turns===100?original:original.filter(r=>r.turn<=40||r.turn>=91);
  const retained=new Map(selected.map((r,i)=>[r.turn,i+1]));
  const mapped=selected.map((r,i)=>({...r,turn:i+1,text:r.text+ (turns===50?` Scaled session turn ${i+1}; notebook labels retain full-study numbering.`:'')}));
- const cp=turns===100?checkpoints:[...checkpoints.slice(0,5).map(([_,track,refs],i)=>[31+i*2,track,refs.filter(n=>n<=(30+i*2))] as [number,Track,number[]]),...checkpoints.slice(5).map(([n,track,refs])=>[retained.get(n)!,track,refs.filter(n=>retained.has(n))] as [number,Track,number[]])];
+ const cp50:[number,Track,number[]][]=[[31,'cross-track-synthesis',[2,19,47,3,8,13,4,9,14,5,20,40]],[33,'calorimetry-assay',[3,8,13,18,23,28,33,38,43]],[35,'clinical-cohort',[5,10,15,20,25,35,40]],[37,'scaling-law',[2,19,27,32,42]],[39,'distributed-consensus',[4,9,14,24,29,34,44]]];
+ const cp=turns===100?checkpoints:[...cp50.map(([t,track,refs])=>[t,track,refs.filter(n=>n<t)] as [number,Track,number[]]),...checkpoints.slice(5).map(([n,track,refs])=>[retained.get(n)!,track,refs.filter(r=>retained.has(r)&&retained.get(r)!<retained.get(n)!)] as [number,Track,number[]])];
  const spikeAt=Array.from({length:pressureSpikes},(_,i)=>{let n=Math.floor((i+1)*turns*0.70/(pressureSpikes+1))+2;while(cp.some(c=>c[0]===n))n--;return n;});
  return mapped.map((r,i)=>{
  const checkpoint=cp.find(c=>c[0]===r.turn),focus=checkpoint?.[1]??r.track;

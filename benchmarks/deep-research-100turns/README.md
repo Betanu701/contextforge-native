@@ -46,15 +46,18 @@ There are **10 independently scored multi-hop checkpoints**:
 
 | Session turns (100-turn mode) | Focus | Required original premises |
 | --- | --- | --- |
-| 45 / 92 | Scaling law | 5 / 8 |
-| 47 / 94 | Calorimetry ledger | 9 / 19 |
-| 49 / 96 | Consensus | 7 / 10 |
-| 51 / 98 | Clinical cohort | 7 / 11 |
-| 53 / 100 | Cross-track synthesis | 12 / 20 |
+| 45 / 100 | Clinical cohort | 7 / 11 |
+| 47 / 92 | Scaling law | 5 / 8 |
+| 49 / 94 | Consensus | 7 / 10 |
+| 51 / 96 | Cross-track synthesis | 12 / 20 |
+| 53 / 98 | Calorimetry ledger | 9 / 19 |
 
 Together these require **108 premise deliveries** (some originals intentionally
-recur at several checkpoints). The last synthesis retrieves the original Turn 15
-observation **85 turns later**, alongside failed and corrected router hypotheses,
+recur at several checkpoints). Each checkpoint turn's newly ingested observation is
+on the **same research track** as its synthesis question, eliminating artificial
+cross-track scope conflicts. The late cross-track synthesis at Turn 96 retrieves the
+original Turn 15 observation **81 turns later** (and Turn 99 retrieves Turn 14
+**85 turns later**), alongside failed and corrected router hypotheses,
 heat invariants, the consensus trace/theorem and sealed-label restrictions.
 Checkpoint questions name the records to compare but do not reveal their values
 or expected interpretation. Thus this is a **named-reference evidence-acquisition
@@ -83,17 +86,19 @@ Defaults:
 - `--pressure-spikes 3` (integer 0..5)
 - `--spike-tokens 150000`, or mutually exclusive `--spike-ratio 0.92`
 - `--window 262144`
-- `--research-budget 12000` (3000..14000; strict output verification still applies)
-- `--max-output 512`, `--timeout-ms 300000`
+- `--research-budget 262144` (defaults to `--window`; optional override `>=3000`)
+- `--max-output 2048`, `--timeout-ms 300000`
 
-**Budget scheduling is explicit, not a claim that unconstrained retrieval stops
-at 12k by itself.** Normal substantive turns receive a 12k total-input host
-admission envelope within the configured native model window; pressure turns
-receive the full native-window envelope. The benchmark independently measures the
-actual serialized provider-style payload, rejecting any non-spike turn above
-14,000 estimated wire tokens. Early admissions may be below 3k; no filler or
-artificial padding is added to meet a token floor. Smaller user-selected research budgets can fail
-premise coverage; a report does not silently relax the oracle or trim the wire.
+**Self-bounding working-set knee (`optionalKneeCap` in `src/planner.ts`):**
+Both normal analytical turns and pressure-spike turns receive the full native model
+window (`--window`) by default—no manual per-turn caller budget scheduling is needed.
+Inside `planContext()`, required obligations (explicitly attached/referenced `sourceIds`
+and named documents) may expand through the quarter-tranche ladder up to the full
+physical window (`H`), while non-exhaustive optional historical recall is bounded by
+an automatic working-set knee (`11,500` total-input tokens). The benchmark independently
+measures the actual serialized provider-style payload, rejecting any non-spike turn
+above 14,000 estimated wire tokens (`nonSpikeMaxWireTokens` is `~10.6k–11.7k` across
+all 97 normal turns even with `hostTokenBudget = 262144`).
 
 Each pressure event ingests **12 actual bulky literature/dataset sources** whose
 combined original bytes are at least `spikeTokens * 3.6`. Each spike has unique

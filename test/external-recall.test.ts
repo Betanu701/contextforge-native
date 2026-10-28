@@ -255,3 +255,29 @@ for(const mutation of ['withdrawn','superseded','content-hash'] as const)
   assert.deepEqual([...selection.derivedNodeIds].sort(),nodes.map(n=>n.nodeId).sort());
  }finally{fixture.close();}
 });
+
+test('fallbackMinCoverage dial skips external/embedding adapter when native lexical coverage suffices and triggers when below threshold',async()=>{
+ const {store,options,adapter}=setup();
+ let adapterCalls=0;
+ try {
+  const source=store.ingestSource({originKey:'zircon-spec',text:'Zircon p99 latency is 910ms under stale writer reconnects.'});
+  new ContextForgeCompiler(store).compile();
+  adapter.search=async r=>{
+   adapterCalls++;
+   return {adapterId:'fake',adapterVersion:'1',querySha256:r.querySha256,namespaceId:r.namespaceId,namespaceGeneration:r.namespaceGeneration,complete:true,warnings:[],candidates:[{ref,rank:1,nativeRef:{namespaceId:r.namespaceId,sourceId:source.sourceId,contentSha256:source.contentSha256}}]};
+  };
+  // High native lexical coverage (100% >= 5%): external adapter must NOT be called.
+  const skipped=await prepareExternalRecall({store,query:'Zircon p99 latency',sessionId:'s'},{...options,policy:{enabled:true,fallbackMinCoverage:0.05}});
+  assert.equal(adapterCalls,0);
+  assert.equal(skipped.status,'disabled');
+  assert.ok((skipped.nativeCoverageRatio??0)>=0.5);
+  // Zero native lexical coverage (0% < 5%) on paraphrased vocabulary: external/embedding adapter MUST fire and hydrate native source.
+  const triggered=await prepareExternalRecall({store,query:'tail response delay during obsolete client reattachment',sessionId:'s'},{...options,policy:{enabled:true,fallbackMinCoverage:0.05}});
+  assert.equal(adapterCalls,1);
+  assert.equal(triggered.status,'ready');
+  assert.equal(triggered.nativeCoverageRatio,0);
+  assert.equal(triggered.candidates.length,1);
+  assert.deepEqual(triggered.candidates[0].sourceIds,[source.sourceId]);
+ }finally{store.close();}
+});
+

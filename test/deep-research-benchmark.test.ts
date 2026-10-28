@@ -28,8 +28,8 @@ test('100 distinct detailed observations, 20 per track, zero filler, separated f
  assert.equal(rows[57].track,'clinical-cohort');assert.match(rows[57].text,/numerical calibration/);
  for(const row of s){assert.ok(row.text.length>400);assert.ok(row.query.length>500);assert.ok(analyzeRecallQuery(row.query).substantiveTerms.length>0);const d=classifyQueryDemand(row.query);assert.notEqual(d.primary,'conversational');assert.ok(d.signals.includes('substantive_evidence_query'));assert.doesNotMatch(row.query,/acknowledge|routine turn/i);}
  assert.equal(s.filter(r=>r.checkpoint).length,10);assert.deepEqual(s.filter(r=>r.checkpoint).map(r=>r.turn),[45,47,49,51,53,92,94,96,98,100]);
- for(const c of s.filter(r=>r.checkpoint)){const refs=requiredTurns(c.turn,100);assert.ok(refs.length>=5);assert.ok(refs.every(n=>n<c.turn));for(const n of refs)assert.ok(c.query.includes(rows[n-1].anchor));}
- assert.ok(s[99].query.includes(rows[14].anchor),'85-turn synthesis dependency');
+ for(const c of s.filter(r=>r.checkpoint)){assert.equal(c.track,c.checkpoint);const refs=requiredTurns(c.turn,100);assert.ok(refs.length>=5);assert.ok(refs.every(n=>n<c.turn));for(const n of refs)assert.ok(c.query.includes(rows[n-1].anchor));}
+ assert.ok(s[95].query.includes(rows[14].anchor),'81-turn cross-track synthesis dependency');
  for(const lag of [10,30,60,85])assert.ok(s[98].query.includes(rows[98-lag].anchor),`Turn 99 reference ${lag} turns back`);
  for(const count of [50,100])for(let spikes=0;spikes<=5;spikes++){const turns=scenario(count,spikes);assert.equal(turns.length,count);assert.equal(turns.filter(r=>r.checkpoint).length,10);for(const t of TRACKS)assert.equal(turns.filter(r=>r.track===t).length,count/5);for(const r of turns.filter(r=>r.spike!==undefined)){assert.equal(r.checkpoint,undefined);assert.equal(turns[r.turn].release,r.spike);}}
  const fixture=readFileSync(new URL('../benchmarks/deep-research-100turns/fixtures.ts',import.meta.url),'utf8');assert.doesNotMatch(fixture,/from ['"].*oracles/);

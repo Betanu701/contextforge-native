@@ -4,20 +4,20 @@ import type { ContextForgeStore } from '../../src/store.ts';
 import type { Observation } from './fixtures.ts';
 import { canonicalJson } from '../../src/store.ts';
 const required100:Record<number,number[]>={
- 45:[2,19,27,32,42],47:[3,8,13,18,23,28,33,38,43],49:[4,9,14,24,29,34,44],51:[5,10,15,20,25,35,40],
- 53:[2,19,47,3,8,13,4,9,14,5,20,40],92:[2,19,27,32,47,57,71,87],
- 94:[3,8,13,18,23,28,33,38,43,48,53,60,63,68,73,78,83,88,93],
- 96:[4,9,14,24,29,34,54,64,79,89],98:[5,10,20,35,40,50,55,58,65,90,95],
- 100:[2,19,27,47,71,3,8,13,98,4,9,14,79,94,5,20,40,55,95,15]
+ 45:[5,10,15,20,25,35,40],47:[2,19,27,32,42],49:[4,9,14,24,29,34,44],51:[2,19,47,3,8,13,4,9,14,5,20,40],
+ 53:[3,8,13,18,23,28,33,38,43],92:[2,19,27,32,47,57,71,87],
+ 94:[4,9,14,24,29,34,54,64,79,89],
+ 96:[2,19,27,47,71,3,8,13,93,4,9,14,79,94,5,20,40,55,95,15],98:[3,8,13,18,23,28,33,38,43,48,53,60,63,68,73,78,83,88,93],
+ 100:[5,10,20,35,40,50,55,58,65,90,95]
 };
 export function requiredTurns(turn:number,count:number):number[] {
  if(count===100)return required100[turn]??[];
  const retained=(n:number)=>n<=40||n>=91;
- const mid=[31,33,35,37,39].indexOf(turn);
- if(mid>=0)return required100[[45,47,49,51,53][mid]].filter(n=>n<=(30+mid*2));
+ const midMap:Record<number,number>={31:51,33:53,35:45,37:47,39:49};
+ if(turn in midMap)return required100[midMap[turn]].filter(n=>n<turn);
  if(![42,44,46,48,50].includes(turn))return [];
  const full=turn+50;
- return (required100[full]??[]).filter(retained);
+ return (required100[full]??[]).filter(n=>retained(n)&&n<full);
 }
 export function scorePremises(plan:ContextPlan,turn:number,count:number,originals:Observation[],store:ContextForgeStore) {
  const checks=requiredTurns(turn,count).map(n=>{

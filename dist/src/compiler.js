@@ -66,7 +66,7 @@ export function extractRoutingFacets(text) {
         }
     }
     for (const m of text.matchAll(/\b[\p{Lu}][\p{L}\p{N}]*(?:[-_.][\p{L}\p{N}]+)+\b|\b[\p{Lu}][\p{L}\p{N}]{1,}\b/gu)){
-        if (!/^(?:The|This|That|There|These|Those|It|We|No|Not|Fact|State|Correction|Decision|Constraint|Concept|Negative|Report|Status|Return)$/u.test(m[0])) entities.push(m[0]);
+        if (!/^(?:The|This|That|There|These|Those|It|We|No|Not|Fact|State|Correction|Decision|Constraint|Concept|Negative|Report|Status|Return|Analyze|Analyse|Retrieve|Compare|Contrast|Explain|Synthesize|Calculate|Test|Which|What|When|Where|Why|How|Preserve|Shared|Replication|Research|Turn|Initial|Final|Post-fix|Pre-final|Empty|Untared|Independent|Prospective|Screening|Baseline|Adjustment|Sensitivity|Recalibration|External|Internal|Bounded|Conditional|Refined|Preregistered|Unified|Do|Keep|Retain|Exclude|Remove|Removing|Reject|Rejected|Adopted|Proposal|Review|Audit|Table|Summary|Source|Observation|Observations|Record|Records|Notebook|Notebooks|Thread|Threads|Track|Tracks|Project|Projects|Protocol|Study|Sweep|Trace|Lemma|Theorem|Invariant|Hypothesis|Assumptions|Assumption|Conclusion|Conclusions|Evidence|Units|Unit|Number|Numbers|Value|Values)$/iu.test(m[0])) entities.push(m[0]);
     }
     for (const m of text.matchAll(/\b[\p{L}][\p{L}\p{N}]*(?:[-_.][\p{L}\p{N}]+)+\b/gu))if (/[\p{N}\p{Lu}]/u.test(m[0])) entities.push(m[0]);
     if (/\b(?:status|current)\b/iu.test(text)) kinds.push('status');

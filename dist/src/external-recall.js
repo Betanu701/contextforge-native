@@ -1,12 +1,45 @@
-import { ContextForgeStore, sha256 } from './store.js';
+import { ContextForgeStore, sha256, createStoreReadBudget } from './store.js';
 import { planContext } from './planner.js';
-import { analyzeRecallQuery } from './retrieval.js';
+import { analyzeRecallQuery, scoreFacetCoverage } from './retrieval.js';
 export const CONTEXTFORGE_SUPPLEMENT_ORIGIN = 'contextforge-native';
+export function measureNativeLexicalCoverage(store, query, namespaceId = store.namespaceId, deadlineAt = Infinity) {
+    store.assertNamespace(namespaceId);
+    const recall = analyzeRecallQuery(query);
+    const qFacets = recall.facets.filter((f)=>f.origin === 'question');
+    const totalWeight = qFacets.reduce((n, f)=>n + f.weight, 0);
+    if (totalWeight <= 0) return 1;
+    const budget = createStoreReadBudget({
+        maxInspected: 256,
+        maxBytes: 512 * 1024,
+        deadlineAt
+    });
+    const hits = store.search(query, {
+        namespaceId,
+        layers: [
+            0,
+            1,
+            2
+        ],
+        limit: 32,
+        maxInspected: 128,
+        maxStatisticsInspected: 64,
+        deadlineAt,
+        budget
+    });
+    const covered = new Set();
+    for (const h of hits){
+        const sc = scoreFacetCoverage(recall, h.title + ' ' + h.body);
+        if (sc.anchored && sc.score > 0) for (const id of sc.matchedFacetIds)covered.add(id);
+    }
+    const coveredWeight = qFacets.filter((f)=>covered.has(f.id)).reduce((n, f)=>n + f.weight, 0);
+    return coveredWeight / totalWeight;
+}
 export function externalRecallStatus(options = {}) {
     const enabled = options.policy?.enabled === true;
     return {
         enabled,
         available: enabled && !!options.adapter && !!options.resolveCallerContext,
+        fallbackMinCoverage: options.policy?.fallbackMinCoverage ?? null,
         reason: !enabled ? 'disabled' : !options.adapter ? 'adapter_unavailable' : !options.resolveCallerContext ? 'trusted_caller_binding_unavailable' : 'injected_adapter',
         snapshotLifecycle: 'Snapshots are immutable observations; refresh/invalidation requires explicit host lifecycle management.'
     };
@@ -81,6 +114,13 @@ export async function prepareExternalRecall(input, options = {}) {
     if (options.policy?.enabled !== true) return result;
     const recall = analyzeRecallQuery(input.query);
     if (!recall.substantiveTerms.length && !input.sourceIds?.length && !input.attachments?.length) return result;
+    const fallbackThreshold = options.policy.fallbackMinCoverage;
+    if (fallbackThreshold !== undefined) {
+        if (!Number.isFinite(fallbackThreshold) || fallbackThreshold < 0 || fallbackThreshold > 1) throw new Error('Invalid fallbackMinCoverage: must be 0..1');
+        const ratio = measureNativeLexicalCoverage(input.store, input.query, ns, input.deadlineAt);
+        result.nativeCoverageRatio = ratio;
+        if (ratio >= fallbackThreshold) return result;
+    }
     result.status = 'unavailable';
     if (!options.adapter || !options.resolveCallerContext) {
         result.warnings.push('External recall unavailable: injected adapter and trusted caller binding are required.');

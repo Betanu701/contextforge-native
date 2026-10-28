@@ -349,7 +349,8 @@ export function planContext(input: PlanContextInput): ContextPlan {
       const remaining=H-mandatoryCost;
       const smallest=candidates.reduce((min,b)=>Math.min(min,b.cost),Infinity);
       let Q=Math.min(remaining,Math.max(1,Number.isFinite(smallest)?smallest:0,demand.initialDesiredInputTokens-fixed-mandatoryCost));
-      let tranche=0, done=false;
+      const optionalKneeCap=exhaustive?remaining:Math.max(0,11500-fixed-mandatoryCost);
+      let tranche=0, done=false, kneeCapped=false;
       const transportRejected=new Set<Bundle>();
       const redundant=new Set<Bundle>();const coveredFacets=new Set<string>();const coveredClaims=new Set<string>();
       while(!done) {
@@ -363,20 +364,23 @@ export function planContext(input: PlanContextInput): ContextPlan {
           for(const b of ranked) {
             if(input.abortSignal?.aborted||Date.now()>=(input.deadlineAt??Infinity))break;
             if(selected.includes(b)||transportRejected.has(b)||redundant.has(b))continue;visited++;
+            const isReq=b.items.some(i=>i.required);
             const facets=b.items.flatMap(i=>i.matchedFacetIds??[]);
             const premise=b.items.some(i=>(i.claimSignatures??[]).some(claim=>!coveredClaims.has(claim))); // semantic gain, never a blanket support-label exemption
-            if(!exhaustive&&!b.items.some(i=>i.required)&&facets.length&&!facets.some(f=>!coveredFacets.has(f))&&!premise){redundant.add(b);continue;}
+            if(!exhaustive&&!isReq&&facets.length&&!facets.some(f=>!coveredFacets.has(f))&&!premise){redundant.add(b);continue;}
+            if(!isReq&&(spent-mandatoryCost)+b.cost>optionalKneeCap){kneeCapped=true;continue;}
             if(spent+b.cost>allowance)continue;
             if(!fitsTransport([...selected,b])){transportRejected.add(b);continue;}
             selected.push(b);facets.forEach(f=>coveredFacets.add(f));b.items.flatMap(i=>i.claimSignatures??[]).forEach(c=>coveredClaims.add(c));spent+=b.cost;added.push(...b.items.map(i=>i.selectionId));utility+=b.items.reduce((n,i)=>n+i.utility,0);
           }
           refresh();
           const pending=candidates.filter(b=>!selected.includes(b)&&!transportRejected.has(b)&&!redundant.has(b));
+          const fittablePending=pending.filter(b=>b.items.some(i=>i.required)||(spent-mandatoryCost)+b.cost<=optionalKneeCap);
           const satisfied=demand.obligations.every(o=>o.status==='satisfied');
-          const quotedRemaining=pending.some(b=>b.items.some(i=>i.role==='quoted_evidence'));
+          const quotedRemaining=fittablePending.some(b=>b.items.some(i=>i.role==='quoted_evidence'));
           if(input.abortSignal?.aborted){stop='cancelled';done=true;}
           else if(Date.now()>=(input.deadlineAt??Infinity)){stop='retrieval_deadline';done=true;}
-          else if(!pending.length){stop=transportRejected.size?'transport_limit':unavailable.size?'modality_unavailable':satisfied?'sufficient_evidence':'corpus_exhausted';done=true;}
+          else if(!fittablePending.length){stop=transportRejected.size?'transport_limit':unavailable.size?'modality_unavailable':satisfied&&kneeCapped?'sufficient_evidence':satisfied?'sufficient_evidence':'corpus_exhausted';done=true;}
           else if(fraction===1&&satisfied&&!quotedRemaining&&demand.primary!=='heavy_rag'){stop='sufficient_evidence';done=true;}
           else if(fraction===1&&Q===remaining){stop='physical_limit';done=true;}
           const action=done?'stop':fraction===1?'expand_tranche':'expand_stage';
