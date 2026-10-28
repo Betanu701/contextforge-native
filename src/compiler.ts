@@ -218,7 +218,15 @@ export function extractAssertions(text:string): Parsed[] {
       const net=decimalSubtract(r.value,previous);
       if(!net.startsWith('-'))out.push({entity:r.entity,predicate:'net_mass',object:{value:net,unit:r.unit},polarity:1,kind:'derived_calculation',unit:r.unit,formula:{op:'subtract',left:r.value,right:previous,rounding:'exact_decimal',baseline:index===0?'zero_tare':null},operandIndexes:previousTotalIndex===undefined?[totalIndex]:[totalIndex,previousTotalIndex]});
       previous=r.value;previousTotalIndex=totalIndex;
-    });return out;
+    });
+    const meter=/\bcumulative\s+([\p{L}][\p{L}\p{N}_ -]*?)\s+meter\s+read\s+(-?\d+(?:\.\d+)?)\s*(kJ|J|kcal|cal|L|mL|ml)\b/iu.exec(line);
+    if(meter) {
+      const mName=meter[1].trim(), mVal=meter[2], mUnit=meter[3];
+      const colon=line.indexOf(':'), intro=colon>=0?line.slice(0,colon):line;
+      const context=colon<0?'':intro.replace(/\b(?:The|In|A|An|Cumulative|Scale|Successive|Readings|Running|Total|Balance|Vessel|Container)\b/giu,' ').match(/\b[\p{Lu}][\p{L}\p{N}_-]*\b/gu)?.join(' ')??'';
+      out.push({entity:context?`${context} ${mName}`:mName,predicate:'cumulative_meter',object:{value:mVal,unit:mUnit,reported:meter[0].trim()},polarity:1,kind:'parsed_measurement',unit:mUnit});
+    }
+    return out;
   }
   const measurement=/^([\p{L}\p{N}_ .\/-]+?)\s*:\s*(-?\d+(?:\.\d+)?)\s*(g|kg|mg|ml|mL|L|kcal|cal|cm|mm|m|bpm|%|ms|s|°C|°F)\s*$/u.exec(line);
   if(measurement)out.push({entity:measurement[1].trim(),predicate:'measurement',object:{value:measurement[2],unit:measurement[3],reported:line},polarity:1,kind:'parsed_measurement',unit:measurement[3]});

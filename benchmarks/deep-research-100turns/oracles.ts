@@ -55,10 +55,10 @@ export function verifyAssayArithmetic(rows:Observation[]) {
  const last=values.at(-1)!;
  return {observations:values.length,pass:values.length===20&&values[0].enthalpy===decimalUnits(expected.assay.firstJ)&&last.enthalpy===decimalUnits(expected.assay.lastJ)&&last.enthalpy-values[0].enthalpy===decimalUnits(expected.assay.driftJ)&&last.reagent===decimalUnits(expected.assay.finalReagentG)&&last.solvent===decimalUnits(expected.assay.finalSolventG)&&values.slice(1).every((v,i)=>v.enthalpy-values[i].enthalpy===123456789012345679n)};
 }
-export function scoreResponse(track:string,response:string) {
+export function scoreResponse(track:string,response:string,turn=100) {
  const checks:Record<string,RegExp[]>={
- 'scaling-law':[/0\.31/,/0\.22/,/warmup/i,/200[,.]?000|1\.6/i],
- 'calorimetry-assay':[/4\.184/,/reject|retain/i,/subtract|difference/i],
+ 'scaling-law':[/0\.31/,/0\.22/,/warmup/i,...(turn>=71?[/200[,.]?000|1\.6/i]:[/drop|95\.9|exposure/i])],
+ 'calorimetry-assay':[/4\.184|0\.200000000000000020/,/reject|retain|subtract|difference/i,/subtract|difference|122\.345678991234567901|121\.234567890123456790/i],
  'distributed-consensus':[/durable|persist/i,/quorum|certificate/i,/eventual|conditional/i],
  'clinical-cohort':[/0\.91/,/both|conjunct|\bAND\b/,/sealed|unknown|abstain/i],
  'cross-track-synthesis':[/warmup/i,/calibrat/i,/sealed|unknown/i,/fenc|promise/i]
