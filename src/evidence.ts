@@ -1,6 +1,7 @@
 import { ContextForgeStore, stableId, createStoreReadBudget } from './store.ts';
 import { analyzeRecallQuery, scoreFacetCoverage } from './retrieval.ts';
 import { estimateTokens } from './symbolic-ir.ts';
+import { getLanguageGrammar, decomposeCodeSource } from './code-decomposer.ts';
 import type { StoreReadBudget } from './store.ts';
 import type { RecallQuery } from './retrieval.ts';
 type Excerpt={spanId:string;artifactId:string;byteStart:number;byteEnd:number;text:string};
@@ -40,6 +41,28 @@ export function buildEvidenceWindow(store:ContextForgeStore,sourceId:string,reca
     }
     m.forEach(f=>coveredWindowFacets.add(f));
    }
+  }
+  // After all primary facet hits are secured, if budget remains (< 6,500 chars) and this is a
+  // recognized code/markup/mainframe file, expand top matched chunks to complete surgical block boundaries!
+  const grammar=getLanguageGrammar(source.originKey);
+  if(grammar&&totalChars<6500&&chunks.length>1&&chunks[chunks.length-1].byteEnd===Buffer.byteLength(full)){
+   try{
+    const tree=decomposeCodeSource(full,{originKey:source.originKey,grammarId:grammar.id,maxBlockBytes:1600});
+    const matchedByteOffsets=ranked.slice(0,4).map(r=>chunks[r.i].byteStart);
+    for(const offset of matchedByteOffsets){
+     const enclosing=tree.flatNodes
+      .filter(n=>n.depth>=1&&n.byteStart<=offset&&n.byteEnd>offset&&(n.byteEnd-n.byteStart)<=1200)
+      .sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart))[0];
+     if(enclosing){
+      const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=enclosing.byteStart&&c.byteEnd<=enclosing.byteEnd).map(x=>x.idx);
+      const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
+      if(addedChars>0&&totalChars+addedChars<=7200){
+       blockIdxs.forEach(idx=>indexes.add(idx));
+       totalChars+=addedChars;
+      }
+     }
+    }
+   }catch{/* fallback to line-window if custom grammar throws */}
   }
   chosen=chunks.filter((_,i)=>indexes.has(i));
  }

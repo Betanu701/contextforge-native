@@ -7,9 +7,10 @@ import { ContextForgeCompiler } from "./src/compiler.js";
 import { planContext, executeTrancheStream, resolveCapabilityEnvelope, resolvePromptAndToolProfile } from "./src/planner.js";
 import { compileDualChannelSystemPrompt, estimateTokens } from "./src/symbolic-ir.js";
 import { createContextForgeTools } from "./src/tools.js";
+import { decomposeCodeSource, registerLanguageGrammar, getLanguageGrammar, listLanguageGrammars, fromVSCodeLanguageConfig, verifyPartitionConservation } from "./src/code-decomposer.js";
 import { planContextWithRecall, assertContextPlanCurrent, externalRecallStatus, CONTEXTFORGE_SUPPLEMENT_ORIGIN } from "./src/external-recall.js";
 export * from "./src/external-recall.js";
-export { ContextForgeStore, ContextForgeCompiler, planContext, executeTrancheStream, resolveCapabilityEnvelope, resolvePromptAndToolProfile, compileDualChannelSystemPrompt, createContextForgeTools };
+export { ContextForgeStore, ContextForgeCompiler, planContext, executeTrancheStream, resolveCapabilityEnvelope, resolvePromptAndToolProfile, compileDualChannelSystemPrompt, createContextForgeTools, decomposeCodeSource, registerLanguageGrammar, getLanguageGrammar, listLanguageGrammars, fromVSCodeLanguageConfig, verifyPartitionConservation };
 function asRecord(v) {
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }

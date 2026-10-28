@@ -18,6 +18,18 @@ import {
 } from "./src/planner.ts";
 import { compileDualChannelSystemPrompt, estimateTokens } from "./src/symbolic-ir.ts";
 import { createContextForgeTools } from "./src/tools.ts";
+import {
+  decomposeCodeSource,
+  registerLanguageGrammar,
+  getLanguageGrammar,
+  listLanguageGrammars,
+  fromVSCodeLanguageConfig,
+  verifyPartitionConservation,
+  type LanguageGrammarSpec,
+  type VSCodeLanguageConfiguration,
+  type CodeBlockNode,
+  type DecomposedCodeTree,
+} from "./src/code-decomposer.ts";
 import { planContextWithRecall, assertContextPlanCurrent, externalRecallStatus, CONTEXTFORGE_SUPPLEMENT_ORIGIN, type ExternalRecallAdapter, type ExternalRecallOptions } from "./src/external-recall.ts";
 export * from "./src/external-recall.ts";
 import type { AcceptedMessage, JsonValue, Modality } from "./src/types.ts";
@@ -31,12 +43,22 @@ export {
   resolvePromptAndToolProfile,
   compileDualChannelSystemPrompt,
   createContextForgeTools,
+  decomposeCodeSource,
+  registerLanguageGrammar,
+  getLanguageGrammar,
+  listLanguageGrammars,
+  fromVSCodeLanguageConfig,
+  verifyPartitionConservation,
 };
 export type {
   TrancheStreamInput,
   TranchePassSelection,
   TrancheStreamPassReceipt,
   TrancheStreamResult,
+  LanguageGrammarSpec,
+  VSCodeLanguageConfiguration,
+  CodeBlockNode,
+  DecomposedCodeTree,
 };
 
 export interface ContextForgePluginOptions {
