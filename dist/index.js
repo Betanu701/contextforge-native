@@ -4,12 +4,12 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { ContextForgeStore, sha256 } from "./src/store.js";
 import { ContextForgeCompiler } from "./src/compiler.js";
-import { planContext, resolveCapabilityEnvelope, resolvePromptAndToolProfile } from "./src/planner.js";
+import { planContext, executeTrancheStream, resolveCapabilityEnvelope, resolvePromptAndToolProfile } from "./src/planner.js";
 import { compileDualChannelSystemPrompt, estimateTokens } from "./src/symbolic-ir.js";
 import { createContextForgeTools } from "./src/tools.js";
 import { planContextWithRecall, assertContextPlanCurrent, externalRecallStatus, CONTEXTFORGE_SUPPLEMENT_ORIGIN } from "./src/external-recall.js";
 export * from "./src/external-recall.js";
-export { ContextForgeStore, ContextForgeCompiler, planContext, resolveCapabilityEnvelope, resolvePromptAndToolProfile, compileDualChannelSystemPrompt, createContextForgeTools };
+export { ContextForgeStore, ContextForgeCompiler, planContext, executeTrancheStream, resolveCapabilityEnvelope, resolvePromptAndToolProfile, compileDualChannelSystemPrompt, createContextForgeTools };
 function asRecord(v) {
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }

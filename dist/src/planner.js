@@ -1142,6 +1142,122 @@ export function planContext(input) {
         };
     });
 }
+export async function executeTrancheStream(input, selectPass) {
+    const { store } = input;
+    const ns = input.namespaceId ?? store.namespaceId;
+    store.assertNamespace(ns);
+    const baseEnvelope = resolveCapabilityEnvelope(input.envelope);
+    const trancheBudget = input.trancheTokenBudget ?? Math.min(baseEnvelope.hostTokenBudget, baseEnvelope.nativeContextTokens, baseEnvelope.deploymentContextTokens);
+    const maxPasses = Math.max(1, Math.min(input.maxPasses ?? 16, 64));
+    const visitedSources = new Set();
+    const pendingQueue = [
+        ...new Set(input.sourceIds ?? [])
+    ];
+    const verifiedKeepSpans = new Set();
+    const retainedSourceIds = new Set();
+    const passes = [];
+    for(let passIndex = 0; passIndex < maxPasses; passIndex++){
+        const queueSlice = pendingQueue.filter((id)=>!visitedSources.has(id));
+        if (passIndex > 0 && queueSlice.length === 0) break;
+        const passAdmissionId = `${input.admissionId}:tranche-${passIndex}`;
+        const passPlan = planContext({
+            ...input,
+            admissionId: passAdmissionId,
+            sourceIds: queueSlice,
+            envelope: {
+                ...baseEnvelope,
+                hostTokenBudget: trancheBudget,
+                hostBudgetScope: 'total_input'
+            }
+        });
+        const admittedInPass = [
+            ...new Set(passPlan.receipt.selections.filter((s)=>s.role === 'quoted_evidence').map((s)=>s.sourceId))
+        ];
+        for (const id of admittedInPass)visitedSources.add(id);
+        if (admittedInPass.length === 0 && queueSlice.length > 0) break;
+        const passVerifiedSpans = [];
+        const resolvedSymbols = [];
+        if (selectPass) {
+            const rawSelection = await selectPass(passPlan, passIndex);
+            const parsed = typeof rawSelection === 'string' ? {
+                keepSpanIds: [
+                    ...rawSelection.matchAll(/\[span:([a-f0-9]{64})\]/gi)
+                ].map((m)=>m[1])
+            } : rawSelection;
+            for (const spanId of parsed.keepSpanIds ?? []){
+                try {
+                    const span = store.readEvidenceSpan(spanId, {
+                        namespaceId: ns
+                    });
+                    verifiedKeepSpans.add(span.spanId);
+                    retainedSourceIds.add(span.sourceId);
+                    passVerifiedSpans.push(span.spanId);
+                } catch  {}
+            }
+            for (const srcId of parsed.keepSourceIds ?? []){
+                const src = store.getSource(srcId);
+                if (src && src.namespaceId === ns && src.status === 'active') {
+                    retainedSourceIds.add(srcId);
+                }
+            }
+            for (const sym of parsed.unresolvedSymbols ?? []){
+                const key = `wiki/entities/${encodeURIComponent(sym.normalize('NFKC').toLowerCase().trim())}`;
+                const nodes = store.db.prepare("SELECT node_id FROM derived_nodes WHERE namespace_id=? AND status='active' AND (logical_key=? OR logical_key LIKE ?)").all(ns, key, `${key}/part-%`);
+                for (const n of nodes){
+                    for (const p of store.getProvenance(String(n.node_id))){
+                        if (!visitedSources.has(p.sourceId) && !pendingQueue.includes(p.sourceId)) {
+                            pendingQueue.push(p.sourceId);
+                            resolvedSymbols.push(sym);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (const s of passPlan.receipt.selections.filter((x)=>x.role === 'quoted_evidence')){
+                for (const spanId of s.provenanceSpanIds){
+                    verifiedKeepSpans.add(spanId);
+                    passVerifiedSpans.push(spanId);
+                }
+            }
+        }
+        const remaining = pendingQueue.filter((id)=>!visitedSources.has(id));
+        passes.push({
+            passIndex,
+            admissionId: passAdmissionId,
+            plan: passPlan,
+            admittedSourceIds: admittedInPass,
+            remainingSourceIds: remaining,
+            verifiedKeepSpanIds: passVerifiedSpans,
+            unresolvedSymbolsResolved: [
+                ...new Set(resolvedSymbols)
+            ]
+        });
+        if (remaining.length === 0) break;
+    }
+    const finalPlan = passes.length === 1 && retainedSourceIds.size === 0 ? passes[0].plan : planContext({
+        ...input,
+        admissionId: `${input.admissionId}:final-synthesis`,
+        sourceIds: [
+            ...retainedSourceIds
+        ],
+        envelope: baseEnvelope
+    });
+    const initialRequested = new Set(input.sourceIds ?? []);
+    const allCovered = [
+        ...initialRequested
+    ].every((id)=>visitedSources.has(id));
+    return {
+        passes,
+        finalPlan,
+        totalUniqueSourcesAdmitted: [
+            ...visitedSources
+        ],
+        verifiedSpanIds: [
+            ...verifiedKeepSpans
+        ],
+        allRequestedSourcesCovered: allCovered
+    };
+}
 
 
 //# sourceURL=src/planner.ts

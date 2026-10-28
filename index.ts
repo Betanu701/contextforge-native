@@ -6,10 +6,15 @@ import { ContextForgeStore, sha256 } from "./src/store.ts";
 import { ContextForgeCompiler } from "./src/compiler.ts";
 import {
   planContext,
+  executeTrancheStream,
   resolveCapabilityEnvelope,
   resolvePromptAndToolProfile,
   type EnvelopeMetadata,
   type MediaAdapter,
+  type TrancheStreamInput,
+  type TranchePassSelection,
+  type TrancheStreamPassReceipt,
+  type TrancheStreamResult,
 } from "./src/planner.ts";
 import { compileDualChannelSystemPrompt, estimateTokens } from "./src/symbolic-ir.ts";
 import { createContextForgeTools } from "./src/tools.ts";
@@ -21,10 +26,17 @@ export {
   ContextForgeStore,
   ContextForgeCompiler,
   planContext,
+  executeTrancheStream,
   resolveCapabilityEnvelope,
   resolvePromptAndToolProfile,
   compileDualChannelSystemPrompt,
   createContextForgeTools,
+};
+export type {
+  TrancheStreamInput,
+  TranchePassSelection,
+  TrancheStreamPassReceipt,
+  TrancheStreamResult,
 };
 
 export interface ContextForgePluginOptions {

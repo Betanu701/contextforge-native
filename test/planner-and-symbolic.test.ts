@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextForgeStore, canonicalJson, stableId } from '../src/store.ts';
 import { ContextForgeCompiler } from '../src/compiler.ts';
-import { resolveCapabilityEnvelope, resolveHistoryCapacity, resolvePromptAndToolProfile, classifyQueryDemand, groupVerbatimTail, planContext } from '../src/planner.ts';
+import { resolveCapabilityEnvelope, resolveHistoryCapacity, resolvePromptAndToolProfile, classifyQueryDemand, groupVerbatimTail, planContext, executeTrancheStream } from '../src/planner.ts';
 import type { EnvelopeMetadata, PlanContextInput } from '../src/planner.ts';
 
 function fixture(){const dir=mkdtempSync(join(tmpdir(),'cf-planner-'));const store=new ContextForgeStore(join(dir,'store.sqlite'));return {store,clean(){store.close();rmSync(dir,{recursive:true,force:true});}};}
@@ -129,3 +129,55 @@ test('audio/video/document capabilities use the same hydration path',()=>{
     }
   }finally{f.clean();}
 });
+
+test('executeTrancheStream folds a 12-document repo exceeding a 16K window across multiple bounded tranches with stable prefix reuse, L2 symbol resolution, and final verbatim hydration',async()=>{
+  const f=fixture();try{
+    const ids:string[]=[];
+    for(let i=0;i<12;i++){
+      const text=`Module file-${i}.ts:\n`+(i===3?'export function criticalBugTarget() { return validateCrossFileContract(42); }\n':i===9?'export function validateCrossFileContract(x: number) { return x === 42; }\n':'')+'// Repository implementation detail padding line for module.\n'.repeat(240);
+      ids.push(f.store.ingestSource({originKey:`repo/file-${i}.ts`,kind:'document',role:'user',text}).sourceId);
+    }
+    const helperSource=f.store.ingestSource({originKey:'repo/UnqueuedHelper.ts',kind:'document',role:'user',text:'export function UnqueuedHelperSymbol() { return "resolved-via-L2-entity-graph"; }\n'});
+    new ContextForgeCompiler(f.store).compile();
+
+    // Single-pass on a 16K window with 8K tranche budget can only fit a subset of the 12 files (~4,000 tokens each -> ~2-3 files per pass).
+    const stream=await executeTrancheStream(
+      request(f.store,{
+        admissionId:'repo-fold',
+        query:'Trace criticalBugTarget and validateCrossFileContract across the repository modules',
+        sourceIds:ids,
+        trancheTokenBudget:10000,
+        envelope:envelope(16000,{hostTokenBudget:16000,hostBudgetScope:'total_input'}),
+      }),
+      (passPlan, passIndex) => {
+        const keepSpans = passPlan.receipt.selections
+          .filter(s => [ids[3], ids[9], helperSource.sourceId].includes(s.sourceId))
+          .flatMap(s => s.provenanceSpanIds);
+        return {
+          keepSpanIds: [...keepSpans, 'deadbeef'.repeat(8)], // bogus span must be rejected
+          unresolvedSymbols: passIndex === 0 ? ['UnqueuedHelperSymbol'] : [],
+        };
+      },
+    );
+
+    assert.ok(stream.passes.length >= 2, '12 files must stream across multiple bounded tranches');
+    assert.equal(stream.allRequestedSourcesCovered, true, 'All 12 requested repo files must be visited across passes');
+    assert.ok(stream.totalUniqueSourcesAdmitted.includes(helperSource.sourceId), 'Unresolved symbol must be resolved via L2 entity graph into subsequent tranche');
+    // Every intermediate pass must respect the 10,000-token tranche budget and share the exact same stable prefix SHA-256 (Slot 0 KV-cache reuse).
+    const prefixHashes = new Set(stream.passes.map(p => p.plan.epoch.prefixSha256));
+    assert.equal(prefixHashes.size, 1, 'All tranche passes must share identical Slot 0 prefixSha256 for 100% KV-cache reuse');
+    for (const p of stream.passes) {
+      assert.ok(p.plan.receipt.tokens.serializedInputTokens <= 10000, `Pass ${p.passIndex} exceeded trancheTokenBudget: ${p.plan.receipt.tokens.serializedInputTokens}`);
+    }
+    // Bogus span ID was rejected; only the 3 critical files were hydrated verbatim into finalPlan.
+    assert.ok(!stream.verifiedSpanIds.includes('deadbeef'.repeat(8)));
+    const finalSources = new Set(stream.finalPlan.receipt.selections.filter(s => s.role === 'quoted_evidence').map(s => s.sourceId));
+    assert.deepEqual(finalSources, new Set([ids[3], ids[9], helperSource.sourceId]));
+    const finalWire = canonicalJson(stream.finalPlan.messages);
+    assert.match(finalWire, /criticalBugTarget/);
+    assert.match(finalWire, /validateCrossFileContract/);
+    assert.match(finalWire, /resolved-via-L2-entity-graph/);
+    assert.ok(stream.finalPlan.receipt.tokens.serializedInputTokens < 10000, 'Final synthesis prompt is compact (~9.5k tokens vs ~50k full repo) and contains only surviving verbatim spans');
+  }finally{f.clean();}
+});
+
