@@ -234,7 +234,7 @@ export function planContext(input: PlanContextInput): ContextPlan {
     // ACL before existence/title/scoring: denied IDs do not enter receipts.
     for(const id of explicit){const s=store.getSource(id);if(s&&s.namespaceId!==ns)throw new Error('Source outside authorized planning scope');}
     const inventory=db.prepare("SELECT s.source_id,s.origin_key FROM sources s JOIN source_lifecycle l USING(source_id) WHERE s.namespace_id=? AND l.status='active' AND s.kind IN ('document','media','external_snapshot') ORDER BY s.observed_at,s.source_id").all(ns);
-    const exhaustive=/\b(all|every|exhaustive|entire|comprehensive)\b/i.test(input.query) && (demand.primary==='heavy_rag'||demand.secondary.includes('heavy_rag'));
+    const exhaustive=(!input.strictExplicitObligationsOnly) && /\b(all|every|exhaustive|entire|comprehensive)\b/i.test(input.query) && (demand.primary==='heavy_rag'||demand.secondary.includes('heavy_rag'));
     for(const id of explicit){const source=store.getSource(id);if(source?.status==='active'&&!inventory.some(r=>r.source_id===id))inventory.push({source_id:id,origin_key:source.originKey});}
     const requested=new Set(explicit);
     if(exhaustive)inventory.forEach(r=>requested.add(String(r.source_id)));
@@ -257,10 +257,11 @@ export function planContext(input: PlanContextInput): ContextPlan {
       let windowedSpans:string[]|undefined, windowedArtifacts:string[]|undefined;
       const explicitSpans=input.requiredSpansBySource?.[id];
       // When a required text document has explicit surviving spans from `executeTrancheStream`,
-      // or alone exceeds remaining history capacity (H - mandatoryCost) or >2048 tokens in multi-file tranche mode,
-      // hydrate its bounded query-relevant L0 evidence window (`buildEvidenceWindow`) so oversized
-      // repo files (e.g. 60KB `planner.ts` or `store.ts`) fit cleanly into 8K-16K tranches with exact spans.
-      if(rawText && (explicitSpans?.length || estimateTokens(text)+64 > Math.max(1024, H-mandatory.reduce((n,b)=>n+b.cost,0)) || (input.strictExplicitObligationsOnly && requested.size>1 && estimateTokens(text)>2048))) {
+      // or in multi-file `strictExplicitObligationsOnly` tranche mode exceeds remaining history capacity
+      // or >2048 tokens, hydrate its bounded query-relevant L0 evidence window (`buildEvidenceWindow`)
+      // so oversized repo files fit cleanly into 8K-16K tranches with exact spans while regular
+      // full-source pressure spikes (`!strictExplicitObligationsOnly`) keep their full verbatim payload.
+      if(rawText && (explicitSpans?.length || (input.strictExplicitObligationsOnly && (estimateTokens(text)+64 > Math.max(1024, H-mandatory.reduce((n,b)=>n+b.cost,0)) || (requested.size>1 && estimateTokens(text)>2048))))) {
         const win=buildEvidenceWindow(store,id,recall,explicitSpans??[],ns,input.deadlineAt);
         if(win&&win.text&&win.spanIds.length){text=win.text;windowedSpans=win.spanIds;windowedArtifacts=win.artifactIds;}
       }
@@ -393,14 +394,16 @@ export function planContext(input: PlanContextInput): ContextPlan {
             const facets=b.items.flatMap(i=>i.matchedFacetIds??[]);
             const premise=b.items.some(i=>(i.claimSignatures??[]).some(claim=>!coveredClaims.has(claim))); // semantic gain, never a blanket support-label exemption
             if(!exhaustive&&!isReq&&facets.length&&!facets.some(f=>!coveredFacets.has(f))&&!premise){redundant.add(b);continue;}
-            if(!isReq&&(spent-mandatoryCost)+b.cost>optionalKneeCap){kneeCapped=true;continue;}
+            const optionalSpent=selected.filter(x=>x.items.every(i=>!i.required)).reduce((n,x)=>n+x.cost,0);
+            if(!isReq&&optionalSpent+b.cost>optionalKneeCap){kneeCapped=true;continue;}
             if(spent+b.cost>allowance)continue;
             if(!fitsTransport([...selected,b])){transportRejected.add(b);continue;}
             selected.push(b);facets.forEach(f=>coveredFacets.add(f));b.items.flatMap(i=>i.claimSignatures??[]).forEach(c=>coveredClaims.add(c));spent+=b.cost;added.push(...b.items.map(i=>i.selectionId));utility+=b.items.reduce((n,i)=>n+i.utility,0);
           }
           refresh();
+          const optionalSpentNow=selected.filter(x=>x.items.every(i=>!i.required)).reduce((n,x)=>n+x.cost,0);
           const pending=candidates.filter(b=>!selected.includes(b)&&!transportRejected.has(b)&&!redundant.has(b));
-          const fittablePending=pending.filter(b=>b.items.some(i=>i.required)||(spent-mandatoryCost)+b.cost<=optionalKneeCap);
+          const fittablePending=pending.filter(b=>b.items.some(i=>i.required)||optionalSpentNow+b.cost<=optionalKneeCap);
           const satisfied=demand.obligations.every(o=>o.status==='satisfied');
           const quotedRemaining=fittablePending.some(b=>b.items.some(i=>i.role==='quoted_evidence'));
           if(input.abortSignal?.aborted){stop='cancelled';done=true;}

@@ -59,7 +59,7 @@ export function analyzeRecallQuery(query, limit = 256) {
         if (stop.has(full)) continue;
         const aliases = tokenizeRecallText(surface).filter((a)=>!stop.has(a));
         if (!aliases.length) continue;
-        const kind = /^\d+(?:\.\d+)?$/.test(full) ? 'number' : /[\d_-]/.test(surface) || /\p{Ll}\p{Lu}|\p{Lu}\p{Lu}\p{Ll}/u.test(surface) ? 'identifier' : surface.length === 1 && surface === 'm' ? 'unit' : /^\p{Lu}/u.test(surface) ? 'entity' : origin === 'output_schema' ? 'field' : 'content';
+        const kind = /^\d+(?:\.\d+)?$/.test(full) ? 'number' : /[\d_-]/.test(surface) || /^\p{Ll}/u.test(surface) && /\p{Ll}\p{Lu}/u.test(surface) ? 'identifier' : surface.length === 1 && surface === 'm' ? 'unit' : /^\p{Lu}/u.test(surface) ? 'entity' : origin === 'output_schema' ? 'field' : 'content';
         const id = createHash('sha256').update(origin + '\0' + full).digest('hex').slice(0, 20);
         if (!facets.some((f)=>f.id === id)) facets.push({
             id,
@@ -130,8 +130,7 @@ export function scoreFacetCoverage(query, text, covered = []) {
         return matchMemo.get(f.id);
     };
     const entities = strong.filter((f)=>f.kind === 'entity' && f.surface.length > 1);
-    const identifiers = strong.filter((f)=>f.kind === 'identifier' && f.surface.length > 1);
-    const anchored = entities.length || identifiers.length ? entities.some((f)=>match(f) >= 0.9) || identifiers.some((f)=>match(f) >= 0.9) : !strong.length || strong.some((f)=>match(f) >= 0.9) || q.facets.filter((f)=>f.origin === 'question' && f.kind === 'content' && match(f) >= 0.9 && !generic.has(norm(f.surface))).length >= 2;
+    const anchored = entities.length ? entities.some((f)=>match(f) >= 0.9) : !strong.length || strong.some((f)=>match(f) >= 0.9) || q.facets.filter((f)=>f.origin === 'question' && f.kind === 'content' && match(f) >= 0.9 && !generic.has(norm(f.surface))).length >= 2;
     const matched = q.facets.filter((f)=>match(f) > 0 && (anchored || f.origin === 'question' && !generic.has(norm(f.surface))));
     const marginal = matched.filter((f)=>!seen.has(f.id));
     const result = {

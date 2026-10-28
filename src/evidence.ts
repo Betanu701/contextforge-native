@@ -27,42 +27,46 @@ export function buildEvidenceWindow(store:ContextForgeStore,sourceId:string,reca
     +recall.facets.filter(f=>f.origin==='question'&&(f.kind==='identifier'||f.kind==='number')&&f.surface.length>=2&&c.text.includes(f.surface)).length*12
     +(/\b(anomal\w*|exception|reject\w*|unchanged|only|no other|must not|never)\b/i.test(c.text)?3:0)
   })).sort((a,b)=>b.s-a.s||a.i-b.i);
-  const coveredWindowFacets=new Set<string>();
-  let totalChars=chunks[0].text.length+(chunks.length>1?chunks[chunks.length-1].text.length:0);
-  // Greedily include top-scoring chunks (plus +/-2 adjacent lines for code/context)
-  // and any chunk that covers a previously uncovered query facet, up to ~7,500 chars (~2,000 tokens).
-  for(const {i,s} of ranked){
-   if(s<=0)break;
-   const m=scoreFacetCoverage(recall,chunks[i].text).matchedFacetIds;
-   const addsNewFacet=m.some(f=>!coveredWindowFacets.has(f));
-   if((indexes.size<48||addsNewFacet)&&totalChars<7200){
-    for(let j=Math.max(0,i-2);j<=Math.min(chunks.length-1,i+2);j++){
-     if(!indexes.has(j)&&totalChars+chunks[j].text.length<=7500){indexes.add(j);totalChars+=chunks[j].text.length;}
-    }
-    m.forEach(f=>coveredWindowFacets.add(f));
-   }
-  }
-  // After all primary facet hits are secured, if budget remains (< 6,500 chars) and this is a
-  // recognized code/markup/mainframe file, expand top matched chunks to complete surgical block boundaries!
   const grammar=getLanguageGrammar(source.originKey);
-  if(grammar&&totalChars<6500&&chunks.length>1&&chunks[chunks.length-1].byteEnd===Buffer.byteLength(full)){
-   try{
-    const tree=decomposeCodeSource(full,{originKey:source.originKey,grammarId:grammar.id,maxBlockBytes:1600});
-    const matchedByteOffsets=ranked.slice(0,4).map(r=>chunks[r.i].byteStart);
-    for(const offset of matchedByteOffsets){
-     const enclosing=tree.flatNodes
-      .filter(n=>n.depth>=1&&n.byteStart<=offset&&n.byteEnd>offset&&(n.byteEnd-n.byteStart)<=1200)
-      .sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart))[0];
-     if(enclosing){
-      const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=enclosing.byteStart&&c.byteEnd<=enclosing.byteEnd).map(x=>x.idx);
-      const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
-      if(addedChars>0&&totalChars+addedChars<=7200){
-       blockIdxs.forEach(idx=>indexes.add(idx));
-       totalChars+=addedChars;
+  if(grammar){
+   const coveredWindowFacets=new Set<string>();
+   let totalChars=chunks[0].text.length+(chunks.length>1?chunks[chunks.length-1].text.length:0);
+   // Greedily include top-scoring chunks (plus +/-2 adjacent lines for code/context)
+   // and any chunk that covers a previously uncovered query facet, up to ~7,500 chars (~2,000 tokens).
+   for(const {i,s} of ranked){
+    if(s<=0)break;
+    const m=scoreFacetCoverage(recall,chunks[i].text).matchedFacetIds;
+    const addsNewFacet=m.some(f=>!coveredWindowFacets.has(f));
+    if((indexes.size<48||addsNewFacet)&&totalChars<7200){
+     for(let j=Math.max(0,i-2);j<=Math.min(chunks.length-1,i+2);j++){
+      if(!indexes.has(j)&&totalChars+chunks[j].text.length<=7500){indexes.add(j);totalChars+=chunks[j].text.length;}
+     }
+     m.forEach(f=>coveredWindowFacets.add(f));
+    }
+   }
+   // After all primary facet hits are secured, if budget remains (< 6,500 chars) and this is a
+   // recognized code/markup/mainframe file, expand top matched chunks to complete surgical block boundaries!
+   if(totalChars<6500&&chunks.length>1&&chunks[chunks.length-1].byteEnd===Buffer.byteLength(full)){
+    try{
+     const tree=decomposeCodeSource(full,{originKey:source.originKey,grammarId:grammar.id,maxBlockBytes:1600});
+     const matchedByteOffsets=ranked.slice(0,4).map(r=>chunks[r.i].byteStart);
+     for(const offset of matchedByteOffsets){
+      const enclosing=tree.flatNodes
+       .filter(n=>n.depth>=1&&n.byteStart<=offset&&n.byteEnd>offset&&(n.byteEnd-n.byteStart)<=1200)
+       .sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart))[0];
+      if(enclosing){
+       const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=enclosing.byteStart&&c.byteEnd<=enclosing.byteEnd).map(x=>x.idx);
+       const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
+       if(addedChars>0&&totalChars+addedChars<=7200){
+        blockIdxs.forEach(idx=>indexes.add(idx));
+        totalChars+=addedChars;
+       }
       }
      }
-    }
-   }catch{/* fallback to line-window if custom grammar throws */}
+    }catch{/* fallback to line-window if custom grammar throws */}
+   }
+  } else {
+   for(const {i,s} of ranked.slice(0,3))if(s>0)for(const j of [i])if(j>=0&&j<chunks.length)indexes.add(j);
   }
   chosen=chunks.filter((_,i)=>indexes.has(i));
  }

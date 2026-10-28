@@ -429,7 +429,7 @@ export function planContext(input) {
             if (s && s.namespaceId !== ns) throw new Error('Source outside authorized planning scope');
         }
         const inventory = db.prepare("SELECT s.source_id,s.origin_key FROM sources s JOIN source_lifecycle l USING(source_id) WHERE s.namespace_id=? AND l.status='active' AND s.kind IN ('document','media','external_snapshot') ORDER BY s.observed_at,s.source_id").all(ns);
-        const exhaustive = /\b(all|every|exhaustive|entire|comprehensive)\b/i.test(input.query) && (demand.primary === 'heavy_rag' || demand.secondary.includes('heavy_rag'));
+        const exhaustive = !input.strictExplicitObligationsOnly && /\b(all|every|exhaustive|entire|comprehensive)\b/i.test(input.query) && (demand.primary === 'heavy_rag' || demand.secondary.includes('heavy_rag'));
         for (const id of explicit){
             const source = store.getSource(id);
             if (source?.status === 'active' && !inventory.some((r)=>r.source_id === id)) inventory.push({
@@ -490,7 +490,7 @@ export function planContext(input) {
             let text = rawText ? String(rawText.text_content) : '';
             let windowedSpans, windowedArtifacts;
             const explicitSpans = input.requiredSpansBySource?.[id];
-            if (rawText && (explicitSpans?.length || estimateTokens(text) + 64 > Math.max(1024, H - mandatory.reduce((n, b)=>n + b.cost, 0)) || input.strictExplicitObligationsOnly && requested.size > 1 && estimateTokens(text) > 2048)) {
+            if (rawText && (explicitSpans?.length || input.strictExplicitObligationsOnly && (estimateTokens(text) + 64 > Math.max(1024, H - mandatory.reduce((n, b)=>n + b.cost, 0)) || requested.size > 1 && estimateTokens(text) > 2048))) {
                 const win = buildEvidenceWindow(store, id, recall, explicitSpans ?? [], ns, input.deadlineAt);
                 if (win && win.text && win.spanIds.length) {
                     text = win.text;
@@ -823,7 +823,8 @@ export function planContext(input) {
                             redundant.add(b);
                             continue;
                         }
-                        if (!isReq && spent - mandatoryCost + b.cost > optionalKneeCap) {
+                        const optionalSpent = selected.filter((x)=>x.items.every((i)=>!i.required)).reduce((n, x)=>n + x.cost, 0);
+                        if (!isReq && optionalSpent + b.cost > optionalKneeCap) {
                             kneeCapped = true;
                             continue;
                         }
@@ -843,8 +844,9 @@ export function planContext(input) {
                         utility += b.items.reduce((n, i)=>n + i.utility, 0);
                     }
                     refresh();
+                    const optionalSpentNow = selected.filter((x)=>x.items.every((i)=>!i.required)).reduce((n, x)=>n + x.cost, 0);
                     const pending = candidates.filter((b)=>!selected.includes(b) && !transportRejected.has(b) && !redundant.has(b));
-                    const fittablePending = pending.filter((b)=>b.items.some((i)=>i.required) || spent - mandatoryCost + b.cost <= optionalKneeCap);
+                    const fittablePending = pending.filter((b)=>b.items.some((i)=>i.required) || optionalSpentNow + b.cost <= optionalKneeCap);
                     const satisfied = demand.obligations.every((o)=>o.status === 'satisfied');
                     const quotedRemaining = fittablePending.some((b)=>b.items.some((i)=>i.role === 'quoted_evidence'));
                     if (input.abortSignal?.aborted) {
