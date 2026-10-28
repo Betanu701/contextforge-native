@@ -37,7 +37,7 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
         namespaceId,
         deadlineAt,
         budget,
-        maxInspected: 512,
+        maxInspected: 1024,
         maxBytes: 1024 * 1024
     });
     let required;
@@ -60,12 +60,23 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
         ]);
         const ranked = chunks.map((c, i)=>({
                 i,
-                s: scoreFacetCoverage(recall, c.text).gain + (/\b(anomal\w*|exception|reject\w*|unchanged|only|no other|must not|never)\b/i.test(c.text) ? 3 : 0)
+                s: scoreFacetCoverage(recall, c.text).gain + recall.facets.filter((f)=>f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'number') && f.surface.length >= 2 && c.text.includes(f.surface)).length * 12 + (/\b(anomal\w*|exception|reject\w*|unchanged|only|no other|must not|never)\b/i.test(c.text) ? 3 : 0)
             })).sort((a, b)=>b.s - a.s || a.i - b.i);
-        for (const { i, s } of ranked.slice(0, 3))if (s > 0) {
-            for (const j of [
-                i
-            ])if (j >= 0 && j < chunks.length) indexes.add(j);
+        const coveredWindowFacets = new Set();
+        let totalChars = chunks[0].text.length + (chunks.length > 1 ? chunks[chunks.length - 1].text.length : 0);
+        for (const { i, s } of ranked){
+            if (s <= 0) break;
+            const m = scoreFacetCoverage(recall, chunks[i].text).matchedFacetIds;
+            const addsNewFacet = m.some((f)=>!coveredWindowFacets.has(f));
+            if ((indexes.size < 48 || addsNewFacet) && totalChars < 7200) {
+                for(let j = Math.max(0, i - 2); j <= Math.min(chunks.length - 1, i + 2); j++){
+                    if (!indexes.has(j) && totalChars + chunks[j].text.length <= 7500) {
+                        indexes.add(j);
+                        totalChars += chunks[j].text.length;
+                    }
+                }
+                m.forEach((f)=>coveredWindowFacets.add(f));
+            }
         }
         chosen = chunks.filter((_, i)=>indexes.has(i));
     }
