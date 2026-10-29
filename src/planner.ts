@@ -425,9 +425,27 @@ export function planContext(input: PlanContextInput): ContextPlan {
     for(const b of candidates)if(!selected.includes(b))for(const i of b.items)if(!exclusions.some(x=>x.id===i.selectionId))exclusions.push({id:i.selectionId,layer:i.layer,reason:!exhaustive&&i.matchedFacetIds?.length&&(selected.some(b=>b.items.some(s=>s.sourceId===i.sourceId))||i.claimSignatures?.length&&i.claimSignatures.every(c=>selected.some(b=>b.items.some(s=>s.claimSignatures?.includes(c)))) )?'redundant':stop==='retrieval_deadline'?'retrieval_deadline':stop==='cancelled'?'low_marginal_gain':'physical_token_limit',estimatedTokens:i.costs.total,obligationIds:i.obligationIds});
     // Evidence first, then exact historical groups in chronological order.
     const historyOrder=new Map(history.map((m,i)=>[m,i]));
+    // Lost-in-the-Middle Recency Ordering:
+    // For multi-source `quoted_evidence` bundles, sort lowest-utility / lower-priority bundles first
+    // and highest-utility / highest-priority bundles LAST (immediately before the user's pending query).
+    // Transformer attention weights are strongest at the very beginning (system policy) and very end
+    // (immediately preceding generation), so placing the #1 highest-scoring evidence bundle last
+    // prevents Lost-in-the-Middle attention decay on 4B-26B models.
+    const evidenceRelevance=(b:Bundle)=>{
+      const it=b.items[0];
+      const idx=orderIndex.get(it.sourceId);
+      if(input.strictExplicitObligationsOnly && it.required && idx!==undefined) {
+        return Math.max(0, 1000 - idx * 10) + it.utility;
+      }
+      return it.utility;
+    };
     selected.sort((a,b)=>{
       const rank=(x:Bundle)=>x.items[0].role==='system_policy'?0:x.items[0].role==='quoted_evidence'?1:2;
-      return rank(a)-rank(b)||(rank(a)===2?(historyOrder.get(a.messages[0])??0)-(historyOrder.get(b.messages[0])??0):a.items[0].bundleId.localeCompare(b.items[0].bundleId));
+      const rA=rank(a), rB=rank(b);
+      if(rA!==rB) return rA-rB;
+      if(rA===2) return (historyOrder.get(a.messages[0])??0)-(historyOrder.get(b.messages[0])??0);
+      if(rA===1) return evidenceRelevance(a)-evidenceRelevance(b)||a.items[0].bundleId.localeCompare(b.items[0].bundleId);
+      return a.items[0].bundleId.localeCompare(b.items[0].bundleId);
     });
     const messages:AcceptedMessage[]=[], selections:SelectionItem[]=[];
     // A partial source set must carry a model-facing caveat. It is dynamic
@@ -582,13 +600,37 @@ export async function executeTrancheStream(
     // large repo files (e.g. 60KB `planner.ts` or `store.ts`) are never starved on small windows.
     if (newlyVisitedInQueue.length === 0 && queueSlice.length > 0) {
       const recall = analyzeRecallQuery(input.query);
+      const querySyms = recall.facets
+        .filter(f => f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'entity') && f.surface.length >= 3)
+        .map(f => f.surface);
+      const maxCharsPerSource = Math.max(1200, Math.min(4800, Math.floor((trancheBudget * 3.0) / Math.max(2, pendingQueue.length))));
       let windowAdded = false;
       for (const oversizedId of queueSlice) {
         const win = buildEvidenceWindow(store, oversizedId, recall, [], ns, input.deadlineAt);
         if (win && win.spanIds.length > 0) {
           visitedSources.add(oversizedId);
           admittedInPass.push(oversizedId);
-          for (const sp of win.spanIds) verifiedKeepSpans.add(sp);
+          const scored = win.spanIds.map(spanId => {
+            const sp = store.readEvidenceSpan(spanId, { namespaceId: ns });
+            const sc = scoreFacetCoverage(recall, sp.text).gain + querySyms.filter(sym => sp.text.includes(sym)).length * 8;
+            return { spanId, text: sp.text, score: sc };
+          });
+          // Retain top-scoring spans plus +/-2 neighboring spans in `win.spanIds` up to `maxCharsPerSource`
+          const keepIdx = new Set<number>([0]);
+          const byScore = scored.map((x, idx) => ({ ...x, idx })).sort((a, b) => b.score - a.score);
+          let keptChars = scored[0]?.text.length ?? 0;
+          for (const item of byScore) {
+            if (item.score <= 0 && keepIdx.size > 4) break;
+            for (let j = Math.max(0, item.idx - 2); j <= Math.min(scored.length - 1, item.idx + 2); j++) {
+              if (!keepIdx.has(j) && keptChars + scored[j].text.length <= maxCharsPerSource) {
+                keepIdx.add(j);
+                keptChars += scored[j].text.length;
+              }
+            }
+          }
+          for (const idx of [...keepIdx].sort((a, b) => a - b)) {
+            verifiedKeepSpans.add(scored[idx].spanId);
+          }
           retainedSourceIds.add(oversizedId);
           windowAdded = true;
         }
@@ -647,11 +689,13 @@ export async function executeTrancheStream(
     } else {
       // Zero-oracle autonomous pass selection:
       // 1. Score each admitted source's selected spans against the query facets + code identifiers,
-      //    retaining sources/spans with positive facet coverage or symbol definitions.
+      //    retaining only the top matching spans per source (up to ~8 spans / ~3,200 chars per source)
+      //    so multi-source `final-synthesis` never overflows tight 4K-8K token envelopes.
       const passRecall = analyzeRecallQuery(input.query);
       const querySyms = passRecall.facets
         .filter(f => f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'entity') && f.surface.length >= 3)
         .map(f => f.surface);
+      const maxCharsPerSource = Math.max(1200, Math.min(4800, Math.floor((trancheBudget * 3.2) / Math.max(2, pendingQueue.length))));
       for (const s of passPlan.receipt.selections.filter(x => x.role === 'quoted_evidence')) {
         const spanTexts: Array<{ spanId: string; text: string; score: number }> = [];
         for (const spanId of s.provenanceSpanIds) {
@@ -667,10 +711,13 @@ export async function executeTrancheStream(
         const pathMatch = querySyms.some(sym => originKey.toLowerCase().includes(sym.toLowerCase()));
         if (totalScore > 0 || pathMatch || resolvedSymbolSources.has(s.sourceId)) {
           retainedSourceIds.add(s.sourceId);
-          for (const st of spanTexts) {
-            if (st.score > 0 || pathMatch || resolvedSymbolSources.has(s.sourceId) || spanTexts.length <= 16) {
+          const rankedSpans = [...spanTexts].sort((a, b) => b.score - a.score);
+          let keptChars = 0;
+          for (const st of rankedSpans) {
+            if ((st.score > 0 || keptChars === 0) && keptChars + st.text.length <= maxCharsPerSource) {
               verifiedKeepSpans.add(st.spanId);
               passVerifiedSpans.push(st.spanId);
+              keptChars += st.text.length;
             }
           }
         }

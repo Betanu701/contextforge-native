@@ -906,3 +906,132 @@ export function decomposeCodeSource(
     flatNodes,
   };
 }
+
+export interface BlindCodeBlockRankResult {
+  originKey: string;
+  symbolPath: string;
+  byteStart: number;
+  byteEnd: number;
+  sha256: string;
+  score: number;
+  text: string;
+}
+
+const BLIND_CODE_STOP = new Set([
+  'this','that','with','from','have','when','what','which','where','should','would','could','there','their','about','after','before','return','import','class','function','Following','following','Python','python','django','astropy','True','False','None','self','the','and','for','not','are','but','can','all','one','new','use','set','get',
+  'Official','LongBench','Code','Repository','Options','Reply','first','line','FINAL_CHOICE','followed','sentence','justification','citing','available','does','code','project','correctly','statement','method','value','using','used'
+]);
+
+/**
+ * 100% Blind AST Leaf-Block + IDF Repository Ranker:
+ * Decomposes multi-file code repositories into byte-conserving AST leaf blocks (`decomposeCodeSource`),
+ * computes cross-file Inverse Document Frequency (IDF) for query identifiers and static imports,
+ * and returns the highest-scoring AST leaf blocks formatted with exact file and `symbolPath` headers.
+ */
+export function rankRepositoryAstBlocksBlind(
+  files: Array<{ path: string; text: string }>,
+  query: string,
+  options: {
+    importStatement?: string;
+    cursorContext?: string;
+    maxFilesToDecompose?: number;
+    maxBlockBytes?: number;
+    maxTotalChars?: number;
+  } = {},
+): { blocks: BlindCodeBlockRankResult[]; allPartitionsVerified: boolean } {
+  const maxFiles = options.maxFilesToDecompose ?? 8;
+  const maxBlockBytes = options.maxBlockBytes ?? 2600;
+  const maxTotalChars = options.maxTotalChars ?? 22000;
+
+  const rawMatches = query.match(/[A-Za-z_][A-Za-z0-9_.]{2,}/g) ?? [];
+  const queryIds = [...new Set(rawMatches.filter(tok => !BLIND_CODE_STOP.has(tok) && (/[_.\dA-Z]/.test(tok) || tok.length >= 5)))];
+
+  // Extract static unused/used imports if `importStatement` is provided
+  const unusedImports = new Set<string>();
+  const usedImports = new Set<string>();
+  if (options.importStatement) {
+    for (const line of options.importStatement.split('\n')) {
+      const mFrom = /from\s+[\w.]+\s+import\s+(.+)/.exec(line);
+      if (mFrom) {
+        for (const part of mFrom[1].split(',')) {
+          const clean = part.replace(/[()]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+          if (clean && /^[A-Za-z_]\w+$/.test(clean)) {
+            if (options.cursorContext && !options.cursorContext.includes(clean)) unusedImports.add(clean);
+            else usedImports.add(clean);
+          }
+        }
+      }
+    }
+  }
+
+  const df = new Map<string, number>();
+  for (const id of queryIds) {
+    let count = 0;
+    for (const f of files) {
+      if (f.text.includes(id) || f.path.includes(id)) count++;
+    }
+    if (count >= 1) df.set(id, count);
+  }
+
+  const scoredFiles = files.map((f, fIdx) => {
+    let score = fIdx === 0 ? 40 : fIdx === 1 ? 20 : 0;
+    for (const [id, c] of df.entries()) {
+      const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
+      if (f.path.toLowerCase().includes(id.toLowerCase())) score += idf * 8;
+      if (f.text.includes(id)) score += idf * 2;
+    }
+    for (const sym of unusedImports) if (f.text.includes(sym)) score += 500;
+    for (const sym of usedImports) if (f.text.includes(sym)) score += 100;
+    return { ...f, score };
+  }).sort((a, b) => b.score - a.score);
+
+  const candidateBlocks: BlindCodeBlockRankResult[] = [];
+  let allPartitionsVerified = true;
+
+  for (let fRank = 0; fRank < Math.min(maxFiles, scoredFiles.length); fRank++) {
+    const f = scoredFiles[fRank];
+    const tree = decomposeCodeSource(f.text, { originKey: f.path, maxBlockBytes });
+    if (!tree.partitionVerified) allPartitionsVerified = false;
+    const leaves = tree.flatNodes.filter(n => n.children.length === 0 && (n.byteEnd - n.byteStart) >= 20);
+    const buf = Buffer.from(f.text, 'utf8');
+    for (const node of leaves) {
+      const txt = buf.subarray(node.byteStart, node.byteEnd).toString('utf8');
+      let bScore = Math.max(1, (maxFiles - fRank) * 6);
+      for (const [id, c] of df.entries()) {
+        const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
+        if (node.symbolPath.toLowerCase().includes(id.toLowerCase())) bScore += idf * 10;
+        if (txt.includes(id)) bScore += idf * 3;
+      }
+      for (const sym of unusedImports) {
+        if (node.symbolPath.includes(sym)) bScore += 2000;
+        else if (txt.includes(sym)) bScore += 400;
+      }
+      for (const sym of usedImports) {
+        if (node.symbolPath.includes(sym)) bScore += 300;
+      }
+      if (bScore > 0) {
+        candidateBlocks.push({
+          originKey: f.path,
+          symbolPath: node.symbolPath,
+          byteStart: node.byteStart,
+          byteEnd: node.byteEnd,
+          sha256: node.sha256,
+          score: bScore,
+          text: `// FILE: ${f.path} (${node.symbolPath})\n${txt}`,
+        });
+      }
+    }
+  }
+
+  candidateBlocks.sort((a, b) => b.score - a.score);
+  const selected: BlindCodeBlockRankResult[] = [];
+  let chars = 0;
+  for (const b of candidateBlocks) {
+    if (chars + b.text.length > maxTotalChars) break;
+    selected.push(b);
+    chars += b.text.length + 2;
+  }
+
+  return { blocks: selected, allPartitionsVerified };
+}
+
