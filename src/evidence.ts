@@ -166,8 +166,11 @@ export function triangulateMultiClueGraph(
  const budget=options.budget;
  if(seedNodesByClue.size<2||Date.now()>=deadlineAt)return [];
 
- // Track `nodeId -> Map<clueId, hopDistance>`
+ // Track `nodeId -> Map<clueId, hopDistance>` AND `nodeId -> Map<clueId, Set<originSeedNodeId>>`
+ // A true triangulation requires >= 2 clues arriving from at least 2 distinct origin seed nodes
+ // (not a single seed node carrying both clue labels along a 1-path walk).
  const reached=new Map<string,Map<string,number>>();
+ const originsByTarget=new Map<string,Map<string,Set<string>>>();
  const seedSet=new Set<string>();
  let frontier=new Map<string,Set<string>>(); // nodeId -> Set<clueId>
 
@@ -176,6 +179,9 @@ export function triangulateMultiClueGraph(
    seedSet.add(nid);
    let m=reached.get(nid);if(!m){m=new Map();reached.set(nid,m);}
    m.set(clueId,0);
+   let o=originsByTarget.get(nid);if(!o){o=new Map();originsByTarget.set(nid,o);}
+   let cSet=o.get(clueId);if(!cSet){cSet=new Set();o.set(clueId,cSet);}
+   cSet.add(nid);
    let f=frontier.get(nid);if(!f){f=new Set();frontier.set(nid,f);}
    f.add(clueId);
   }
@@ -196,10 +202,15 @@ export function triangulateMultiClueGraph(
   for(const edge of rel){
    const targetId=edge.node.nodeId;
    const parentClues=frontier.get(edge.seedNodeId);
-   if(!parentClues)continue;
+   const parentOrigins=originsByTarget.get(edge.seedNodeId);
+   if(!parentClues||!parentOrigins)continue;
    let m=reached.get(targetId);
    if(!m){m=new Map();reached.set(targetId,m);}
+   let o=originsByTarget.get(targetId);
+   if(!o){o=new Map();originsByTarget.set(targetId,o);}
    for(const cId of parentClues){
+    let cSet=o.get(cId);if(!cSet){cSet=new Set();o.set(cId,cSet);}
+    for(const sId of parentOrigins.get(cId)??[])cSet.add(sId);
     if(!m.has(cId)){
      m.set(cId,hop);
      let nf=nextFrontier.get(targetId);if(!nf){nf=new Set();nextFrontier.set(targetId,nf);}
@@ -213,6 +224,23 @@ export function triangulateMultiClueGraph(
  const bridges:Array<{nodeId:string;convergedClues:string[];minHop:number;triangulationScore:number}>=[];
  for(const [nodeId,clueMap] of reached.entries()){
   if(seedSet.has(nodeId)||clueMap.size<2)continue;
+  // Verify true multi-point triangulation: exist at least two clues (c1 != c2) that originated from
+  // at least two distinct seed nodes (s1 != s2). If a single seed node already had both clues and walked
+  // a single path, that's a 1-point walk, not multi-point triangulation!
+  const originMap=originsByTarget.get(nodeId);
+  let hasDistinctOriginPair=false;
+  const clueEntries=originMap?[...originMap.entries()]:[];
+  for(let i=0;i<clueEntries.length&&!hasDistinctOriginPair;i++){
+   for(let j=i+1;j<clueEntries.length&&!hasDistinctOriginPair;j++){
+    for(const s1 of clueEntries[i][1]){
+     for(const s2 of clueEntries[j][1]){
+      if(s1!==s2){hasDistinctOriginPair=true;break;}
+     }
+     if(hasDistinctOriginPair)break;
+    }
+   }
+  }
+  if(!hasDistinctOriginPair)continue;
   let score=0,minHop=Infinity;
   for(const h of clueMap.values()){
    if(h<minHop)minHop=h;
@@ -317,17 +345,15 @@ export function discoverEvidenceCandidates(store:ContextForgeStore,query:string,
  const related=expandRelatedPremises(store,seeds.map(h=>h.nodeId!),recall,namespaceId,deadlineAt,budget);
  for(const r of related){if(Date.now()>=deadlineAt)break;for(const c of hydrateProvenanceSupport(store,r.node.nodeId,recall,namespaceId,windowCache,deadlineAt,budget)){c.reasons.push(r.relation==='contradicts'?'contradiction':'dependency');c.trace={...c.trace,relation:r.relation,direction:r.direction};merge(c);}}
  // Multi-Clue Triangulation (up to 3 hops):
- // When a query has >= 2 distinct substantive clues (`question` facets) that are NOT all
- // already covered in a single candidate source, expand up to 3 hops through the L1/L2
- // derivation graph to discover intermediate bridge nodes where >= 2 distinct clues converge!
- const questionFacets=recall.facets.filter(f=>f.origin==='question');
- const singleSourceCoversAll=questionFacets.length>0 && [...out.values()].some(c=>questionFacets.every(f=>c.matchedFacetIds.includes(f.id)));
+ // Even if one candidate document already mentions all clues, a 2nd/3rd bridge document where
+ // >= 2 distinct clue seed nodes converge can hold the hidden root cause ("looking for the least
+ // because it sheds light on the most"). Triangulate across all substantive question clues
+ // whenever >= 2 distinct origin seed nodes exist!
+ const questionFacetIds=new Set(recall.facets.filter(f=>f.origin==='question').map(f=>f.id));
  const seedNodesByClue=new Map<string,string[]>();
- if(!singleSourceCoversAll && questionFacets.length>=2){
-  for(const h of seeds){
-   const m=scoreFacetCoverage(recall,h.title+' '+h.body).matchedFacetIds;
-   for(const fId of m){const arr=seedNodesByClue.get(fId)??[];if(!arr.includes(h.nodeId!))arr.push(h.nodeId!);seedNodesByClue.set(fId,arr);}
-  }
+ for(const h of seeds){
+  const m=scoreFacetCoverage(recall,h.title+' '+h.body).matchedFacetIds.filter(id=>questionFacetIds.has(id));
+  for(const fId of m){const arr=seedNodesByClue.get(fId)??[];if(!arr.includes(h.nodeId!))arr.push(h.nodeId!);seedNodesByClue.set(fId,arr);}
  }
  if(seedNodesByClue.size>=2&&Date.now()<deadlineAt){
   const bridges=triangulateMultiClueGraph(store,seedNodesByClue,recall,{namespaceId,maxHops:3,deadlineAt,budget});
