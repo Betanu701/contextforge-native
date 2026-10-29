@@ -365,12 +365,32 @@ function partitionIntoContiguousParts(
   parent: CodeBlockNode,
   maxPartBytes: number,
 ): CodeBlockNode[] {
+  if (parent.byteEnd - parent.byteStart <= maxPartBytes) return [];
   const subLines = lines.filter(l => l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
-  if (subLines.length <= 1 || parent.byteEnd - parent.byteStart <= maxPartBytes) return [];
   const ranges: Array<[number, number]> = [];
   let start = parent.byteStart;
   let cursor = parent.byteStart;
   for (const l of subLines) {
+    if (l.byteEnd - l.byteStart > maxPartBytes) {
+      // Single giant line (e.g., 1MB minified JSON): flush accumulated lines first, then slice along UTF-8 safe character boundaries
+      if (cursor > start) {
+        ranges.push([start, cursor]);
+      }
+      let bPos = l.byteStart;
+      while (bPos < l.byteEnd) {
+        let bNext = Math.min(l.byteEnd, bPos + maxPartBytes);
+        // Step back if bNext lands in the middle of a multi-byte UTF-8 sequence (10xxxxxx)
+        while (bNext < l.byteEnd && bNext > bPos && (bytes[bNext] & 0xc0) === 0x80) {
+          bNext--;
+        }
+        if (bNext <= bPos) bNext = Math.min(l.byteEnd, bPos + maxPartBytes);
+        ranges.push([bPos, bNext]);
+        bPos = bNext;
+      }
+      start = l.byteEnd;
+      cursor = l.byteEnd;
+      continue;
+    }
     if (cursor > start && l.byteEnd - start > maxPartBytes) {
       ranges.push([start, cursor]);
       start = cursor;
@@ -527,17 +547,19 @@ function decomposeBraceAndStringLanguage(
 
   // If the entire node was a single segment (e.g. we are already inside one giant function body),
   // peel off the function's opening header line and closing brace line, and decompose the interior!
-  if (rawSegments.length === 1 && subLines.length > 4 && parent.byteEnd - parent.byteStart > maxBlockBytes) {
+  if (rawSegments.length === 1 && subLines.length > 4 && parent.byteEnd - parent.byteStart > maxBlockBytes && parent.depth < 14) {
     const firstLine = subLines[0];
     const lastLine = subLines[subLines.length - 1];
-    const headerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::header`, `${parent.symbolPath}::header`, 'statement', parent.depth + 1, firstLine.byteStart, firstLine.byteEnd, parent.nodeId);
-    const bodyDummy = makeNode(bytes, parent.grammarId, `${parent.symbolName}::body`, `${parent.symbolPath}`, 'block', parent.depth, firstLine.byteEnd, lastLine.byteStart, parent.nodeId);
-    const bodyChildren = decomposeBraceAndStringLanguage(bytes, lines, bodyDummy, spec, maxBlockBytes);
-    const footerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::footer`, `${parent.symbolPath}::footer`, 'statement', parent.depth + 1, lastLine.byteStart, lastLine.byteEnd, parent.nodeId);
-    const midNodes = bodyChildren.length
-      ? bodyChildren.map(c => ({ ...c, parentId: parent.nodeId, depth: parent.depth + 1 }))
-      : partitionIntoContiguousParts(bytes, lines, bodyDummy, maxBlockBytes).map(c => ({ ...c, parentId: parent.nodeId, depth: parent.depth + 1 }));
-    return [headerNode, ...(midNodes.length ? midNodes : [ { ...bodyDummy, depth: parent.depth + 1 } ]), footerNode];
+    if (firstLine.byteEnd < lastLine.byteStart) {
+      const headerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::header`, `${parent.symbolPath}::header`, 'statement', parent.depth + 1, firstLine.byteStart, firstLine.byteEnd, parent.nodeId);
+      const bodyDummy = makeNode(bytes, parent.grammarId, `${parent.symbolName}::body`, `${parent.symbolPath}`, 'block', parent.depth + 1, firstLine.byteEnd, lastLine.byteStart, parent.nodeId);
+      const bodyChildren = decomposeBraceAndStringLanguage(bytes, lines, bodyDummy, spec, maxBlockBytes);
+      const footerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::footer`, `${parent.symbolPath}::footer`, 'statement', parent.depth + 1, lastLine.byteStart, lastLine.byteEnd, parent.nodeId);
+      const midNodes = bodyChildren.length
+        ? bodyChildren.map(c => ({ ...c, parentId: parent.nodeId, depth: parent.depth + 1 }))
+        : partitionIntoContiguousParts(bytes, lines, bodyDummy, maxBlockBytes).map(c => ({ ...c, parentId: parent.nodeId, depth: parent.depth + 1 }));
+      return [headerNode, ...(midNodes.length ? midNodes : [ { ...bodyDummy, depth: parent.depth + 1 } ]), footerNode];
+    }
   }
 
   const children: CodeBlockNode[] = [];
@@ -1045,7 +1067,17 @@ export function rankRepositoryAstBlocksBlind(
 
   // Distinguish true code-identifier clues (`snake_case`, `CamelCase`, or identifiers with digits)
   // from plain lowercase prose words so triangulation focuses on actual technical symbols!
-  const isCodeSymbol = (id: string) => /[_0-9]/.test(id) || (/[A-Z]/.test(id) && /[a-z]/.test(id) && !/^[A-Z][a-z]+$/.test(id)) || files.some(f => f.path.toLowerCase().includes(id.toLowerCase()) || f.text.includes(`def ${id}`) || f.text.includes(`class ${id}`) || f.text.includes(`.${id}`));
+  const codeSymbolCache = new Map<string, boolean>();
+  const isCodeSymbol = (id: string): boolean => {
+    const cached = codeSymbolCache.get(id);
+    if (cached !== undefined) return cached;
+    const val =
+      /[_0-9]/.test(id) ||
+      (/[A-Z]/.test(id) && /[a-z]/.test(id) && !/^[A-Z][a-z]+$/.test(id)) ||
+      files.some(f => f.path.toLowerCase().includes(id.toLowerCase()) || f.text.includes(`def ${id}`) || f.text.includes(`class ${id}`) || f.text.includes(`.${id}`));
+    codeSymbolCache.set(id, val);
+    return val;
+  };
 
   const rareQueryClues = [...df.entries()]
     .filter(([id, c]) => c <= Math.max(2, Math.floor(files.length / 2)) && isCodeSymbol(id))
@@ -1341,10 +1373,14 @@ export function splitCorpusStreamIntoFiles(
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     const prevBlank = lines[i - 1].trim() === '';
-    const isTopLevelImport = /^(?:import\s+[A-Za-z_]|from\s+[A-Za-z_.]+\s+import\s+|#include\s+[<"])/.test(line);
+    const isTopLevelImport = /^(?:import\s+[A-Za-z_]|from\s+[A-Za-z_.]+\s+import\s+|#include\s+[<"]|package\s+[A-Za-z_]|using\s+[A-Za-z_])/.test(line);
     const isTopLevelDocHeader = /^#{1,2}\s+[A-Z0-9🔥]/.test(line) && inCodeBody && prevBlank;
+    const isChunkOverflowBoundary =
+      i - curStart >= 900 &&
+      prevBlank &&
+      /^(?:class\s+|def\s+|async\s+def\s+|export\s+|function\s+|public\s+|private\s+|protected\s+|interface\s+|struct\s+|impl\s+|fn\s+|#{1,3}\s+)/.test(line);
 
-    if ((isTopLevelImport || isTopLevelDocHeader) && inCodeBody && i - curStart >= 20) {
+    if (((isTopLevelImport || isTopLevelDocHeader) && inCodeBody && i - curStart >= 20) || isChunkOverflowBoundary || i - curStart >= 2000) {
       const chunkLines = lines.slice(curStart, i);
       const vPath = inferVirtualPath(chunkLines, files.length + 1);
       const rawChunk = chunkLines.join('\n');
