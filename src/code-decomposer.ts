@@ -919,7 +919,8 @@ export interface BlindCodeBlockRankResult {
 
 const BLIND_CODE_STOP = new Set([
   'this','that','with','from','have','when','what','which','where','should','would','could','there','their','about','after','before','return','import','class','function','Following','following','Python','python','django','astropy','True','False','None','self','the','and','for','not','are','but','can','all','one','new','use','set','get',
-  'Official','LongBench','Code','Repository','Options','Reply','first','line','FINAL_CHOICE','followed','sentence','justification','citing','available','does','code','project','correctly','statement','method','value','using','used'
+  'Official','LongBench','Code','Repository','Options','Reply','first','line','FINAL_CHOICE','followed','sentence','justification','citing','available','does','code','project','correctly','statement','method','value','using','used',
+  'Description','Current','Behaviour','Behavior','Expected','However','When','There','Here','Looking','other','methods','issue','issues','problem','problems','error','errors','message','messages','example','examples','should','could','would','result','results','instead','default','something','another','because','provide','created','called','against','several'
 ]);
 
 /**
@@ -951,6 +952,10 @@ export function rankRepositoryAstBlocksBlind(
       for (const part of tok.split('.')) {
         if (part.length >= 3) expandedTokens.push(part);
       }
+    }
+    // Split mixed alphanumeric tokens like `Http404` -> `404` so functions like `technical_404_response` match!
+    for (const numMatch of tok.matchAll(/\d{3,}/g)) {
+      expandedTokens.push(numMatch[0]);
     }
   }
   const queryIds = [...new Set(expandedTokens.filter(tok => !BLIND_CODE_STOP.has(tok) && (/[_.\dA-Z]/.test(tok) || tok.length >= 5)))];
@@ -995,12 +1000,71 @@ export function rankRepositoryAstBlocksBlind(
     if (count >= 1) df.set(id, count);
   }
 
+  // Extract multi-word phrase clues (including 2-word error-message bigrams like `more items` or `first extra item`
+  // where templates like `%s contains %d more items, first extra item: %s` split longer phrases with `%d`/`{}`)
+  const phraseClues: string[] = [];
+  for (const m of query.matchAll(/\b([a-z]{3,}\s+[a-z]{3,}(?:,?\s+[a-z]{3,}){0,2})\b/g)) {
+    const phrase = m[1].trim();
+    const words = phrase.split(/[\s,]+/);
+    if (phrase.length >= 10 && words.every(w => !BLIND_CODE_STOP.has(w))) {
+      let c = 0;
+      for (const f of files) if (f.text.includes(`"${phrase}`) || f.text.includes(` ${phrase}`) || f.text.includes(`${phrase}:`) || f.text.includes(`${phrase},`)) c++;
+      if (c === 1) phraseClues.push(phrase);
+    }
+  }
+
+  // Extract file-level imported/referenced symbols from the top lines of each file (`from X import A, B`)
+  // so cross-file symbol bridges (`Http404`, `Resolver404`, `allow_migrate`, etc.) are tracked at the file level!
+  const fileHeaderImports = new Map<string, Set<string>>();
+  for (const f of files) {
+    const headerSlice = f.text.slice(0, 2400).replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner) => inner.replace(/\s*\n\s*/g, ' '));
+    const syms = new Set<string>();
+    for (const line of headerSlice.split('\n')) {
+      const mFrom = /from\s+[\w.]+\s+import\s+(.+)/.exec(line);
+      if (mFrom) {
+        for (const p of mFrom[1].split(',')) {
+          const clean = p.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+          if (clean && /^[A-Za-z_]\w{2,}$/.test(clean)) syms.add(clean);
+        }
+      }
+    }
+    fileHeaderImports.set(f.path, syms);
+  }
+
+  // Distinguish true code-identifier clues (`snake_case`, `CamelCase`, or identifiers with digits)
+  // from plain lowercase prose words so triangulation focuses on actual technical symbols!
+  const isCodeSymbol = (id: string) => /[_0-9]/.test(id) || (/[A-Z]/.test(id) && /[a-z]/.test(id) && !/^[A-Z][a-z]+$/.test(id)) || files.some(f => f.path.toLowerCase().includes(id.toLowerCase()) || f.text.includes(`def ${id}`) || f.text.includes(`class ${id}`) || f.text.includes(`.${id}`));
+
+  const rareQueryClues = [...df.entries()]
+    .filter(([id, c]) => c <= Math.max(2, Math.floor(files.length / 2)) && isCodeSymbol(id))
+    .map(([id]) => id);
+
+  const fileRareClues = new Map<string, string[]>();
+  let maxFileRareCount = 0;
+  for (const f of files) {
+    const matched = rareQueryClues.filter(id => f.text.includes(id) || f.path.toLowerCase().includes(id.toLowerCase()));
+    fileRareClues.set(f.path, matched);
+    if (matched.length > maxFileRareCount) maxFileRareCount = matched.length;
+  }
+
   const scoredFiles = files.map((f, fIdx) => {
     let score = fIdx === 0 ? 40 : fIdx === 1 ? 20 : 0;
     for (const [id, c] of df.entries()) {
       const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
-      if (f.path.toLowerCase().includes(id.toLowerCase())) score += idf * 8;
-      if (f.text.includes(id)) score += idf * 2;
+      const symMult = isCodeSymbol(id) ? 2 : 1;
+      if (f.path.toLowerCase().includes(id.toLowerCase())) score += idf * 8 * symMult;
+      if (f.text.includes(id)) score += idf * 2 * symMult;
+    }
+    for (const ph of phraseClues) {
+      if (f.text.includes(ph)) score += 600;
+    }
+    const fRare = fileRareClues.get(f.path) ?? [];
+    // File-Level Multi-Clue Triangulation Boost:
+    // When a file bridges >= 2 rare code clues (especially when it bridges the maximum number of rare clues in the repo),
+    // boost its file rank so caller/orchestrator files (`executor.py`, `debug.py`, `decorators.py`) aren't buried!
+    if (fRare.length >= 2) {
+      score += fRare.length * fRare.length * 55;
+      if (fRare.length === maxFileRareCount) score += 300;
     }
     for (const sym of unusedImports) if (f.text.includes(sym)) score += 500;
     for (const sym of usedImports) if (f.text.includes(sym)) score += 100;
@@ -1012,6 +1076,14 @@ export function rankRepositoryAstBlocksBlind(
 
   for (let fRank = 0; fRank < Math.min(maxFiles, scoredFiles.length); fRank++) {
     const f = scoredFiles[fRank];
+    const fRare = fileRareClues.get(f.path) ?? [];
+    const fMissingRare = rareQueryClues.filter(c => !fRare.includes(c)).slice(0, 4);
+    const fImports = [...(fileHeaderImports.get(f.path) ?? [])];
+    const relevantImports = fImports.filter(s => queryIds.includes(s) || /[A-Z]/.test(s)).slice(0, 8);
+    const fileTriangulationNote = fRare.length >= 2
+      ? `[FILE TRIANGULATION: ${f.path} bridges ${fRare.length} code clues (${fRare.slice(0, 6).join(', ')})${fMissingRare.length === 0 ? ' — FULL CLUE INTERSECTION' : ''}${relevantImports.length ? `; imports: ${relevantImports.join(', ')}` : ''}]`
+      : `[FILE SCOPE: ${f.path} matches (${fRare.slice(0, 4).join(', ') || 'general'})${fMissingRare.length ? `; does NOT reference (${fMissingRare.join(', ')})` : ''}]`;
+
     const tree = decomposeCodeSource(f.text, { originKey: f.path, maxBlockBytes });
     if (!tree.partitionVerified) allPartitionsVerified = false;
     const leaves = tree.flatNodes.filter(n => n.children.length === 0 && (n.byteEnd - n.byteStart) >= 20);
@@ -1023,14 +1095,32 @@ export function rankRepositoryAstBlocksBlind(
       const leafName = node.symbolName.replace(/#part-\d+$|::header$|::footer$/, '');
       for (const [id, c] of df.entries()) {
         const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
+        const symMult = isCodeSymbol(id) ? 2 : 1;
         if (node.symbolPath.toLowerCase().includes(id.toLowerCase())) {
-          bScore += idf * 10;
-          matchedClues.add(id);
+          bScore += idf * 10 * symMult;
+          if (isCodeSymbol(id)) matchedClues.add(id);
         }
         if (txt.includes(id)) {
-          bScore += idf * 3;
-          matchedClues.add(id);
+          bScore += idf * 3 * symMult;
+          if (isCodeSymbol(id)) matchedClues.add(id);
         }
+      }
+      for (const ph of phraseClues) {
+        if (txt.includes(ph)) {
+          bScore += 1800;
+          matchedClues.add(ph);
+        }
+      }
+      // Credit imported symbols from the file header that appear inside this method AND relate to the file's triangulated clues
+      for (const impSym of relevantImports) {
+        if (txt.includes(impSym)) {
+          bScore += 60;
+          matchedClues.add(impSym);
+        }
+      }
+      // File-level triangulation inheritance for methods that actively participate in the file's rare clues
+      if (fRare.length >= 2 && matchedClues.size >= 1) {
+        bScore += fRare.length * 45;
       }
       for (const sym of unusedImports) {
         const symLower = sym.toLowerCase();
@@ -1060,7 +1150,7 @@ export function rankRepositoryAstBlocksBlind(
           byteEnd: node.byteEnd,
           sha256: node.sha256,
           score: bScore,
-          text: `// FILE: ${f.path} (${node.symbolPath})\n${txt}`,
+          text: `// FILE: ${f.path} (${node.symbolPath}) ${fileTriangulationNote}\n${txt}`,
         });
       }
     }
@@ -1093,6 +1183,28 @@ export function rankRepositoryAstBlocksBlind(
     if (callEdges > 0 && callHopClues.size >= 2) {
       // Super-linear multi-clue call-graph triangulation boost!
       b.score += callEdges * 90 * callHopClues.size;
+    }
+  }
+
+  // Bidirectional Call-Hop Expansion (Outgoing Callees across DIFFERENT files):
+  // If a top-3 seed block calls a function/helper `callee(` defined in ANOTHER file in the repo
+  // (e.g. `requests/models.py::iter_content` calling `stream_decode_response_unicode(` in `requests/utils.py`),
+  // boost that cross-file callee definition block so the 1-hop implementation is always pulled alongside the caller!
+  const top3Blocks = [...candidateBlocks].sort((a, b) => b.score - a.score).slice(0, 3);
+  const outgoingCalls = new Map<string, string>(); // calleeName -> callerFile
+  for (const tb of top3Blocks) {
+    for (const m of tb.text.matchAll(/\b([a-z_][a-z0-9_]{5,})\s*\(/g)) {
+      const fn = m[1];
+      if (!BLIND_CODE_STOP.has(fn) && !outgoingCalls.has(fn)) outgoingCalls.set(fn, tb.originKey);
+    }
+  }
+  if (outgoingCalls.size > 0) {
+    for (const b of candidateBlocks) {
+      const callerFile = outgoingCalls.get(b.leafName);
+      if (callerFile && callerFile !== b.originKey) {
+        b.score += 1400;
+        b.text = b.text.replace('\n', ` [CROSS-FILE CALLEE OF ${callerFile}: ${b.leafName}()]\n`);
+      }
     }
   }
 
