@@ -1,5 +1,5 @@
 import { sha256, stableId } from './store.ts';
-import { isCommonEnglishProseToken, splitIdentifierSubTokens, hasTechnicalIdentifierFormatting } from './lexicon-priors.ts';
+import { splitIdentifierSubTokens, hasTechnicalIdentifierFormatting } from './lexicon-priors.ts';
 
 export interface LanguageGrammarSpec {
   id: string;
@@ -41,6 +41,17 @@ export interface CodeBlockNode {
   byteEnd: number;
   sha256: string;
   parentId: string | null;
+  /** Inclusive, 1-based source lines; byte ranges are half-open. */
+  startLine?: number;
+  endLine?: number;
+  headerByteStart?: number;
+  headerByteEnd?: number;
+  subTokens?: string[];
+  /** Structural identity survives bounded leaf partitioning. */
+  partOfId?: string;
+  previousPartId?: string;
+  nextPartId?: string;
+  partIds?: string[];
   partIndex?: number;
   totalParts?: number;
   children: CodeBlockNode[];
@@ -271,6 +282,11 @@ registerLanguageGrammar({
   },
 });
 
+registerLanguageGrammar({
+  id: 'markdown', extensions: ['.md', '.markdown', '.rst', '.txt'],
+  comments: {}, strings: { quotes: [] }, blocks: {},
+});
+
 interface LineSpan {
   index: number;
   text: string;
@@ -357,7 +373,8 @@ function makeNode(
 
 /**
  * Partition an oversized leaf or block `[byteStart, byteEnd)` into contiguous line-aligned parts
- * `<= maxPartBytes` that sum byte-for-byte to the parent span.
+ * that sum byte-for-byte to the parent span. Parts fit maxPartBytes except
+ * when one UTF-8 scalar itself exceeds that budget (at most four bytes).
  */
 function partitionIntoContiguousParts(
   bytes: Buffer,
@@ -366,53 +383,42 @@ function partitionIntoContiguousParts(
   maxPartBytes: number,
 ): CodeBlockNode[] {
   if (parent.byteEnd - parent.byteStart <= maxPartBytes) return [];
-  const subLines = lines.filter(l => l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
+  // Prefer existing line ends, but allow a single Unicode scalar to exceed a
+  // smaller budget. A byte budget must never manufacture invalid UTF-8.
+  const lineEnds = lines.filter(l => l.byteEnd > parent.byteStart && l.byteEnd <= parent.byteEnd).map(l => l.byteEnd);
   const ranges: Array<[number, number]> = [];
   let start = parent.byteStart;
-  let cursor = parent.byteStart;
-  for (const l of subLines) {
-    if (l.byteEnd - l.byteStart > maxPartBytes) {
-      // Single giant line (e.g., 1MB minified JSON): flush accumulated lines first, then slice along UTF-8 safe character boundaries
-      if (cursor > start) {
-        ranges.push([start, cursor]);
+  let lineIndex = 0;
+  while (start < parent.byteEnd) {
+    const limit = Math.min(parent.byteEnd, start + maxPartBytes);
+    while (lineIndex < lineEnds.length && lineEnds[lineIndex] <= start) lineIndex++;
+    let next = limit;
+    if (lineIndex < lineEnds.length && lineEnds[lineIndex] <= limit) {
+      while (lineIndex + 1 < lineEnds.length && lineEnds[lineIndex + 1] <= limit) lineIndex++;
+      next = lineEnds[lineIndex];
+    } else {
+      while (next > start && next < parent.byteEnd && (bytes[next] & 0xc0) === 0x80) next--;
+      if (next === start) {
+        next++;
+        while (next < parent.byteEnd && (bytes[next] & 0xc0) === 0x80) next++;
       }
-      let bPos = l.byteStart;
-      while (bPos < l.byteEnd) {
-        let bNext = Math.min(l.byteEnd, bPos + maxPartBytes);
-        // Step back if bNext lands in the middle of a multi-byte UTF-8 sequence (10xxxxxx)
-        while (bNext < l.byteEnd && bNext > bPos && (bytes[bNext] & 0xc0) === 0x80) {
-          bNext--;
-        }
-        if (bNext <= bPos) bNext = Math.min(l.byteEnd, bPos + maxPartBytes);
-        ranges.push([bPos, bNext]);
-        bPos = bNext;
-      }
-      start = l.byteEnd;
-      cursor = l.byteEnd;
-      continue;
     }
-    if (cursor > start && l.byteEnd - start > maxPartBytes) {
-      ranges.push([start, cursor]);
-      start = cursor;
-    }
-    cursor = l.byteEnd;
+    ranges.push([start, next]);
+    start = next;
   }
-  if (start < parent.byteEnd) ranges.push([start, parent.byteEnd]);
   if (ranges.length <= 1) return [];
-  return ranges.map(([s, e], idx) =>
-    makeNode(
-      bytes,
-      parent.grammarId,
-      `${parent.symbolName}#part-${idx + 1}`,
-      `${parent.symbolPath}#part-${idx + 1}`,
-      'part',
-      parent.depth + 1,
-      s,
-      e,
-      parent.nodeId,
-      { partIndex: idx + 1, totalParts: ranges.length },
-    ),
-  );
+  const parts = ranges.map(([s, e], idx) => makeNode(
+    bytes, parent.grammarId, `${parent.symbolName}#part-${idx + 1}`,
+    `${parent.symbolPath}#part-${idx + 1}`, 'part', parent.depth + 1,
+    s, e, parent.nodeId, { partIndex: idx + 1, totalParts: ranges.length },
+  ));
+  parent.partIds = parts.map(p => p.nodeId);
+  parts.forEach((part, idx) => {
+    part.partOfId = parent.nodeId;
+    part.previousPartId = parts[idx - 1]?.nodeId;
+    part.nextPartId = parts[idx + 1]?.nodeId;
+  });
+  return parts;
 }
 
 /**
@@ -426,98 +432,114 @@ function decomposeBraceAndStringLanguage(
   spec: LanguageGrammarSpec,
   maxBlockBytes: number,
 ): CodeBlockNode[] {
-  const subLines = lines.filter(l => l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
-  if (subLines.length <= 1 || parent.depth >= 12) return [];
+  if (parent.depth >= 12) return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
 
-  // Identify top-level balanced `{ ... }` blocks or multiline backtick template blocks across lines.
-  const intervals: Array<{ startLine: number; endLine: number; kind: CodeBlockNode['kind']; embeddedGrammar?: string }> = [];
+  // Byte-accurate scanner, including multiple definitions on one line. The
+  // masked view has identical UTF-16 positions to the source.
+  const source = bytes.subarray(parent.byteStart, parent.byteEnd).toString('utf8');
+  const masked = maskCode(source);
+  const atByte = (offset: number) => parent.byteStart + Buffer.byteLength(source.slice(0, offset));
+  const intervals: Array<{ byteStart: number; byteEnd: number; headerEnd: number; kind: CodeBlockNode['kind']; embeddedGrammar?: string }> = [];
   let depth = 0;
-  let inBacktick = false;
-  let inBlockComment = false;
-  let blockStartLine = 0;
-  let embeddedLang: string | undefined;
-
-  for (let li = 0; li < subLines.length; li++) {
-    const line = subLines[li].text;
-    if (isLineComment(line, spec) && !inBacktick && !inBlockComment) continue;
-
-    for (let ci = 0; ci < line.length; ci++) {
-      const ch = line[ci];
-      const next = line[ci + 1] ?? '';
-
-      if (inBlockComment) {
-        if (ch === '*' && next === '/') {
-          inBlockComment = false;
-          ci++;
-        }
-        continue;
+  let opening = 0;
+  let start = 0;
+  let boundary = 0;
+  let parentheses = 0;
+  let squareBrackets = 0;
+  for (let i = 0; i < masked.length; i++) {
+    if (depth === 0 && masked[i] === '(') parentheses++;
+    if (depth === 0 && masked[i] === ')') parentheses--;
+    if (depth === 0 && masked[i] === '[') squareBrackets++;
+    if (depth === 0 && masked[i] === ']') squareBrackets--;
+    if (depth === 0 && (parentheses > 0 || squareBrackets > 0)) continue;
+    if (depth === 0 && (masked[i] === ';' || masked[i] === '}')) boundary = i + 1;
+    if (masked[i] === '{') {
+      if (depth === 0) {
+        opening = i;
+        // Signature starts after the previous statement, skipping standalone
+        // comments/imports while retaining multiline parameter lists.
+        start = boundary;
+        const prefix = source.slice(start, i);
+        const declaration = /(?:^|\n)([ \t]*(?:(?:export|default|async|public|private|protected|static|abstract)\s+)*(?:function\b|class\b|interface\b|enum\b|namespace\b|(?:const|let|var)\b|[A-Za-z_$][\w$]*\s*\())/g;
+        let match: RegExpExecArray | null;
+        while ((match = declaration.exec(prefix))) start = boundary + match.index + (match[0].startsWith('\n') ? 1 : 0);
+        while (start < i && /\s/.test(source[start])) start++;
+        const lineStart = source.lastIndexOf('\n', start - 1) + 1;
+        if (lineStart >= boundary && /^[ \t]*$/.test(source.slice(lineStart, start))) start = lineStart;
       }
-      if (!inBacktick && ch === '/' && next === '*') {
-        inBlockComment = true;
-        ci++;
-        continue;
-      }
-      if (!inBacktick && ch === '/' && next === '/') break;
-
-      if (!inBacktick && (ch === '"' || ch === "'")) {
-        const quote = ch;
-        ci++;
-        while (ci < line.length) {
-          if (line[ci] === '\\') {
-            ci += 2;
-            continue;
-          }
-          if (line[ci] === quote) break;
-          ci++;
-        }
-        continue;
-      }
-
-      if (ch === '`') {
-        if (!inBacktick) {
-          inBacktick = true;
-          if (depth === 0) blockStartLine = li;
-        } else {
-          inBacktick = false;
-          if (depth === 0 && li > blockStartLine) {
-            const sliceText = subLines.slice(blockStartLine, li + 1).map(x => x.text).join('');
-            const det = spec.strings.embeddedDetectors?.find(d => d.pattern.test(sliceText));
-            intervals.push({ startLine: blockStartLine, endLine: li, kind: 'embedded_string', embeddedGrammar: det?.targetGrammar });
-            blockStartLine = li + 1;
-          }
-        }
-        continue;
-      }
-
-      if (!inBacktick) {
-        if (ch === '{') {
-          if (depth === 0) blockStartLine = li;
-          depth++;
-        } else if (ch === '}') {
-          depth = Math.max(0, depth - 1);
-          if (depth === 0 && li >= blockStartLine) {
-            intervals.push({ startLine: blockStartLine, endLine: li, kind: 'block' });
-            blockStartLine = li + 1;
-            embeddedLang = undefined;
-          }
-        }
+      depth++;
+    } else if (masked[i] === '}' && depth > 0) {
+      depth--;
+      if (depth === 0) {
+        let end = i + 1;
+        if (source[end] === ';') end++;
+        const tail = /^[ \t]*(?:\r?\n|$)/.exec(source.slice(end));
+        if (tail) end += tail[0].length;
+        intervals.push({ byteStart: atByte(start), byteEnd: atByte(end), headerEnd: atByte(opening + 1), kind: 'block' });
+        boundary = end;
       }
     }
   }
+  // Expression-bodied arrow definitions have no braces, but are still
+  // structural units. Stop at an un-nested semicolon/newline, not a byte crop.
+  for (const match of masked.matchAll(/(?:^|[;\n])[ \t]*(?:(?:export|default)\s+)*(?:const|let|var)\s+([A-Za-z_$][\w$]*)[^;\n]*?=>/g)) {
+    let begin = match.index!;
+    if (masked[begin] === ';' || masked[begin] === '\n') begin++;
+    const headerEnd = match.index! + match[0].length;
+    if (intervals.some(iv => atByte(begin) >= iv.byteStart && atByte(begin) < iv.byteEnd)) continue;
+    let end = headerEnd;
+    let nesting = 0;
+    for (; end < masked.length; end++) {
+      const ch = masked[end];
+      if ('([{'.includes(ch)) nesting++;
+      if (')]}'.includes(ch)) nesting--;
+      if (nesting === 0 && (ch === ';' || ch === '\n')) { end++; break; }
+    }
+    const byteStart = atByte(begin), byteEnd = atByte(end);
+    // Arrow matching also sees declarations inside existing blocks. A line's
+    // indentation can precede that block's start, so checking only `begin`
+    // misses overlaps and manufactures a second, crossing interval.
+    if (intervals.some(iv => byteStart < iv.byteEnd && byteEnd > iv.byteStart)) continue;
+    intervals.push({ byteStart, byteEnd, headerEnd: atByte(headerEnd), kind: 'block' });
+  }
+  // Keep embedded template languages visible without reinterpreting their
+  // contents as host-language braces.
+  for (const match of source.matchAll(/`(?:\\[\s\S]|[^`\\])*`/g)) {
+    const begin = atByte(match.index!);
+    const end = atByte(match.index! + match[0].length);
+    if (intervals.some(iv => begin >= iv.byteStart && end <= iv.byteEnd)) continue;
+    const det = spec.strings.embeddedDetectors?.find(d => d.pattern.test(match[0]));
+    if (!det && !match[0].includes('\n')) continue;
+    const lineStart = source.lastIndexOf('\n', match.index! - 1) + 1;
+    let charEnd = match.index! + match[0].length;
+    const tail = /^[; \t]*(?:\r?\n|$)/.exec(source.slice(charEnd));
+    if (tail) charEnd += tail[0].length;
+    // A template can share a line with an earlier definition. Do not extend
+    // its header backwards over that definition (or a previous template).
+    const priorEnd = intervals.reduce((end, iv) => iv.byteEnd <= begin ? Math.max(end, iv.byteEnd) : end, parent.byteStart);
+    const byteStart = Math.max(atByte(lineStart), priorEnd);
+    const byteEnd = atByte(charEnd);
+    if (intervals.some(iv => byteStart < iv.byteEnd && byteEnd > iv.byteStart)) continue;
+    intervals.push({ byteStart, byteEnd, headerEnd: begin + 1, kind: 'embedded_string', embeddedGrammar: det?.targetGrammar });
+  }
+  intervals.sort((a, b) => a.byteStart - b.byteStart);
 
   if (intervals.length === 0) {
     return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
   }
 
   // Convert line intervals into a complete, gap-free byte partition of [parent.byteStart, parent.byteEnd)
-  const rawSegments: Array<{ byteStart: number; byteEnd: number; kind: CodeBlockNode['kind']; headerText: string; embeddedGrammar?: string }> = [];
+  const rawSegments: Array<{ byteStart: number; byteEnd: number; kind: CodeBlockNode['kind']; headerText: string; headerEnd?: number; embeddedGrammar?: string }> = [];
   let cursorByte = parent.byteStart;
 
   for (const iv of intervals) {
-    // Include one preceding signature/declaration line if unincorporated
-    const sigLineIdx = iv.startLine > 0 && subLines[iv.startLine - 1].byteStart >= cursorByte ? iv.startLine - 1 : iv.startLine;
-    const segStart = Math.max(cursorByte, subLines[sigLineIdx].byteStart);
-    const segEnd = subLines[iv.endLine].byteEnd;
+    // Never clip structural intervals: their opening/header offsets belong
+    // to the original span. Clipping can leave a header before its own node
+    // and make recursive body decomposition escape the parent's bounds.
+    if (iv.byteStart < cursorByte || iv.byteStart < parent.byteStart || iv.byteEnd > parent.byteEnd ||
+        iv.headerEnd < iv.byteStart || iv.headerEnd > iv.byteEnd) continue;
+    const segStart = iv.byteStart;
+    const segEnd = iv.byteEnd;
     if (segEnd <= segStart) continue;
     if (segStart > cursorByte) {
       rawSegments.push({
@@ -531,6 +553,7 @@ function decomposeBraceAndStringLanguage(
       byteStart: segStart,
       byteEnd: segEnd,
       kind: iv.kind,
+      headerEnd: iv.headerEnd,
       headerText: bytes.subarray(segStart, Math.min(segEnd, segStart + 320)).toString('utf8'),
       embeddedGrammar: iv.embeddedGrammar,
     });
@@ -543,23 +566,6 @@ function decomposeBraceAndStringLanguage(
       kind: 'statement',
       headerText: bytes.subarray(cursorByte, Math.min(parent.byteEnd, cursorByte + 256)).toString('utf8'),
     });
-  }
-
-  // If the entire node was a single segment (e.g. we are already inside one giant function body),
-  // peel off the function's opening header line and closing brace line, and decompose the interior!
-  if (rawSegments.length === 1 && subLines.length > 4 && parent.byteEnd - parent.byteStart > maxBlockBytes && parent.depth < 14) {
-    const firstLine = subLines[0];
-    const lastLine = subLines[subLines.length - 1];
-    if (firstLine.byteEnd < lastLine.byteStart) {
-      const headerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::header`, `${parent.symbolPath}::header`, 'statement', parent.depth + 1, firstLine.byteStart, firstLine.byteEnd, parent.nodeId);
-      const bodyDummy = makeNode(bytes, parent.grammarId, `${parent.symbolName}::body`, `${parent.symbolPath}`, 'block', parent.depth + 1, firstLine.byteEnd, lastLine.byteStart, parent.nodeId);
-      const bodyChildren = decomposeBraceAndStringLanguage(bytes, lines, bodyDummy, spec, maxBlockBytes);
-      const footerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::footer`, `${parent.symbolPath}::footer`, 'statement', parent.depth + 1, lastLine.byteStart, lastLine.byteEnd, parent.nodeId);
-      const midNodes = bodyChildren.length
-        ? bodyChildren.map(c => ({ ...c, parentId: parent.nodeId, depth: parent.depth + 1 }))
-        : partitionIntoContiguousParts(bytes, lines, bodyDummy, maxBlockBytes).map(c => ({ ...c, parentId: parent.nodeId, depth: parent.depth + 1 }));
-      return [headerNode, ...(midNodes.length ? midNodes : [ { ...bodyDummy, depth: parent.depth + 1 } ]), footerNode];
-    }
   }
 
   const children: CodeBlockNode[] = [];
@@ -575,12 +581,26 @@ function decomposeBraceAndStringLanguage(
     const childGrammar = seg.embeddedGrammar ?? parent.grammarId;
     const node = makeNode(bytes, childGrammar, sym, symPath, seg.kind, parent.depth + 1, seg.byteStart, seg.byteEnd, parent.nodeId);
 
-    if (seg.embeddedGrammar && REGISTRY.has(seg.embeddedGrammar) && (node.byteStart > parent.byteStart || node.byteEnd < parent.byteEnd || node.grammarId !== parent.grammarId)) {
+    if (seg.headerEnd !== undefined) {
+      node.headerByteStart = seg.byteStart;
+      node.headerByteEnd = seg.headerEnd;
+    }
+    if (seg.embeddedGrammar && REGISTRY.has(seg.embeddedGrammar)) {
       node.children = decomposeByGrammar(bytes, lines, node, REGISTRY.get(seg.embeddedGrammar)!, maxBlockBytes);
-    } else if ((node.byteEnd - node.byteStart > maxBlockBytes || (node.kind === 'block' && subLines.length > 4)) && (node.byteStart > parent.byteStart || node.byteEnd < parent.byteEnd)) {
-      node.children = decomposeBraceAndStringLanguage(bytes, lines, node, spec, maxBlockBytes);
-      if (node.children.length === 0 && node.byteEnd - node.byteStart > maxBlockBytes) {
-        node.children = partitionIntoContiguousParts(bytes, lines, node, maxBlockBytes);
+    } else if (seg.kind === 'block' && seg.headerEnd !== undefined && bytes[seg.headerEnd - 1] === 0x7b) {
+      // Preserve whole units, but expose contained methods/functions as children.
+      // Scan a byte-bounded body, not the same enclosing braces recursively.
+      const closing = bytes.lastIndexOf(0x7d, seg.byteEnd - 1);
+      if (closing > seg.headerEnd) {
+        const body = makeNode(bytes, spec.id, `${sym}::body`, symPath, 'block', node.depth, seg.headerEnd, closing, node.nodeId);
+        const nested = decomposeBraceAndStringLanguage(bytes, lines, body, spec, maxBlockBytes);
+        if (nested.length && (nested.some(n => n.kind === 'block' || n.kind === 'embedded_string') || node.byteEnd - node.byteStart > maxBlockBytes)) {
+          node.children = [
+            makeNode(bytes, spec.id, `${sym}::header`, `${symPath}::header`, 'statement', node.depth + 1, seg.byteStart, seg.headerEnd, node.nodeId),
+            ...nested.map(n => ({ ...n, parentId: node.nodeId })),
+            makeNode(bytes, spec.id, `${sym}::footer`, `${symPath}::footer`, 'statement', node.depth + 1, closing, seg.byteEnd, node.nodeId),
+          ];
+        }
       }
     }
     children.push(node);
@@ -600,7 +620,7 @@ function decomposeByGrammar(
   maxBlockBytes: number,
 ): CodeBlockNode[] {
   const subLines = lines.filter(l => l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
-  if (subLines.length <= 1) return [];
+  if (subLines.length === 0) return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
 
   // 1. Section Hierarchy (e.g. COBOL Divisions / Sections / Paragraphs)
   if (spec.blocks.sectionHierarchy?.length) {
@@ -769,98 +789,10 @@ function decomposeByGrammar(
     }
   }
 
-  // 4.5. Indentation-Scoped Languages (Python `class` / `def` / `async def`)
+  // 4.5. Indentation-scoped definitions. Never strip source line numbers:
+  // callers supply original bytes, not a synthetic rendering of the source.
   if (spec.blocks.indentationScoped) {
-    const stripLineNum = (line: string): string => line.replace(/^\s*\d+:?\s?(?=[A-Za-z_#@"' \t]|$)/, '');
-    const isCommentOrHeader = (line: string): boolean => {
-      const s = stripLineNum(line).trimStart();
-      return !s || s.startsWith('//') || isLineComment(s, spec);
-    };
-    const getIndent = (line: string): number => {
-      const stripped = stripLineNum(line);
-      const m = /^([ \t]*)\S/.exec(stripped);
-      if (!m) return -1;
-      return m[1].replace(/\t/g, '    ').length;
-    };
-    const isPyBlockHeader = (line: string): boolean => {
-      const stripped = stripLineNum(line);
-      return /^[ \t]*(?:async\s+def|def|class)\s+[A-Za-z_][\w]*\b/.test(stripped);
-    };
-    const headerCandidates: Array<{ idx: number; indent: number }> = [];
-    for (let i = 0; i < subLines.length; i++) {
-      if (isCommentOrHeader(subLines[i].text)) continue;
-      if (isPyBlockHeader(subLines[i].text)) {
-        headerCandidates.push({ idx: i, indent: getIndent(subLines[i].text) });
-      }
-    }
-    const baseIndent = headerCandidates.reduce((min, h) => (h.indent >= 0 && h.indent < min ? h.indent : min), Infinity);
-
-    if (Number.isFinite(baseIndent)) {
-      const headerIdxs = headerCandidates.filter(h => h.indent === baseIndent).map(h => h.idx);
-      if (headerIdxs.length >= 2 || (headerIdxs.length === 1 && headerIdxs[0] > 0)) {
-        const nodes: CodeBlockNode[] = [];
-        let cursor = parent.byteStart;
-        for (let h = 0; h < headerIdxs.length; h++) {
-          const startIdx = headerIdxs[h];
-          // Include immediately preceding `@decorator` lines at the same indentation
-          let decIdx = startIdx;
-          while (decIdx > (h > 0 ? headerIdxs[h - 1] + 1 : 0)) {
-            const prev = stripLineNum(subLines[decIdx - 1].text).trim();
-            if (prev.startsWith('@')) decIdx--;
-            else break;
-          }
-          const nextHeaderIdx = h + 1 < headerIdxs.length ? headerIdxs[h + 1] : subLines.length;
-          // Also exclude `@decorator` lines belonging to `nextHeaderIdx`
-          let limitIdx = nextHeaderIdx;
-          if (h + 1 < headerIdxs.length) {
-            while (limitIdx > startIdx + 1 && stripLineNum(subLines[limitIdx - 1].text).trim().startsWith('@')) {
-              limitIdx--;
-            }
-          }
-          let endIdx = limitIdx - 1;
-          for (let j = startIdx + 1; j < limitIdx; j++) {
-            if (isCommentOrHeader(subLines[j].text)) continue;
-            const ind = getIndent(subLines[j].text);
-            const trimmed = stripLineNum(subLines[j].text).trim();
-            if (ind >= 0 && ind < baseIndent && !/^[)\]}'"]/.test(trimmed)) {
-              endIdx = j - 1;
-              break;
-            }
-          }
-          const s = subLines[decIdx].byteStart;
-          const e = subLines[endIdx].byteEnd;
-          if (s > cursor) {
-            nodes.push(makeNode(bytes, spec.id, `module-preamble-${nodes.length + 1}`, `${parent.symbolPath}::module-preamble-${nodes.length + 1}`, 'statement', parent.depth + 1, cursor, s, parent.nodeId));
-          }
-          const sym = inferSymbolName(stripLineNum(subLines[startIdx].text), `block-${nodes.length + 1}`);
-          const n = makeNode(bytes, spec.id, sym, `${parent.symbolPath}::${sym}`, 'block', parent.depth + 1, s, e, parent.nodeId);
-          const isClassHeader = /^[ \t]*class\s+/.test(stripLineNum(subLines[startIdx].text));
-          // Keep classes/functions intact when they fit within maxBlockBytes (or keep small classes <= maxBlockBytes intact so __init__ + forward stay together)
-          if (endIdx - startIdx >= 3 && (n.byteStart > parent.byteStart || n.byteEnd < parent.byteEnd) && (n.byteEnd - n.byteStart > maxBlockBytes || (isClassHeader && n.byteEnd - n.byteStart > 2200))) {
-            // Peel the outer class/def header line to decompose nested methods!
-            const firstLine = subLines[startIdx];
-            const headerEnd = firstLine.byteEnd;
-            if (headerEnd < e) {
-              const headerNode = makeNode(bytes, spec.id, `${sym}::header`, `${n.symbolPath}::header`, 'statement', n.depth + 1, s, headerEnd, n.nodeId);
-              const bodyDummy = makeNode(bytes, spec.id, `${sym}::body`, n.symbolPath, 'block', n.depth, headerEnd, e, n.nodeId);
-              const bodyChildren = decomposeByGrammar(bytes, lines, bodyDummy, spec, maxBlockBytes).map(c => ({ ...c, parentId: n.nodeId, depth: n.depth + 1 }));
-              if (bodyChildren.length > 0) {
-                n.children = [headerNode, ...bodyChildren];
-              }
-            }
-          }
-          if (n.children.length === 0 && n.byteEnd - n.byteStart > maxBlockBytes) {
-            n.children = partitionIntoContiguousParts(bytes, lines, n, maxBlockBytes);
-          }
-          nodes.push(n);
-          cursor = e;
-        }
-        if (cursor < parent.byteEnd) {
-          nodes.push(makeNode(bytes, spec.id, 'module-epilogue', `${parent.symbolPath}::module-epilogue`, 'statement', parent.depth + 1, cursor, parent.byteEnd, parent.nodeId));
-        }
-        return nodes;
-      }
-    }
+    return decomposePythonDefinitions(bytes, lines, parent, spec, maxBlockBytes);
   }
 
   // 5. Brace-delimited default
@@ -869,6 +801,82 @@ function decomposeByGrammar(
   }
 
   return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
+}
+
+/** Mask comments/strings without changing UTF-16 offsets or newlines. */
+function maskCode(text: string, python = false): string {
+  return text.replace(python
+    ? /("""[\s\S]*?(?:"""|$)|\x27\x27\x27[\s\S]*?(?:\x27\x27\x27|$)|"(?:\\[\s\S]|[^"\\])*"|\x27(?:\\[\s\S]|[^\x27\\])*\x27|#[^\n]*)/g
+    : /("(?:\\[\s\S]|[^"\\])*"|\x27(?:\\[\s\S]|[^\x27\\])*\x27|`(?:\\[\s\S]|[^`\\])*`|\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\n]*)/g,
+    match => match.replace(/[^\n\r]/g, ' '));
+}
+
+function decomposePythonDefinitions(
+  bytes: Buffer, lines: LineSpan[], parent: CodeBlockNode,
+  spec: LanguageGrammarSpec, maxBlockBytes: number,
+): CodeBlockNode[] {
+  const local = lines.filter(l => l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
+  const masked = maskCode(bytes.subarray(parent.byteStart, parent.byteEnd).toString('utf8'), true).split(/(?<=\n)/u);
+  const indent = (s: string) => (/^[ \t]*/.exec(s)![0]).replace(/\t/g, '        ').length;
+  const candidates: Array<{ index: number; indent: number; name: string; headerEnd: number }> = [];
+  for (let i = 0; i < local.length; i++) {
+    const m = /^[ \t]*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b/.exec(masked[i] ?? '');
+    if (!m) continue;
+    // Multiline signatures end at a colon outside parameter/type brackets.
+    let level = 0;
+    let headerEnd = local[i].byteEnd;
+    let found = false;
+    for (let j = i; j < local.length && !found; j++) {
+      for (let k = 0; k < (masked[j] ?? '').length; k++) {
+        const ch = masked[j][k];
+        if ('([{'.includes(ch)) level++;
+        if (')]}'.includes(ch)) level--;
+        if (ch === ':' && level === 0) {
+          headerEnd = local[j].byteStart + Buffer.byteLength(local[j].text.slice(0, k + 1));
+          found = true;
+          break;
+        }
+      }
+    }
+    candidates.push({ index: i, indent: indent(masked[i]), name: m[1], headerEnd });
+  }
+  if (!candidates.length) return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
+  const minimum = Math.min(...candidates.map(c => c.indent));
+  const heads = candidates.filter(c => c.indent === minimum);
+  const nodes: CodeBlockNode[] = [];
+  let cursor = parent.byteStart;
+  for (const head of heads) {
+    let first = head.index;
+    while (first > 0 && /^[ \t]*@/.test(masked[first - 1] ?? '') && indent(masked[first - 1]) === minimum) first--;
+    let last = head.index;
+    while (last + 1 < local.length && local[last].byteEnd <= head.headerEnd) last++;
+    while (last + 1 < local.length) {
+      const next = masked[last + 1] ?? '';
+      if (next.trim() && indent(next) <= minimum) break;
+      last++;
+    }
+    // Blank/comment-only tails are not part of a definition's source extent.
+    while (last > head.index && !(masked[last] ?? '').trim()) last--;
+    const start = local[first].byteStart;
+    const end = local[last].byteEnd;
+    if (start < cursor) continue;
+    if (start > cursor) nodes.push(makeNode(bytes, spec.id, `gap-${nodes.length + 1}`, `${parent.symbolPath}::gap-${nodes.length + 1}`, 'statement', parent.depth + 1, cursor, start, parent.nodeId));
+    const n = makeNode(bytes, spec.id, head.name, `${parent.symbolPath}::${head.name}`, 'block', parent.depth + 1, start, end, parent.nodeId);
+    n.headerByteStart = start;
+    n.headerByteEnd = head.headerEnd;
+    // Retain the whole definition as the authority, and enumerate nested
+    // definitions beneath it even when the containing class fits the budget.
+    const bodyStart = local.find(l => l.byteStart >= head.headerEnd)?.byteStart ?? end;
+    if (bodyStart < end && candidates.some(c => local[c.index].byteStart >= bodyStart && local[c.index].byteStart < end && c.indent > minimum)) {
+      const header = makeNode(bytes, spec.id, `${head.name}::header`, `${n.symbolPath}::header`, 'statement', n.depth + 1, start, bodyStart, n.nodeId);
+      const body = makeNode(bytes, spec.id, `${head.name}::body`, n.symbolPath, 'block', n.depth, bodyStart, end, n.nodeId);
+      n.children = [header, ...decomposePythonDefinitions(bytes, lines, body, spec, maxBlockBytes).map(child => ({ ...child, parentId: n.nodeId }))];
+    }
+    nodes.push(n);
+    cursor = end;
+  }
+  if (cursor < parent.byteEnd) nodes.push(makeNode(bytes, spec.id, 'trailing', `${parent.symbolPath}::trailing`, 'statement', parent.depth + 1, cursor, parent.byteEnd, parent.nodeId));
+  return nodes;
 }
 
 /**
@@ -900,6 +908,9 @@ export function decomposeCodeSource(
 ): DecomposedCodeTree {
   const bytes = Buffer.isBuffer(textOrBytes) ? textOrBytes : Buffer.from(textOrBytes, 'utf8');
   const maxBlockBytes = options.maxBlockBytes ?? 4096;
+  if (!Number.isSafeInteger(maxBlockBytes) || maxBlockBytes <= 0) {
+    throw new RangeError('maxBlockBytes must be a positive safe integer');
+  }
   const spec =
     (options.grammarId ? getLanguageGrammar(options.grammarId) : undefined) ??
     (options.originKey ? getLanguageGrammar(options.originKey) : undefined) ??
@@ -911,9 +922,30 @@ export function decomposeCodeSource(
   root.children = decomposeByGrammar(bytes, lines, root, spec, maxBlockBytes);
 
   const flatNodes: CodeBlockNode[] = [];
+  const lineAt = (offset: number): number => {
+    let lo = 0, hi = lines.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (lines[mid].byteStart <= offset) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.max(1, lo);
+  };
   const walk = (n: CodeBlockNode) => {
+    n.startLine = lineAt(n.byteStart);
+    n.endLine = lineAt(Math.max(n.byteStart, n.byteEnd - 1));
+    n.subTokens = splitIdentifierSubTokens(n.symbolName);
+    if ((n.kind === 'block' || n.kind === 'section') && n.headerByteStart === undefined) {
+      n.headerByteStart = n.byteStart;
+      n.headerByteEnd = Math.min(n.byteEnd, lines[n.startLine - 1]?.byteEnd ?? n.byteEnd);
+    }
+    if (n.children.length === 0 && n.kind !== 'part') n.children = partitionIntoContiguousParts(bytes, lines, n, maxBlockBytes);
     flatNodes.push(n);
-    for (const c of n.children) walk(c);
+    for (const c of n.children) {
+      c.parentId = n.nodeId;
+      c.depth = n.depth + 1;
+      walk(c);
+    }
   };
   walk(root);
 
@@ -969,7 +1001,7 @@ export function rankRepositoryAstBlocksBlind(
   const maxBlockBytes = options.maxBlockBytes ?? 2600;
   const maxTotalChars = options.maxTotalChars ?? 22000;
 
-  const rawMatches = query.match(/[A-Za-z_][A-Za-z0-9_.]{2,}/g) ?? [];
+  const rawMatches = query.match(/[A-Za-z_][A-Za-z0-9_.]*/g) ?? [];
   const expandedTokens: string[] = [];
   for (const tok of rawMatches) {
     expandedTokens.push(tok);
@@ -983,14 +1015,20 @@ export function rankRepositoryAstBlocksBlind(
       expandedTokens.push(numMatch[0]);
     }
   }
-  const queryIds = [...new Set(expandedTokens.filter(tok => !BLIND_CODE_STOP.has(tok) && !isCommonEnglishProseToken(tok) && (hasTechnicalIdentifierFormatting(tok) || tok.length >= 4)))];
+  // Definition evidence outranks any prose/stop-word heuristic (e.g. get, set,
+  // library). No English dictionary may erase an actual repository symbol.
+  const definedSymbols = new Set<string>();
+  for (const f of files) {
+    for (const m of f.text.matchAll(/\b(?:def|class|function|interface|enum|type|const|let|var|fn|func)\s+([A-Za-z_$][\w$]*)/g)) definedSymbols.add(m[1]);
+    for (const m of f.text.matchAll(/^[ \t]*(?:(?:public|private|protected|static|async)\s+)*([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?::[^{}]+)?\{/gm)) definedSymbols.add(m[1]);
+  }
+  const isDefinedSymbol = (token: string) => definedSymbols.has(token);
+  const queryIds = [...new Set(expandedTokens.filter(tok => isDefinedSymbol(tok) || (!BLIND_CODE_STOP.has(tok) && (hasTechnicalIdentifierFormatting(tok) || tok.length >= 4))))];
 
   // Extract static unused/used imports if `importStatement` is provided (including multi-line `from X import (\n A,\n B\n)`)
-  // and record sibling import groups (`from module import A, B, C`) so tuple/sibling patterns stay grouped!
   const unusedImports = new Set<string>();
   const usedImports = new Set<string>();
   const importModuleBySymbol = new Map<string, string>();
-  const siblingImportsByModule = new Map<string, string[]>();
   if (options.importStatement) {
     const normalizedImports = options.importStatement.replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner) => inner.replace(/\s*\n\s*/g, ' '));
     for (const line of normalizedImports.split('\n')) {
@@ -999,18 +1037,13 @@ export function rankRepositoryAstBlocksBlind(
       const modName = mFrom ? mFrom[1] : 'global_import';
       const rhs = mFrom ? mFrom[2] : mImp ? mImp[1] : '';
       if (rhs) {
-        const modSyms: string[] = [];
         for (const part of rhs.split(',')) {
           const clean = part.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
           if (clean && /^[A-Za-z_]\w+$/.test(clean)) {
-            modSyms.push(clean);
             importModuleBySymbol.set(clean, modName);
             if (options.cursorContext && !options.cursorContext.includes(clean)) unusedImports.add(clean);
             else usedImports.add(clean);
           }
-        }
-        if (modSyms.length > 0) {
-          siblingImportsByModule.set(modName, [...(siblingImportsByModule.get(modName) ?? []), ...modSyms]);
         }
       }
     }
@@ -1074,7 +1107,7 @@ export function rankRepositoryAstBlocksBlind(
     const cached = codeSymbolCache.get(id);
     if (cached !== undefined) return cached;
     const val =
-      /[_0-9]/.test(id) ||
+      isDefinedSymbol(id) || /[_0-9]/.test(id) ||
       (/[A-Z]/.test(id) && /[a-z]/.test(id) && !/^[A-Z][a-z]+$/.test(id)) ||
       files.some(f => f.path.toLowerCase().includes(id.toLowerCase()) || f.text.includes(`def ${id}`) || f.text.includes(`class ${id}`) || f.text.includes(`.${id}`));
     codeSymbolCache.set(id, val);
@@ -1140,7 +1173,18 @@ export function rankRepositoryAstBlocksBlind(
 
     const tree = decomposeCodeSource(f.text, { originKey: f.path, maxBlockBytes });
     if (!tree.partitionVerified) allPartitionsVerified = false;
-    const leaves = tree.flatNodes.filter(n => n.children.length === 0 && (n.byteEnd - n.byteStart) >= 20);
+    // Prefer the complete fitting structural unit to its header/body leaves.
+    // Nested methods remain available through flatNodes for structural callers.
+    const leaves: CodeBlockNode[] = [];
+    const selectUnits = (node: CodeBlockNode) => {
+      const size = node.byteEnd - node.byteStart;
+      if ((node.kind === 'block' || node.kind === 'embedded_string' || node.kind === 'section') && size <= maxBlockBytes) {
+        if (size > 0) leaves.push(node);
+      } else if (node.children.length) {
+        for (const child of node.children) selectUnits(child);
+      } else if (size > 0) leaves.push(node);
+    };
+    selectUnits(tree.root);
     const buf = Buffer.from(f.text, 'utf8');
     for (const node of leaves) {
       const txt = buf.subarray(node.byteStart, node.byteEnd).toString('utf8');
@@ -1195,14 +1239,6 @@ export function rankRepositoryAstBlocksBlind(
         }
         if (node.symbolPath.includes(sym)) bScore += 300 + cursorBonus;
       }
-      // Penalize boilerplate `__init__` constructor leaves when a sibling `forward` / core method of the same class exists,
-      // unless `__init__` itself is mentioned in the query
-      if (leafName === '__init__' && !query.includes('__init__')) {
-        bScore = Math.max(1, Math.round(bScore * 0.65));
-      }
-      if (leafName === 'forward' || leafName === '__call__') {
-        bScore = Math.round(bScore * 1.25);
-      }
       if (bScore > 0) {
         candidateBlocks.push({
           originKey: f.path,
@@ -1226,7 +1262,7 @@ export function rankRepositoryAstBlocksBlind(
   const topSeeds = [...candidateBlocks].sort((a, b) => b.score - a.score).slice(0, 10);
   const seedSymbols = new Map<string, Set<string>>(); // leafName -> Set<matchedClue>
   for (const s of topSeeds) {
-    if (s.leafName && s.leafName.length >= 4 && !s.leafName.startsWith('module-preamble') && s.leafName !== '__init__') {
+    if (s.leafName && s.leafName.length >= 4 && !s.leafName.startsWith('module-preamble')) {
       const prev = seedSymbols.get(s.leafName) ?? new Set<string>();
       for (const c of s.matchedClues) prev.add(c);
       seedSymbols.set(s.leafName, prev);
@@ -1294,166 +1330,102 @@ export function rankRepositoryAstBlocksBlind(
 }
 
 export interface VirtualCorpusFile {
+  /** Compatibility display key. Consult verifiedPath before treating it as a file. */
   path: string;
+  verifiedPath?: string;
+  inferredLabel?: string;
+  pathProvenance: 'explicit-marker' | 'caller' | 'inferred';
+  segmentKind: 'file' | 'marker' | 'outside' | 'inferred';
   text: string;
+  byteStart: number;
+  byteEnd: number;
+  /** Inclusive, 1-based lines in the ORIGINAL stream. */
+  startLine: number;
+  endLine: number;
   isOrientationDoc: boolean;
 }
 
 /**
- * Universal Multi-File Corpus / Stream Decomposer (`splitCorpusStreamIntoFiles`):
- * Scans any concatenated repository dump, document stream, or multi-file text and splits it
- * along real file/section boundaries (never arbitrary character crops):
- * - Explicit `[start of path] ... [end of path]` markers
- * - Documentation/comment path declarations (`available as EXAMPLE/pddrive.c`, `declared in evaluation/auto_test.py`)
- * - Top-level module import headers (`import ...` / `from ... import ...` / `#include <...>`) and Markdown `# ` sections
- * - Tags `README`, `ARCHITECTURE`, `docs/`, and overview sections with `isOrientationDoc: true`
- * - Renders 1-based per-file line numbers (`L1..Ln`) so line-specific references (`line 121 in evaluation/auto_test.py`) are preserved verbatim.
+ * Lossless stream segmentation. Marker and outside spans are first-class records;
+ * concatenating every record's text returns the original stream exactly. Only an
+ * explicit marker or caller-supplied origin verifies a path; prose references are
+ * labels, never evidence of a source file. includeLineNumbers is a deprecated
+ * compatibility option and deliberately never modifies source bytes.
  */
 export function splitCorpusStreamIntoFiles(
   rawText: string,
   options: { defaultOriginKey?: string; includeLineNumbers?: boolean } = {},
 ): VirtualCorpusFile[] {
-  const defaultKey = options.defaultOriginKey ?? 'corpus_stream.py';
-  const includeLineNums = options.includeLineNumbers ?? false;
-
-  const hasPythonCodeDeclarations = (text: string) =>
-    /^(?:\d+:?\s*)?(?:class\s+[A-Za-z_]\w*|def\s+[A-Za-z_]\w*|async\s+def\s+[A-Za-z_]\w*|from\s+[A-Za-z_.]+\s+import\s+)/m.test(text);
-
-  const isOrientationPath = (p: string, sampleText: string) => {
-    if (hasPythonCodeDeclarations(sampleText)) return false;
-    return (
-      /(?:^|\/)(?:readme|architecture|contributing|overview|changelog|docs?\/|doc\/)/i.test(p) ||
-      /\.(?:md|rst|txt)$/i.test(p) ||
-      /^#{1,2}\s+\S/m.test(sampleText.slice(0, 400))
-    );
-  };
-
-  const formatWithLineNumbers = (text: string) => {
-    if (!includeLineNums) return text;
-    return text
-      .split('\n')
-      .map((l, idx) => `${idx + 1}: ${l}`)
-      .join('\n');
-  };
-
-  // 1. Check explicit `[start of path] ... [end of path]` markers
-  const sweRegex = /\[start of ([^\]]+)\]\n([\s\S]*?)\[end of \1\]/g;
-  const explicitFiles: VirtualCorpusFile[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = sweRegex.exec(rawText)) !== null) {
-    const p = m[1].trim();
-    const body = m[2];
-    explicitFiles.push({
-      path: p,
-      text: formatWithLineNumbers(body),
-      isOrientationDoc: isOrientationPath(p, body),
-    });
-  }
-  if (explicitFiles.length > 0) return explicitFiles;
-
-  // 2. Pre-scan documentation cross-references (`declared in \`path\``, `available as path`)
-  //    that bind a specific file path to a class/function identifier in concatenated streams.
-  const symbolToDeclaredPath = new Map<string, string>();
-  for (const dm of rawText.matchAll(/(?:declared in|defined in|available as|in file)\s+[`'"]?([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[a-zA-Z0-9]+)[`'"]?([^\n]{0,220})/gi)) {
-    const dPath = dm[1];
-    const tail = dm[2] ?? '';
-    for (const symMatch of tail.matchAll(/[`'"]([A-Za-z_][A-Za-z0-9_]{3,})[`'"]/g)) {
-      symbolToDeclaredPath.set(symMatch[1], dPath);
-    }
-  }
-
-  // 3. Scan lines for top-level file/module/section boundaries
-  const lines = rawText.split('\n');
+  const bytes = Buffer.from(rawText, 'utf8');
+  const lines = splitLinesWithByteBounds(bytes);
   const files: VirtualCorpusFile[] = [];
-  let curStart = 0;
-  let inCodeBody = false;
-  let inDocBody = false;
-
-  const inferVirtualPath = (chunkLines: string[], idx: number): string => {
-    const full = chunkLines.join('\n');
-    const sample = chunkLines.slice(0, 35).join('\n');
-    const explicitPath =
-      /(?:available as|file|in|path:?)\s+[`'"]?([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[a-zA-Z0-9]+)[`'"]?/i.exec(sample) ??
-      /^#\s*([A-Za-z0-9_./-]+\.(?:yaml|yml|json|py|c|h|cpp|md|sh|toml|ini))\b/m.exec(sample);
-    if (explicitPath) return explicitPath[1];
-    for (const [sym, dPath] of symbolToDeclaredPath.entries()) {
-      if (full.includes(`class ${sym}`) || full.includes(`def ${sym}`)) return dPath;
+  const lineAt = (offset: number) => {
+    let lo = 0, hi = lines.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (lines[mid].byteStart <= offset) lo = mid + 1;
+      else hi = mid;
     }
-    const clsMatch = /^class\s+([A-Za-z_]\w+)/m.exec(full);
-    const defMatch = /^def\s+([A-Za-z_]\w+)/m.exec(full);
-    const mdMatch = /^#{1,2}\s+([^\n]+)/m.exec(sample);
-    if (clsMatch) return `module_${idx}_${clsMatch[1]}.py`;
-    if (defMatch) return `module_${idx}_${defMatch[1]}.py`;
-    if (mdMatch && !hasPythonCodeDeclarations(full)) {
-      return `docs/section_${idx}_${mdMatch[1].replace(/[^A-Za-z0-9_]+/g, '_').slice(0, 32)}.md`;
-    }
-    return `${defaultKey}_part_${idx}`;
+    return Math.max(1, lo);
   };
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (i === 0) {
-      if (/^(?:#{1,3}\s+\S|<div\b|<h[1-3]\b)/.test(line.trim())) inDocBody = true;
+  const orientation = (path: string, text: string) => {
+    // A known code suffix is stronger evidence than a Markdown-looking
+    // comment or a source file living under docs/.
+    const grammar = getLanguageGrammar(path);
+    if (grammar && grammar.id !== 'markdown') return false;
+    return /(?:^|\/)(?:readme|architecture|contributing|overview|changelog|docs?\/)/i.test(path) ||
+      /\.(?:md|markdown|rst|txt)$/i.test(path) || /^#{1,2}\s+\S/m.test(text.slice(0, 400));
+  };
+  const emit = (start: number, end: number, kind: VirtualCorpusFile['segmentKind'], path?: string, provenance: VirtualCorpusFile['pathProvenance'] = 'inferred') => {
+    if (end <= start) return;
+    const text = bytes.subarray(start, end).toString('utf8');
+    const label = path ?? options.defaultOriginKey ?? `corpus-segment-${files.length + 1}`;
+    files.push({
+      path: label,
+      ...(provenance === 'inferred' ? { inferredLabel: label } : { verifiedPath: label }),
+      pathProvenance: provenance, segmentKind: kind, text,
+      byteStart: start, byteEnd: end,
+      startLine: lineAt(start), endLine: lineAt(Math.max(start, end - 1)),
+      isOrientationDoc: orientation(label, text),
+    });
+  };
+  // Markers are recognized only as complete lines outside Markdown fences.
+  let fence: string | undefined;
+  let activePath: string | undefined;
+  let cursor = 0;
+  let hadMarker = false;
+  for (const line of lines) {
+    const fenceMatch = /^\s{0,3}(`{3,}|~{3,})/.exec(line.text);
+    if (fenceMatch) {
+      if (!fence) fence = fenceMatch[1];
+      else if (fenceMatch[1][0] === fence[0] && fenceMatch[1].length >= fence.length) fence = undefined;
       continue;
     }
-    const prevBlank = lines[i - 1].trim() === '';
-    const nextFewLines = lines.slice(i + 1, Math.min(lines.length, i + 6)).join('\n');
-    const isTopLevelImport = /^(?:import\s+[A-Za-z_]|from\s+[A-Za-z_.]+\s+import\s+|#include\s+[<"]|package\s+[A-Za-z_]|using\s+[A-Za-z_])/.test(line);
-    // Only treat `# Heading` as a Markdown doc section boundary if we are currently in code AND it is NOT immediately followed by Python `def`/`class`/`@decorator`
-    const isTopLevelDocHeader =
-      /^#{1,2}\s+[A-Z0-9🔥]/.test(line) &&
-      inCodeBody &&
-      prevBlank &&
-      !/^(?:def\s+|class\s+|async\s+def\s+|@|#)/.test(nextFewLines.trimStart());
-    const isChunkOverflowBoundary =
-      i - curStart >= 900 &&
-      prevBlank &&
-      /^(?:class\s+|def\s+|async\s+def\s+|export\s+|function\s+|public\s+|private\s+|protected\s+|interface\s+|struct\s+|impl\s+|fn\s+)/.test(line);
-
-    if (
-      ((isTopLevelImport && (inCodeBody || (inDocBody && prevBlank))) || (isTopLevelDocHeader && inCodeBody)) &&
-      i - curStart >= 20 ||
-      isChunkOverflowBoundary ||
-      i - curStart >= 2000
-    ) {
-      const chunkLines = lines.slice(curStart, i);
-      const vPath = inferVirtualPath(chunkLines, files.length + 1);
-      const rawChunk = chunkLines.join('\n');
-      files.push({
-        path: vPath,
-        text: formatWithLineNumbers(rawChunk),
-        isOrientationDoc: isOrientationPath(vPath, rawChunk),
-      });
-      curStart = i;
-      inCodeBody = false;
-      inDocBody = isTopLevelDocHeader;
-    }
-
-    if (/^(?:#{1,3}\s+\S|<div\b|<h[1-3]\b|\*\s+\[\d{4}\.)/.test(line.trim()) && !inCodeBody) {
-      inDocBody = true;
-    }
-
-    if (
-      /^(?:def\s+|class\s+|async\s+def\s+|main\s*\(|void\s+|int\s+|export\s+|function\s+|\s{4,}(?:return\b|self\.|if\b|for\b|while\b|with\b|try:|raise\b|assert\b|super\())/.test(line) &&
-      !isTopLevelImport &&
-      !/^\s+[a-z0-9_,\s\\]+$/i.test(line)
-    ) {
-      inCodeBody = true;
-      inDocBody = false;
-    }
+    if (fence) continue;
+    const m = /^\[(start|end) of ([^\]\r\n]+)\][ \t]*(?:\r?\n)?$/.exec(line.text);
+    if (!m || (m[1] === 'end' && m[2].trim() !== activePath)) continue;
+    emit(cursor, line.byteStart, activePath ? 'file' : 'outside', activePath, activePath ? 'explicit-marker' : 'inferred');
+    const markerPath = m[2].trim();
+    emit(line.byteStart, line.byteEnd, 'marker', markerPath, 'explicit-marker');
+    activePath = m[1] === 'start' ? markerPath : undefined;
+    cursor = line.byteEnd;
+    hadMarker = true;
   }
-
-  if (curStart < lines.length) {
-    const chunkLines = lines.slice(curStart);
-    const vPath = inferVirtualPath(chunkLines, files.length + 1);
-    const rawChunk = chunkLines.join('\n');
-    files.push({
-      path: vPath,
-      text: formatWithLineNumbers(rawChunk),
-      isOrientationDoc: isOrientationPath(vPath, rawChunk),
-    });
+  if (hadMarker) {
+    emit(cursor, bytes.length, activePath ? 'file' : 'outside', activePath, activePath ? 'explicit-marker' : 'inferred');
+    return files;
   }
-
+  // A known file (especially README with fenced examples) remains one file.
+  if (options.defaultOriginKey) {
+    emit(0, bytes.length, 'file', options.defaultOriginKey, 'caller');
+    return files;
+  }
+  // Without explicit boundaries keep the stream intact. Content can suggest a
+  // label, but cannot prove multiple files or their paths.
+  const markdown = /^#{1,2}\s+\S/m.test(rawText.slice(0, 400));
+  const definition = /^(?:class|def|async\s+def)\s+([A-Za-z_]\w*)/m.exec(rawText);
+  const reference = /(?:declared in|defined in|available as|in file)\s+[`'"]?([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[a-zA-Z0-9]+)/i.exec(rawText);
+  const label = markdown ? 'corpus-document.md' : reference?.[1] ?? (definition ? `inferred_${definition[1]}.py` : 'corpus-stream');
+  emit(0, bytes.length, 'inferred', label);
   return files;
 }
-

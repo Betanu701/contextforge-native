@@ -1,4 +1,5 @@
 import { ContextForgeStore, COMPILER_VERSION, canonicalJson, sha256, stableId } from './store.js';
+import { STRUCTURAL_BLOCK_BYTES, isOrientationDocument, boundedHeaderEnd } from './structure.js';
 export const WIKI_COMPILER_VERSION = 'extractive-facets-v2';
 const compareText = (a, b)=>a < b ? -1 : a > b ? 1 : 0;
 const routingKey = (s)=>s.normalize('NFKC').toLowerCase().trim().replace(/\s+/gu, ' ');
@@ -628,6 +629,135 @@ export class ContextForgeCompiler {
                 }
             }
             const pages = buildWikiPages(routingEvidence, factEntries);
+            for (const sourceId of sourceIds){
+                const source = this.store.getSource(sourceId);
+                if (isOrientationDocument(source.originKey)) {
+                    for (const page of pages.values())for (const entry of page.entries)if (entry.sourceId === sourceId) {
+                        entry.orientation = true;
+                        entry.facetKinds = unique([
+                            ...entry.facetKinds,
+                            'orientation'
+                        ]);
+                    }
+                }
+                const units = this.store.getStructuralUnits(sourceId);
+                const artifacts = new Map();
+                const structuralEntries = new Map();
+                for (const unit of units){
+                    let bytes = artifacts.get(unit.artifactId);
+                    if (!bytes) {
+                        const a = db.prepare('SELECT blob_sha256 FROM artifacts WHERE artifact_id=?').get(unit.artifactId);
+                        bytes = this.store.readBlob(String(a.blob_sha256));
+                        artifacts.set(unit.artifactId, bytes);
+                    }
+                    const artifact = db.prepare('SELECT fidelity FROM artifacts WHERE artifact_id=?').get(unit.artifactId);
+                    const end = unit.byteEnd - unit.byteStart <= STRUCTURAL_BLOCK_BYTES ? unit.byteEnd : Math.min(unit.byteEnd, unit.headerByteEnd, unit.byteStart + STRUCTURAL_BLOCK_BYTES);
+                    let safeEnd = end;
+                    while(safeEnd < bytes.length && (bytes[safeEnd] & 0xc0) === 0x80)safeEnd--;
+                    if (safeEnd <= unit.byteStart) continue;
+                    const span = this.store.createSpan(sourceId, unit.artifactId, unit.byteStart, safeEnd);
+                    const row = {
+                        source_id: sourceId,
+                        namespace_id: namespaceId,
+                        span_id: span,
+                        body: bytes.subarray(unit.byteStart, safeEnd).toString('utf8'),
+                        observed_at: source.observedAt,
+                        trust_class: source.trustClass,
+                        fidelity: String(artifact.fidelity),
+                        source_kind: source.kind,
+                        artifact_id: unit.artifactId,
+                        artifact_kind: 'raw',
+                        ordinal: unit.byteStart,
+                        byte_start: unit.byteStart,
+                        byte_end: safeEnd
+                    };
+                    const supports = [
+                        row
+                    ];
+                    if (unit.kind === 'part' && unit.headerByteEnd > unit.headerByteStart && unit.headerByteStart < unit.byteStart) {
+                        const end = boundedHeaderEnd(bytes, unit.headerByteStart, unit.headerByteEnd);
+                        const headerSpan = this.store.createSpan(sourceId, unit.artifactId, unit.headerByteStart, end);
+                        supports.unshift({
+                            ...row,
+                            span_id: headerSpan,
+                            body: bytes.subarray(unit.headerByteStart, end).toString('utf8'),
+                            byte_start: unit.headerByteStart,
+                            byte_end: end
+                        });
+                    }
+                    const entry = evidenceEntry(supports, [], [
+                        'structure',
+                        ...unit.orientation ? [
+                            'orientation'
+                        ] : []
+                    ]);
+                    entry.structural = unit;
+                    entry.orientation = unit.orientation;
+                    entry.entityKeys = unique([
+                        ...entry.entityKeys,
+                        unit.symbolName.toLowerCase(),
+                        ...unit.subTokens
+                    ]);
+                    const key = `wiki/structure/${sourceId}/${unit.unitId}`;
+                    structuralEntries.set(unit.unitId, entry);
+                    pages.set(key, {
+                        title: `${unit.symbolPath} ${unit.subTokens.join(' ')}`,
+                        entries: [
+                            entry
+                        ],
+                        observed: source.observedAt
+                    });
+                }
+                const definitions = new Map();
+                for (const unit of units)if (unit.kind === 'block') {
+                    const ids = definitions.get(unit.symbolName) ?? [];
+                    ids.push(unit.unitId);
+                    definitions.set(unit.symbolName, ids);
+                }
+                for (const unit of units){
+                    const entry = structuralEntries.get(unit.unitId);
+                    if (!entry) continue;
+                    const links = [];
+                    const link = (relation, id)=>{
+                        if (!id) return;
+                        const target = structuralEntries.get(id);
+                        if (target) links.push({
+                            relation,
+                            unitId: id,
+                            spanIds: target.spanIds
+                        });
+                    };
+                    link('contained_by', unit.parentId ?? undefined);
+                    for (const id of unit.childIds)link('contains', id);
+                    link('previous_part', unit.previousPartId);
+                    link('next_part', unit.nextPartId);
+                    for (const ref of unit.references)for (const id of definitions.get(ref) ?? [])if (id !== unit.unitId) link('lexical_reference', id);
+                    entry.structuralLinks = links;
+                }
+            }
+            const definitions = new Map();
+            const structures = [
+                ...pages.values()
+            ].flatMap((p)=>p.entries).filter((e)=>e.structural);
+            for (const entry of structures)if (entry.structural.kind === 'block') {
+                const key = entry.structural.symbolName;
+                const entries = definitions.get(key) ?? [];
+                entries.push(entry);
+                definitions.set(key, entries);
+            }
+            for (const entry of structures)for (const ref of entry.structural.references){
+                for (const target of definitions.get(ref) ?? []){
+                    if (target.sourceId === entry.sourceId) continue;
+                    const links = entry.structuralLinks ??= [];
+                    if (!links.some((l)=>l.unitId === target.structural.unitId)) links.push({
+                        relation: 'lexical_reference',
+                        unitId: target.structural.unitId,
+                        sourceId: target.sourceId,
+                        artifactId: target.artifactId,
+                        spanIds: target.spanIds
+                    });
+                }
+            }
             for (const [key, p] of pages){
                 const deps = unique(p.entries.flatMap((e)=>e.dependencyNodeIds)), spans = unique(p.entries.flatMap((e)=>e.spanIds));
                 const render = (text)=>text.replace(/\[span:([a-f0-9]{64})\]/g, '[ref-span:$1]');
@@ -815,6 +945,16 @@ export class ContextForgeCompiler {
                                 }
                             }
                             if (unique(entry.spans.map((s)=>String(s.spanId))).join(',') !== unique(entry.spanIds).join(',')) issue('entry_span_mismatch');
+                            if (entry.structural) {
+                                const u = entry.structural, artifact = this.store.db.prepare('SELECT blob_sha256 FROM artifacts WHERE artifact_id=? AND source_id=?').get(entry.artifactId, entry.sourceId);
+                                const bytes = artifact ? blobCache.get(String(artifact.blob_sha256)) : undefined;
+                                if (!bytes || !Number.isSafeInteger(u.byteStart) || !Number.isSafeInteger(u.byteEnd) || u.byteStart < 0 || u.byteEnd > bytes.length || u.byteEnd < u.byteStart || u.headerByteStart < 0 || u.headerByteEnd < u.headerByteStart || u.headerByteEnd > bytes.length) issue('invalid_structural_range');
+                                else if (!entry.spans.some((span)=>span.byteStart >= u.byteStart && span.byteEnd <= u.byteEnd)) issue('structural_support_mismatch');
+                                for (const link of entry.structuralLinks ?? [])for (const spanId of link.spanIds ?? []){
+                                    const span = this.store.db.prepare('SELECT p.source_id,p.artifact_id,s.namespace_id,l.status FROM spans p JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) WHERE span_id=?').get(spanId);
+                                    if (!span || span.namespace_id !== namespaceId || span.source_id !== (link.sourceId ?? entry.sourceId) || span.artifact_id !== (link.artifactId ?? entry.artifactId)) issue('invalid_structural_link');
+                                }
+                            }
                             if (entry.textKind === 'extractive') {
                                 if (Buffer.concat(exactParts).toString('utf8') !== entry.text) issue('entry_quote_mismatch');
                                 if (entry.entryId !== stableId('cf-wiki-entry-v2', entry.sourceId, entry.spans.map((s)=>s.spanId), entry.text)) issue('entry_id_mismatch');

@@ -3,7 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, lstatSync, chmodSync, openSync, closeSync, readSync, fstatSync, writeFileSync, fsyncSync, renameSync, readFileSync, unlinkSync, existsSync, constants } from 'node:fs';
 import { resolve, dirname, join, parse } from 'node:path';
 import { analyzeRecallQuery, tokenizeRecallText, buildFtsQuery, lexicalProjectionTitle, canonicalRecallTitle, LEXICAL_VERSION } from './retrieval.ts';
-import { ensureLexiconAndSymbolTables, splitIdentifierSubTokens, isCommonEnglishProseToken } from './lexicon-priors.ts';
+import { getLanguageGrammar } from './code-decomposer.ts';
+import { structuralUnits, isDocumentationDocument } from './structure.ts';
 import { configureDatabase, migrate } from './schema.ts';
 import type { AcceptedMessage, ArtifactKind, ArtifactRecord, BlobRecord, ContextForgeConfig, DerivedNodeRecord, IngestSourceInput, JsonValue, MemoryStatus, ProvenanceRecord, PublishNodeInput, SearchOptions, SearchResult, SourceRecord } from './types.ts';
 
@@ -69,7 +70,6 @@ export class ContextForgeStore {
     this.db = new DatabaseSync(path, { allowExtension: false });
     try {
       chmodSync(path, 0o600); configureDatabase(this.db); migrate(this.db);
-      ensureLexiconAndSymbolTables(this.db);
       // Incoming one-hop traversal must not scan the complete edge table.
       this.db.exec('CREATE INDEX IF NOT EXISTS cf_edges_child ON derivation_edges(child_node_id,parent_node_id,relation)');
       this.db.exec('CREATE INDEX IF NOT EXISTS cf_spans_artifact_range ON spans(artifact_id,byte_start,span_id)');
@@ -234,15 +234,20 @@ export class ContextForgeStore {
             offset=end;
           }
         }
-        // Index AST/code/technical symbols and sub-tokens into `symbol_bm25_index` for O(1) BM25 role lookup
-        if (input.kind !== 'normalized_message') {
-          this.indexSourceSymbols(source.namespaceId, source.sourceId, source.originKey, input.text);
-        }
       }
       if(changed)this.bumpGeneration(source.namespaceId);
       this.queueCompile(source.sourceId);
       return {artifactId:id,sourceId:source.sourceId,kind:input.kind,blobSha256:blob.sha256,mimeType:mime,textContent:input.text??null,producer,producerVersion:version,configSha256:config,fidelity,observedAt:source.observedAt,metadata:input.metadata??{}};
     });
+  }
+  /** Structural coordinates are a regenerable view; immutable L0 is never rewritten. */
+  getStructuralUnits(sourceId:string, artifactId?:string, maxBlockBytes?:number) {
+    const source=this.getSource(sourceId);if(!source||source.status!=='active')return [];
+    const artifact=artifactId?this.db.prepare('SELECT * FROM artifacts WHERE source_id=? AND artifact_id=?').get(sourceId,artifactId):this.db.prepare("SELECT * FROM artifacts WHERE source_id=? AND text_content IS NOT NULL AND kind<>'normalized_message' ORDER BY CASE kind WHEN 'raw' THEN 0 WHEN 'text' THEN 1 ELSE 2 END,artifact_id LIMIT 1").get(sourceId);
+    if(!artifact||artifact.text_content===null)return [];
+    if(!getLanguageGrammar(source.originKey)&&!isDocumentationDocument(source.originKey)&&!/^\[start of [^\]]+\]/m.test(String(artifact.text_content)))return [];
+    const bytes=this.readBlob(String(artifact.blob_sha256));
+    return structuralUnits(bytes.toString('utf8'),source.originKey,maxBlockBytes).map(unit=>({...unit,sourceId,artifactId:String(artifact.artifact_id)}));
   }
   createSpan(sourceId:string, artifactId:string, start:number, end:number): string {
     const source=this.getSource(sourceId); if(!source) throw new Error('Unknown source'); this.assertNamespace(source.namespaceId,'write');
@@ -251,39 +256,28 @@ export class ContextForgeStore {
     const bytes=this.readBlobUnchecked(artifact.blob_sha256 as string);
     return this.insertSpan(sourceId,artifactId,start,end,bytes,source.observedAt,artifact.text_content!==null);
   }
+  /** Create/reuse a quote using bounded range IO, never a hidden whole-artifact read. */
+  createEvidenceSpan(sourceId:string,artifactId:string,start:number,end:number,options:BoundedReadOptions&{namespaceId?:string}={}) {
+    const ns=options.namespaceId??this.namespaceId;this.assertNamespace(ns,'write');
+    const budget=options.budget??createStoreReadBudget({maxBytes:options.maxBytes??8*1024*1024,deadlineAt:options.deadlineAt});
+    if(!available(budget)||options.maxInspected===0||Date.now()>=(options.deadlineAt??Infinity)||end-start>(options.maxBytes??Infinity))throw new Error('EvidenceReadBudgetExceeded');
+    const row=this.db.prepare(`SELECT a.blob_sha256,a.text_content IS NOT NULL AS is_text,s.observed_at,b.byte_length FROM artifacts a JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.artifact_id=? AND s.source_id=? AND s.namespace_id=? AND l.status='active'`).get(artifactId,sourceId,ns);
+    if(!row||!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||end<start||end>Number(row.byte_length))throw new Error('Span bounds invalid');
+    const id=stableId('cf-span-v1',artifactId,start,end);
+    if(!this.db.prepare('SELECT 1 FROM spans WHERE span_id=?').get(id)){
+      const length=end-start;if(length>budget.maxBytes-budget.bytes)throw new Error('EvidenceReadBudgetExceeded');
+      const bytes=this.readBlobRange(String(row.blob_sha256),start,end);budget.bytes+=bytes.length;budget.inspected++;
+      if(row.is_text&&!Buffer.from(bytes.toString('utf8')).equals(bytes))throw new Error('Span splits UTF-8 codepoint');
+      this.db.prepare('INSERT OR IGNORE INTO spans(span_id,source_id,artifact_id,byte_start,byte_end,selector_json,quote_sha256,observed_at) VALUES(?,?,?,?,?,?,?,?)').run(id,sourceId,artifactId,start,end,'{}',sha256(bytes),row.observed_at);
+      return {spanId:id,sourceId,artifactId,byteStart:start,byteEnd:end,text:bytes.toString('utf8')};
+    }
+    return this.readEvidenceSpan(id,{...options,namespaceId:ns,budget});
+  }
   private insertSpan(sourceId:string,artifactId:string,start:number,end:number,bytes:Buffer,observedAt:number,isText:boolean):string {
     if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||end<start||end>bytes.length) throw new Error('Span bounds invalid');
     if(isText && ((start<bytes.length&&(bytes[start]&0xc0)===0x80)||(end<bytes.length&&(bytes[end]&0xc0)===0x80))) throw new Error('Span splits UTF-8 codepoint');
     const id=stableId('cf-span-v1',artifactId,start,end);
     this.db.prepare('INSERT OR IGNORE INTO spans(span_id,source_id,artifact_id,byte_start,byte_end,selector_json,quote_sha256,observed_at) VALUES(?,?,?,?,?,?,?,?)').run(id,sourceId,artifactId,start,end,'{}',sha256(bytes.subarray(start,end)),observedAt); return id;
-  }
-  private indexSourceSymbols(namespaceId: string, sourceId: string, originKey: string, text: string): void {
-    const stmt = this.db.prepare('INSERT OR IGNORE INTO symbol_bm25_index(namespace_id, source_id, symbol_lower, symbol_surface, role, role_weight) VALUES(?, ?, ?, ?, ?, ?)');
-    const addSym = (sym: string, role: string, weight: number) => {
-      if (!sym || sym.length < 2 || sym.length > 96) return;
-      stmt.run(namespaceId, sourceId, sym.toLowerCase(), sym, role, weight);
-      for (const sub of splitIdentifierSubTokens(sym)) {
-        if (sub.length >= 3 && sub !== sym.toLowerCase() && !isCommonEnglishProseToken(sub)) {
-          stmt.run(namespaceId, sourceId, sub, sym, `${role}_subtoken`, Math.round(weight * 0.6 * 100) / 100);
-        }
-      }
-    };
-    for (const part of originKey.split(/[/\\._-]+/)) {
-      if (part.length >= 3) addSym(part, 'origin_path', 2.5);
-    }
-    const sample = text.length > 65536 ? text.slice(0, 65536) : text;
-    for (const m of sample.matchAll(/\b(?:async\s+def|def|function|class|interface|type|enum|subroutine|module|struct)\s+([A-Za-z_][\w$]{2,})\b/g)) {
-      addSym(m[1], 'definition', 3.0);
-    }
-    for (const m of sample.matchAll(/\b(?:defines)\s+([A-Za-z_][\w$]{2,})\b/g)) {
-      addSym(m[1], 'definition', 3.0);
-    }
-    for (const m of sample.matchAll(/\bfrom\s+[\w.]+\s+import\s+([^\n;]+)/g)) {
-      for (const part of m[1].split(',')) {
-        const clean = part.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
-        if (/^[A-Za-z_]\w{2,}$/.test(clean)) addSym(clean, 'import', 2.2);
-      }
-    }
   }
   commitTurn(input:{sessionId:string; advancementKey:string; messages:AcceptedMessage[]}): 'committed'|'duplicate' {
     const payload=canonicalJson(input.messages), hash=sha256(payload);
@@ -443,8 +437,7 @@ export class ContextForgeStore {
       for(const facet of recall.facets){let best=0;for(const term of facet.aliases)if(tokens.has(term)){
         const df=statistics.df.get(term)??0;
         const idf=Math.log(1+(statistics.sourceCount-df+0.5)/(df+0.5));
-        const prosePenalty=(facet.kind==='content'&&isCommonEnglishProseToken(facet.surface))?0.35:1;
-        best=Math.max(best,idf*prosePenalty);
+        best=Math.max(best,idf);
       }relevance+=facet.weight*best;}
       r.score=-relevance/(1+0.05*Math.log1p(tokens.size));rows.push(r);
     }} finally {iterator.return?.();}

@@ -1,7 +1,7 @@
 import { ContextForgeStore, stableId, createStoreReadBudget } from './store.ts';
 import { analyzeRecallQuery, scoreFacetCoverage } from './retrieval.ts';
 import { estimateTokens } from './symbolic-ir.ts';
-import { getLanguageGrammar, decomposeCodeSource } from './code-decomposer.ts';
+import { structuralUnits, STRUCTURAL_BLOCK_BYTES, isOrientationDocument, boundedHeaderEnd } from './structure.ts';
 import type { StoreReadBudget } from './store.ts';
 import type { RecallQuery } from './retrieval.ts';
 type Excerpt={spanId:string;artifactId:string;byteStart:number;byteEnd:number;text:string};
@@ -27,73 +27,51 @@ export function buildEvidenceWindow(store:ContextForgeStore,sourceId:string,reca
     +recall.facets.filter(f=>f.origin==='question'&&(f.kind==='identifier'||f.kind==='number')&&f.surface.length>=2&&c.text.includes(f.surface)).length*12
     +(/\b(anomal\w*|exception|reject\w*|unchanged|only|no other|must not|never)\b/i.test(c.text)?3:0)
   })).sort((a,b)=>b.s-a.s||a.i-b.i);
-  const grammar=getLanguageGrammar(source.originKey);
-  if(grammar){
-   const coveredWindowFacets=new Set<string>();
-   let totalChars=chunks[0].text.length+(chunks.length>1?chunks[chunks.length-1].text.length:0);
-   // 1. Greedily include top-scoring line chunks (plus +/-2 adjacent lines for code/context)
-   // and any chunk that covers a previously uncovered query facet, up to ~4,800 chars (~1,350 tokens).
-   for(const {i,s} of ranked){
-    if(s<=0)break;
-    const m=scoreFacetCoverage(recall,chunks[i].text).matchedFacetIds;
-    const addsNewFacet=m.some(f=>!coveredWindowFacets.has(f));
-    if((indexes.size<36||addsNewFacet)&&totalChars<4800){
-     for(let j=Math.max(0,i-2);j<=Math.min(chunks.length-1,i+2);j++){
-      if(!indexes.has(j)&&totalChars+chunks[j].text.length<=5200){indexes.add(j);totalChars+=chunks[j].text.length;}
-     }
-     m.forEach(f=>coveredWindowFacets.add(f));
-    }
-   }
-   // 2. AST-Block Expansion & Hierarchical Symbol-Path Selection:
-   // After all high-specificity line/facet hits are secured, use the remaining window budget (up to ~7,500 chars)
-   // to (a) expand top matched line chunks to complete enclosing AST blocks (`class`/`def`/`function`), and
-   // (b) pull in high-scoring AST blocks whose hierarchical `symbolPath` + body match the query (e.g. `AlterField::reduce`)!
-   if(totalChars<7200&&chunks.length>1&&chunks[chunks.length-1].byteEnd===Buffer.byteLength(full)){
-    try{
-     const tree=decomposeCodeSource(full,{originKey:source.originKey,grammarId:grammar.id,maxBlockBytes:2400});
-     const matchedByteOffsets=ranked.slice(0,4).map(r=>chunks[r.i].byteStart);
-     for(const offset of matchedByteOffsets){
-      const enclosing=tree.flatNodes
-       .filter(n=>n.depth>=1&&n.byteStart<=offset&&n.byteEnd>offset&&(n.byteEnd-n.byteStart)<=1600)
-       .sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart))[0];
-      if(enclosing){
-       const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=enclosing.byteStart&&c.byteEnd<=enclosing.byteEnd).map(x=>x.idx);
-       const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
-       if(addedChars>0&&totalChars+addedChars<=7500){
-        blockIdxs.forEach(idx=>indexes.add(idx));
-        totalChars+=addedChars;
-       }
-      }
-     }
-     const candidateNodes=tree.flatNodes
-      .filter(n=>n.depth>=1&&(n.byteEnd-n.byteStart)>=32&&(n.byteEnd-n.byteStart)<=3000)
-      .map(n=>{
-       const nodeText=Buffer.from(full).subarray(n.byteStart,n.byteEnd).toString('utf8');
-       const pathBonus=recall.facets.filter(f=>f.origin==='question'&&f.surface.length>=3&&n.symbolPath.toLowerCase().includes(f.surface.toLowerCase())).reduce((acc,f)=>acc+f.weight*4,0);
-       const cov=scoreFacetCoverage(recall,`${n.symbolPath}\n${nodeText}`);
-       return {n,score:cov.gain+pathBonus};
-      })
-      .filter(x=>x.score>0)
-      .sort((a,b)=>b.score-a.score||(a.n.byteEnd-a.n.byteStart)-(b.n.byteEnd-b.n.byteStart));
-     for(const cand of candidateNodes.slice(0,3)){
-      const blockIdxs=chunks.map((c,idx)=>({c,idx})).filter(({c})=>c.byteStart>=cand.n.byteStart&&c.byteEnd<=cand.n.byteEnd).map(x=>x.idx);
-      const addedChars=blockIdxs.filter(idx=>!indexes.has(idx)).reduce((n,idx)=>n+chunks[idx].text.length,0);
-      if(addedChars>0&&totalChars+addedChars<=7500){
-       blockIdxs.forEach(idx=>indexes.add(idx));
-       totalChars+=addedChars;
-      }
-     }
-    }catch{/* fallback to line-window if custom grammar throws */}
-   }
+  if(isOrientationDocument(source.originKey)||/\.(?:py|pyw|ts|tsx|js|jsx|mjs|cjs|java|cs|go|rs|c|cc|cpp|h|hpp|sql|f90|cob|cbl|html|ejs)$/i.test(source.originKey)){
+   // Structural expansion below is authoritative; do not pre-fill +/-2 cropped lines.
+   indexes.clear();
+   for(const {i,s} of ranked.slice(0,4))if(s>0)indexes.add(i);
   } else {
    for(const {i,s} of ranked.slice(0,3))if(s>0)for(const j of [i])if(j>=0&&j<chunks.length)indexes.add(j);
   }
   chosen=chunks.filter((_,i)=>indexes.has(i));
  }
  // Oversized legacy chunks receive an exact UTF-8 bounded window, not a fictional whole-line quote.
- const excerpts:Excerpt[]=chosen.map(c=>{if(Buffer.byteLength(c.text)<=8192)return c;const bytes=Buffer.from(c.text),lower=c.text.toLowerCase();const term=recall.facets.flatMap(f=>f.aliases).find(a=>lower.includes(a));const at=term?Buffer.byteLength(c.text.slice(0,lower.indexOf(term))):0;let start=Math.max(0,at-2048),end=Math.min(bytes.length,start+8192);while(start>0&&(bytes[start]&0xc0)===0x80)start--;while(end<bytes.length&&(bytes[end]&0xc0)===0x80)end++;const spanId=store.createSpan(sourceId,c.artifactId,c.byteStart+start,c.byteStart+end);return {...c,spanId,byteStart:c.byteStart+start,byteEnd:c.byteStart+end,text:bytes.subarray(start,end).toString('utf8')};});
+ const excerpts:Excerpt[]=chosen.map(c=>{if(Buffer.byteLength(c.text)<=8192)return c;const bytes=Buffer.from(c.text),lower=c.text.toLowerCase();const term=recall.facets.flatMap(f=>f.aliases).find(a=>lower.includes(a));const at=term?Buffer.byteLength(c.text.slice(0,lower.indexOf(term))):0;let start=Math.max(0,at-2048),end=Math.min(bytes.length,start+8192);while(start>0&&(bytes[start]&0xc0)===0x80)start--;while(end<bytes.length&&(bytes[end]&0xc0)===0x80)end++;return store.createEvidenceSpan(sourceId,c.artifactId,c.byteStart+start,c.byteStart+end,{namespaceId,budget,deadlineAt});});
+ // Hydrate exact whole units or linked parts using the same decomposition as compilation.
+ const structuralTrace:any[]=[];let structuralIncomplete=false;
+ const complete=!chunks.truncated&&chunks.length>0&&chunks[0].byteStart===0&&chunks.every((c,i)=>!i||c.artifactId===chunks[i-1].artifactId&&c.byteStart===chunks[i-1].byteEnd);
+ let selectedExcerpts=excerpts;
+ if(complete&&Date.now()<deadlineAt){
+  const fullBytes=Buffer.from(full),units=structuralUnits(full,source.originKey),byId=new Map(units.map(u=>[u.unitId,u]));
+  const artifactId=chunks[0].artifactId;
+  const anchors=[...required.filter(p=>p.artifactId===artifactId),...chunks.map(c=>({...c,score:scoreFacetCoverage(recall,c.text).gain})).filter(c=>c.score>0).sort((a,b)=>b.score-a.score).slice(0,8)];
+  const expanded:Excerpt[]=[];let used=0;
+  const addRanges=(ranges:Array<[number,number]>)=>{
+   const pending=ranges.filter(([start,end],i)=>end>start&&!expanded.some(e=>e.byteStart<=start&&e.byteEnd>=end)&&!ranges.some(([a,b],j)=>j!==i&&a<=start&&b>=end&&(a<start||b>end||j<i)));
+   const size=pending.reduce((n,[a,b])=>n+b-a,0);
+   if(used+size>8192||budget&&(size>budget.maxBytes-budget.bytes||pending.length>budget.maxInspected-budget.inspected)||Date.now()>=deadlineAt){structuralIncomplete=true;return false;}
+   const staged:Excerpt[]=[];
+   try{for(const [start,end] of pending)staged.push(store.createEvidenceSpan(sourceId,artifactId,start,end,{namespaceId,budget,deadlineAt}));}catch{structuralIncomplete=true;return false;}
+   expanded.push(...staged);used+=size;return true;
+  };
+  for(const anchor of anchors){
+   const enclosing=units.filter(u=>u.byteStart<=anchor.byteStart&&u.byteEnd>=anchor.byteEnd&&u.kind!=='part'&&u.kind!=='statement').sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart));
+   // Anonymous control blocks are not enclosing function authority. Prefer named definitions.
+   const symbols=enclosing.filter(u=>u.kind==='block'&&!/^(?:if|else|for|while|switch|try|catch|finally|do|block|body|statement)(?:$|[-#\s])/.test(u.symbolName));
+   const authority=symbols[0]??enclosing[0];
+   const whole=authority&&authority.byteEnd-authority.byteStart<=STRUCTURAL_BLOCK_BYTES?authority:undefined;
+   if(whole){if(addRanges([[whole.byteStart,whole.byteEnd]]))structuralTrace.push({unitId:whole.unitId,symbolPath:whole.symbolPath,whole:true,byteStart:whole.byteStart,byteEnd:whole.byteEnd,startLine:whole.startLine,endLine:whole.endLine});continue;}
+   const part=units.filter(u=>u.kind==='part'&&(!authority||u.parentId===authority.unitId)&&u.byteStart<=anchor.byteStart&&u.byteEnd>anchor.byteStart).sort((a,b)=>(a.byteEnd-a.byteStart)-(b.byteEnd-b.byteStart))[0];
+   if(part){const parent=byId.get(part.parentId!);const headerStart=parent?.headerByteStart??part.headerByteStart,originalHeaderEnd=parent?.headerByteEnd??part.headerByteEnd;
+    const headerEnd=boundedHeaderEnd(fullBytes,headerStart,originalHeaderEnd);
+    if(addRanges([[part.byteStart,part.byteEnd],[headerStart,headerEnd]]))structuralTrace.push({unitId:part.unitId,symbolPath:parent?.symbolPath??part.symbolPath,partIndex:part.partIndex,totalParts:part.totalParts,previousPartId:part.previousPartId??null,nextPartId:part.nextPartId??null,headerByteStart:headerStart,headerByteEnd:headerEnd,headerComplete:headerEnd===originalHeaderEnd,fullHeaderByteEnd:originalHeaderEnd,byteStart:part.byteStart,byteEnd:part.byteEnd,startLine:part.startLine,endLine:part.endLine});
+   }
+  }
+  if(expanded.length)selectedExcerpts=expanded;
+ }
  const score=scoreFacetCoverage(recall,full+' '+required.map(p=>p.text).join(' '));
- return bind({sourceId,text:'',spanIds:[],artifactIds:[],matchedFacetIds:score.matchedFacetIds,supportGroupIds:[],reasons:['lexical_match'],trace:{sourceRevision:source.originRevision,sourceStatus:source.status,trustClass:source.trustClass,...(chunks.truncated?{truncated:true}:{})},utility:score.score},[...excerpts,...required]);
+ return bind({sourceId,text:'',spanIds:[],artifactIds:[],matchedFacetIds:score.matchedFacetIds,supportGroupIds:[],reasons:['lexical_match'],trace:{sourceRevision:source.originRevision,sourceStatus:source.status,trustClass:source.trustClass,...(structuralTrace.length?{structuralUnits:structuralTrace}:{}),...(chunks.truncated||structuralIncomplete?{truncated:true,structuralIncomplete}:{})},utility:score.score,...(structuralTrace.some(u=>u.partIndex)?{derivedText:'Structural navigation (not original quote):\n'+structuralTrace.filter(u=>u.partIndex).map(u=>`${u.symbolPath}: part-${u.partIndex} of ${u.totalParts}; lines ${u.startLine}-${u.endLine}; previous=${u.previousPartId??'none'}; next=${u.nextPartId??'none'}; enclosing signature bytes ${u.headerByteStart}-${u.headerByteEnd}${u.headerComplete===false?' (header incomplete; continues to byte '+u.fullHeaderByteEnd+')':''}`).join('\n')}: {})},[...selectedExcerpts,...required]);
 }
 function claimSignatures(recall:RecallQuery,text:string):string[] {
  return text.split(/(?<=[.!?])\s+|\n/u).filter(t=>{const s=scoreFacetCoverage(recall,t);return s.anchored&&s.score>0||/\b(except|unless|only|not|never|unchanged|reject|contradict|must|cannot|if|without)\b/i.test(t);}).map(t=>{const normalized=t.normalize('NFKC').trim().replace(/\s+/g,' ');const claim=/^(?:Fact|State|Decision|Correction):\s*([^|]+)\|\s*([^=]+)=\s*(.+)$/i.exec(normalized);if(claim)return JSON.stringify(claim.slice(1).map(s=>s.trim()));try{const v=JSON.parse(normalized);if(v.type==='fact')return JSON.stringify([v.entity,v.predicate,v.object,v.polarity??1]);}catch{}return normalized;}).sort();
@@ -105,7 +83,7 @@ export function hydrateProvenanceSupport(store:ContextForgeStore,nodeId:string,r
  const canonical=JSON.parse(String(row.canonical_json)),provenance=store.getProvenance(nodeId);
  if(row.status==='superseded'&&!historical(recall))return [];
  const entries=Array.isArray(canonical.entries)?canonical.entries:[];
- const matched=entries.filter((e:any)=>{const s=scoreFacetCoverage(recall,String(e.text));return s.score>0&&s.anchored;}).sort((a:any,b:any)=>scoreFacetCoverage(recall,String(b.text)).gain-scoreFacetCoverage(recall,String(a.text)).gain||String(a.entryId).localeCompare(String(b.entryId)));
+ const matched=entries.filter((e:any)=>{const s=scoreFacetCoverage(recall,String(e.text)+' '+(e.structural?.symbolPath??'')+' '+(e.structural?.subTokens??[]).join(' '));return s.score>0&&s.anchored;}).sort((a:any,b:any)=>scoreFacetCoverage(recall,String(b.text)).gain-scoreFacetCoverage(recall,String(a.text)).gain||String(a.entryId).localeCompare(String(b.entryId)));
  if(entries.length&&!matched.length)return [];
  const allowed=new Set(provenance.map(p=>p.spanId)),result:EvidenceCandidate[]=[];
  const perSource=new Map<string,{count:number;chars:number}>();let truncated=false;
@@ -122,12 +100,16 @@ export function hydrateProvenanceSupport(store:ContextForgeStore,nodeId:string,r
   if(reject)continue;
   const group=stableId('cf-support-group-v2',nodeId,[...selectedSpans].sort());
   for(const [sourceId,spans] of bySource){
-   if(windowCache&&!windowCache.has(sourceId))windowCache.set(sourceId,buildEvidenceWindow(store,sourceId,recall,[],namespaceId,deadlineAt,budget));
-   const base=windowCache?.get(sourceId)??buildEvidenceWindow(store,sourceId,recall,[],namespaceId,deadlineAt,budget);if(!base)continue;
+   // Persisted symbol/sub-token routes may match only a title, not the body. Seed
+   // their exact support span so whole-unit hydration does not depend on lexical coincidence.
+   const structuralSeed=entry.structural?spans:[];
+   if(windowCache&&!windowCache.has(sourceId))windowCache.set(sourceId,buildEvidenceWindow(store,sourceId,recall,structuralSeed,namespaceId,deadlineAt,budget));
+   let base=windowCache?.get(sourceId)??buildEvidenceWindow(store,sourceId,recall,structuralSeed,namespaceId,deadlineAt,budget);if(!base)continue;
+   if(entry.structural&&!base.trace.structuralUnits?.some((u:any)=>u.unitId===entry.structural.unitId)&&!spans.every(id=>base!.spanIds.includes(id))){const routed=buildEvidenceWindow(store,sourceId,recall,spans,namespaceId,deadlineAt,budget);if(routed)base=routed;}
    const required=spans.map(id=>readSupport(id));
    // A small alternate representation can include adjacent punctuation/context;
    // retain the exact required subspan binding as well as that real excerpt.
-   const alternateContext=required.flatMap(p=>{if(base.artifactIds.includes(p.artifactId))return [];const a=store.db.prepare('SELECT b.byte_length FROM artifacts a JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.artifact_id=?').get(p.artifactId);if(!a||Number(a.byte_length)>4096)return [];const id=store.createSpan(sourceId,p.artifactId,0,Number(a.byte_length));try{return [readSupport(id)];}catch{truncated=true;return [];}});
+   const alternateContext=required.flatMap(p=>{if(base.artifactIds.includes(p.artifactId))return [];const a=store.db.prepare('SELECT b.byte_length FROM artifacts a JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.artifact_id=?').get(p.artifactId);if(!a||Number(a.byte_length)>4096)return [];try{return [store.createEvidenceSpan(sourceId,p.artifactId,0,Number(a.byte_length),{namespaceId,budget,deadlineAt})];}catch{truncated=true;return [];}});
    const c=bind({...base,trace:{...base.trace},supportGroupIds:[group],reasons:['provenance_support'],supportRequirements:{[group]:selectedSpans},derivedNodeIds:[nodeId]},[...(base.excerpts??[]),...required,...alternateContext]);
    if(Number(row.layer)===1)c.derivedText=`[${row.status}] revision ${row.revision}: ${row.body}`;
    c.claimSignatures=claimSignatures(recall,String(entry.text));

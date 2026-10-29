@@ -12,7 +12,7 @@ import {
   splitCorpusStreamIntoFiles,
 } from '../src/code-decomposer.ts';
 import { ContextForgeStore, sha256 } from '../src/store.ts';
-import { isCommonEnglishProseToken, splitIdentifierSubTokens } from '../src/lexicon-priors.ts';
+import { hasTechnicalIdentifierFormatting, splitIdentifierSubTokens } from '../src/lexicon-priors.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -157,35 +157,25 @@ test('25,000-byte giant monolithic function decomposes into contiguous parts tha
   assert.equal(sha256(reconstructed), sha256(bytes), 'Concatenated leaf parts must equal exact original file SHA-256');
 });
 
-test('SQLite lexicon_priors + symbol_bm25_index, camelCase/snake_case sub-token triangulation, virtual file stream splitter, and orientation-first/recency-last ordering', () => {
+test('dictionary-free identifier helpers, structural source views, lossless streams and orientation ranking', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cf-lex-test-'));
   try {
     const store = new ContextForgeStore(join(dir, 's.sqlite'));
-    const lexCount = Number((store.db.prepare('SELECT count(*) AS cnt FROM lexicon_priors').get() as any).cnt);
-    assert.ok(lexCount >= 10000, `Expected >=10,000 lexicon_priors rows, got ${lexCount}`);
-
-    // Common English prose words from LongBench questions must be recognized as prose
-    for (const prose of ['mainly', 'important', 'provides', 'library', 'documents', 'refinement', 'factors']) {
-      assert.equal(isCommonEnglishProseToken(prose), true, `Expected "${prose}" to be classified as common English prose`);
-    }
-    // Technical symbols must NOT be classified as prose
-    for (const sym of ['ContrastiveEmbed', 'start_port', 'load_audio', 'Http404', 'HPGMG']) {
-      assert.equal(isCommonEnglishProseToken(sym), false, `Expected "${sym}" to be classified as technical symbol`);
-    }
+    assert.equal(store.db.prepare("SELECT count(*) n FROM sqlite_master WHERE name IN ('lexicon_priors','symbol_bm25_index')").get()!.n,0);
+    for (const sym of ['ContrastiveEmbed', 'start_port', 'load_audio', 'Http404', 'HPGMG']) assert.equal(hasTechnicalIdentifierFormatting(sym),true);
     assert.deepEqual(splitIdentifierSubTokens('ContrastiveEmbed'), ['contrastive', 'embed']);
     assert.deepEqual(splitIdentifierSubTokens('convert_ldm_vae_checkpoint'), ['convert', 'ldm', 'vae', 'checkpoint']);
 
-    // Ingesting a code file indexes its AST definitions and sub-tokens into symbol_bm25_index
+    // Ingesting code exposes source-backed definitions and deterministic sub-tokens.
     const src = store.ingestSource({
       originKey: 'models/utils.py',
       kind: 'document',
       role: 'user',
       text: 'from .blocks import UpBlock3D\nclass ContrastiveEmbed:\n    def forward(self, x):\n        return x\n',
     });
-    const indexed = store.db.prepare('SELECT symbol_lower, role FROM symbol_bm25_index WHERE source_id=?').all(src.sourceId) as any[];
-    assert.ok(indexed.some(r => r.symbol_lower === 'contrastiveembed' && r.role === 'definition'));
-    assert.ok(indexed.some(r => r.symbol_lower === 'contrastive' && r.role === 'definition_subtoken'));
-    assert.ok(indexed.some(r => r.symbol_lower === 'upblock3d' && r.role === 'import'));
+    const indexed=store.getStructuralUnits(src.sourceId);
+    assert.ok(indexed.some(r=>r.symbolName==='ContrastiveEmbed'&&r.subTokens.includes('contrastive')));
+    assert.ok(indexed.some(r=>r.references.includes('.blocks')));
 
     // Multi-line imports + cursor comment sub-token triangulation + orientation-first / recency-last ordering
     const files = [
@@ -205,9 +195,9 @@ test('SQLite lexicon_priors + symbol_bm25_index, camelCase/snake_case sub-token 
     assert.equal(ranked.blocks[0].originKey, 'README.md');
     assert.equal(ranked.blocks[ranked.blocks.length - 1].originKey, 'models/utils.py');
     assert.ok(ranked.blocks[ranked.blocks.length - 1].text.includes('ContrastiveEmbed'));
-    assert.ok(ranked.blocks[ranked.blocks.length - 1].score > ranked.blocks[1].score * 2);
+    assert.ok(ranked.blocks.filter(b=>b.originKey!=='README.md').every(b=>b.score<=ranked.blocks.at(-1)!.score));
 
-    // Virtual file stream splitter preserves 1-based per-file line numbers and binds declared paths
+    // Unverified prose path references stay labels and never rewrite original bytes.
     const docSection = Array.from({ length: 22 }, (_, i) =>
       i === 0
         ? '# Overview'
@@ -221,10 +211,12 @@ test('SQLite lexicon_priors + symbol_bm25_index, camelCase/snake_case sub-token 
       'import os\nimport socket\nclass TextOnlyMobileTask_AutoTest:\n    def init_worker(self):\n        port = find_free_ports(start_port=6060)',
     ].join('\n');
     const vFiles = splitCorpusStreamIntoFiles(stream, { includeLineNumbers: true });
-    assert.equal(vFiles.length, 2);
-    assert.equal(vFiles[0].isOrientationDoc, true);
-    assert.equal(vFiles[1].path, 'evaluation/auto_test.py');
-    assert.ok(vFiles[1].text.includes('5:         port = find_free_ports(start_port=6060)'));
+    assert.equal(vFiles.length,1);
+    assert.equal(vFiles[0].isOrientationDoc,true);
+    assert.equal(vFiles[0].verifiedPath,undefined);
+    assert.equal(vFiles[0].text,stream);
+    assert.equal(vFiles[0].startLine,1);
+    assert.equal(vFiles[0].endLine,stream.split('\n').length);
 
     store.close();
   } finally {

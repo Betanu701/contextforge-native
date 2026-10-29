@@ -3,6 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, lstatSync, chmodSync, openSync, closeSync, readSync, fstatSync, writeFileSync, fsyncSync, renameSync, readFileSync, unlinkSync, existsSync, constants } from 'node:fs';
 import { resolve, dirname, join, parse } from 'node:path';
 import { analyzeRecallQuery, tokenizeRecallText, buildFtsQuery, lexicalProjectionTitle, canonicalRecallTitle, LEXICAL_VERSION } from './retrieval.js';
+import { getLanguageGrammar } from './code-decomposer.js';
+import { structuralUnits, isDocumentationDocument } from './structure.js';
 import { configureDatabase, migrate } from './schema.js';
 export const COMPILER_VERSION = 'deterministic-v1';
 export const INLINE_THRESHOLD = 64 * 1024;
@@ -399,6 +401,19 @@ export class ContextForgeStore {
             };
         });
     }
+    getStructuralUnits(sourceId, artifactId, maxBlockBytes) {
+        const source = this.getSource(sourceId);
+        if (!source || source.status !== 'active') return [];
+        const artifact = artifactId ? this.db.prepare('SELECT * FROM artifacts WHERE source_id=? AND artifact_id=?').get(sourceId, artifactId) : this.db.prepare("SELECT * FROM artifacts WHERE source_id=? AND text_content IS NOT NULL AND kind<>'normalized_message' ORDER BY CASE kind WHEN 'raw' THEN 0 WHEN 'text' THEN 1 ELSE 2 END,artifact_id LIMIT 1").get(sourceId);
+        if (!artifact || artifact.text_content === null) return [];
+        if (!getLanguageGrammar(source.originKey) && !isDocumentationDocument(source.originKey) && !/^\[start of [^\]]+\]/m.test(String(artifact.text_content))) return [];
+        const bytes = this.readBlob(String(artifact.blob_sha256));
+        return structuralUnits(bytes.toString('utf8'), source.originKey, maxBlockBytes).map((unit)=>({
+                ...unit,
+                sourceId,
+                artifactId: String(artifact.artifact_id)
+            }));
+    }
     createSpan(sourceId, artifactId, start, end) {
         const source = this.getSource(sourceId);
         if (!source) throw new Error('Unknown source');
@@ -407,6 +422,40 @@ export class ContextForgeStore {
         if (!artifact) throw new Error('Span source mismatch');
         const bytes = this.readBlobUnchecked(artifact.blob_sha256);
         return this.insertSpan(sourceId, artifactId, start, end, bytes, source.observedAt, artifact.text_content !== null);
+    }
+    createEvidenceSpan(sourceId, artifactId, start, end, options = {}) {
+        const ns = options.namespaceId ?? this.namespaceId;
+        this.assertNamespace(ns, 'write');
+        const budget = options.budget ?? createStoreReadBudget({
+            maxBytes: options.maxBytes ?? 8 * 1024 * 1024,
+            deadlineAt: options.deadlineAt
+        });
+        if (!available(budget) || options.maxInspected === 0 || Date.now() >= (options.deadlineAt ?? Infinity) || end - start > (options.maxBytes ?? Infinity)) throw new Error('EvidenceReadBudgetExceeded');
+        const row = this.db.prepare(`SELECT a.blob_sha256,a.text_content IS NOT NULL AS is_text,s.observed_at,b.byte_length FROM artifacts a JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.artifact_id=? AND s.source_id=? AND s.namespace_id=? AND l.status='active'`).get(artifactId, sourceId, ns);
+        if (!row || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > Number(row.byte_length)) throw new Error('Span bounds invalid');
+        const id = stableId('cf-span-v1', artifactId, start, end);
+        if (!this.db.prepare('SELECT 1 FROM spans WHERE span_id=?').get(id)) {
+            const length = end - start;
+            if (length > budget.maxBytes - budget.bytes) throw new Error('EvidenceReadBudgetExceeded');
+            const bytes = this.readBlobRange(String(row.blob_sha256), start, end);
+            budget.bytes += bytes.length;
+            budget.inspected++;
+            if (row.is_text && !Buffer.from(bytes.toString('utf8')).equals(bytes)) throw new Error('Span splits UTF-8 codepoint');
+            this.db.prepare('INSERT OR IGNORE INTO spans(span_id,source_id,artifact_id,byte_start,byte_end,selector_json,quote_sha256,observed_at) VALUES(?,?,?,?,?,?,?,?)').run(id, sourceId, artifactId, start, end, '{}', sha256(bytes), row.observed_at);
+            return {
+                spanId: id,
+                sourceId,
+                artifactId,
+                byteStart: start,
+                byteEnd: end,
+                text: bytes.toString('utf8')
+            };
+        }
+        return this.readEvidenceSpan(id, {
+            ...options,
+            namespaceId: ns,
+            budget
+        });
     }
     insertSpan(sourceId, artifactId, start, end, bytes, observedAt, isText) {
         if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > bytes.length) throw new Error('Span bounds invalid');
@@ -751,7 +800,8 @@ export class ContextForgeStore {
                     let best = 0;
                     for (const term of facet.aliases)if (tokens.has(term)) {
                         const df = statistics.df.get(term) ?? 0;
-                        best = Math.max(best, Math.log(1 + (statistics.sourceCount - df + 0.5) / (df + 0.5)));
+                        const idf = Math.log(1 + (statistics.sourceCount - df + 0.5) / (df + 0.5));
+                        best = Math.max(best, idf);
                     }
                     relevance += facet.weight * best;
                 }
@@ -830,21 +880,27 @@ export class ContextForgeStore {
             truncated
         };
     }
-    readEvidenceSpan(spanId, options = {}) {
+    readEvidenceSpan(spanIdOrPrefix, options = {}) {
         const ns = options.namespaceId ?? this.namespaceId;
         this.assertNamespace(ns);
         const budget = options.budget ?? (options.deadlineAt !== undefined || options.maxBytes !== undefined || options.maxInspected !== undefined ? readBudget(options) : undefined);
         if (budget && (!available(budget) || Date.now() >= (options.deadlineAt ?? Infinity) || options.maxInspected === 0)) throw new Error('EvidenceReadBudgetExceeded');
         if (budget) budget.inspected++;
-        const row = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(spanId, ns);
+        const clean = String(spanIdOrPrefix).trim().toLowerCase();
+        let row = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(clean, ns);
+        if (!row && /^[a-f0-9]{8,63}$/.test(clean)) {
+            const matches = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id LIKE ? AND s.namespace_id=? LIMIT 2`).all(`${clean}%`, ns);
+            if (matches.length === 1) row = matches[0];
+        }
         if (!row || row.status === 'withdrawn' || row.status !== 'active' && !options.allowSupersededSource) throw new Error('EvidenceSpanUnavailable');
+        const fullSpanId = String(row.span_id);
         const start = Number(row.byte_start), end = Number(row.byte_end);
         if (budget && (end - start > Math.min(options.maxBytes ?? Infinity, budget.maxBytes - budget.bytes) || Date.now() >= Math.min(options.deadlineAt ?? Infinity, budget.deadlineAt))) throw new Error('EvidenceReadBudgetExceeded');
         const bytes = budget ? this.readBlobRange(String(row.blob_sha256), start, end) : this.readBlobUnchecked(String(row.blob_sha256)).subarray(start, end);
         if (budget) budget.bytes += bytes.length;
         if (sha256(bytes) !== row.quote_sha256) throw new Error('EvidenceQuoteMismatch');
         return {
-            spanId,
+            spanId: fullSpanId,
             sourceId: String(row.source_id),
             namespaceId: ns,
             sourceRevision: String(row.origin_revision),
@@ -857,6 +913,22 @@ export class ContextForgeStore {
             bytes,
             status: String(row.status)
         };
+    }
+    formatShortSpanId(spanId, namespaceId = this.namespaceId) {
+        const clean = String(spanId).toLowerCase();
+        for (const len of [
+            8,
+            10,
+            12,
+            16,
+            64
+        ]){
+            if (len >= clean.length) return clean;
+            const prefix = clean.slice(0, len);
+            const conflict = this.db.prepare('SELECT p.span_id FROM spans p JOIN sources s USING(source_id) WHERE s.namespace_id=? AND p.span_id LIKE ? AND p.span_id<>? LIMIT 1').get(namespaceId, `${prefix}%`, clean);
+            if (!conflict) return prefix;
+        }
+        return clean;
     }
     readBlobRange(hash, start, end) {
         if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('Invalid SHA-256');

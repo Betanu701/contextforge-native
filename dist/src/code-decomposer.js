@@ -1,4 +1,5 @@
 import { sha256, stableId } from './store.js';
+import { splitIdentifierSubTokens, hasTechnicalIdentifierFormatting } from './lexicon-priors.js';
 const REGISTRY = new Map();
 const EXT_MAP = new Map();
 export function registerLanguageGrammar(spec) {
@@ -500,6 +501,20 @@ registerLanguageGrammar({
         }
     }
 });
+registerLanguageGrammar({
+    id: 'markdown',
+    extensions: [
+        '.md',
+        '.markdown',
+        '.rst',
+        '.txt'
+    ],
+    comments: {},
+    strings: {
+        quotes: []
+    },
+    blocks: {}
+});
 function splitLinesWithByteBounds(bytes) {
     const text = bytes.toString('utf8');
     const rawLines = text.split(/(?<=\n)/u);
@@ -568,120 +583,150 @@ function makeNode(bytes, grammarId, symbolName, symbolPath, kind, depth, byteSta
     };
 }
 function partitionIntoContiguousParts(bytes, lines, parent, maxPartBytes) {
-    const subLines = lines.filter((l)=>l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
-    if (subLines.length <= 1 || parent.byteEnd - parent.byteStart <= maxPartBytes) return [];
+    if (parent.byteEnd - parent.byteStart <= maxPartBytes) return [];
+    const lineEnds = lines.filter((l)=>l.byteEnd > parent.byteStart && l.byteEnd <= parent.byteEnd).map((l)=>l.byteEnd);
     const ranges = [];
     let start = parent.byteStart;
-    let cursor = parent.byteStart;
-    for (const l of subLines){
-        if (cursor > start && l.byteEnd - start > maxPartBytes) {
-            ranges.push([
-                start,
-                cursor
-            ]);
-            start = cursor;
+    let lineIndex = 0;
+    while(start < parent.byteEnd){
+        const limit = Math.min(parent.byteEnd, start + maxPartBytes);
+        while(lineIndex < lineEnds.length && lineEnds[lineIndex] <= start)lineIndex++;
+        let next = limit;
+        if (lineIndex < lineEnds.length && lineEnds[lineIndex] <= limit) {
+            while(lineIndex + 1 < lineEnds.length && lineEnds[lineIndex + 1] <= limit)lineIndex++;
+            next = lineEnds[lineIndex];
+        } else {
+            while(next > start && next < parent.byteEnd && (bytes[next] & 0xc0) === 0x80)next--;
+            if (next === start) {
+                next++;
+                while(next < parent.byteEnd && (bytes[next] & 0xc0) === 0x80)next++;
+            }
         }
-        cursor = l.byteEnd;
+        ranges.push([
+            start,
+            next
+        ]);
+        start = next;
     }
-    if (start < parent.byteEnd) ranges.push([
-        start,
-        parent.byteEnd
-    ]);
     if (ranges.length <= 1) return [];
-    return ranges.map(([s, e], idx)=>makeNode(bytes, parent.grammarId, `${parent.symbolName}#part-${idx + 1}`, `${parent.symbolPath}#part-${idx + 1}`, 'part', parent.depth + 1, s, e, parent.nodeId, {
+    const parts = ranges.map(([s, e], idx)=>makeNode(bytes, parent.grammarId, `${parent.symbolName}#part-${idx + 1}`, `${parent.symbolPath}#part-${idx + 1}`, 'part', parent.depth + 1, s, e, parent.nodeId, {
             partIndex: idx + 1,
             totalParts: ranges.length
         }));
+    parent.partIds = parts.map((p)=>p.nodeId);
+    parts.forEach((part, idx)=>{
+        part.partOfId = parent.nodeId;
+        part.previousPartId = parts[idx - 1]?.nodeId;
+        part.nextPartId = parts[idx + 1]?.nodeId;
+    });
+    return parts;
 }
 function decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockBytes) {
-    const subLines = lines.filter((l)=>l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
-    if (subLines.length <= 1 || parent.depth >= 12) return [];
+    if (parent.depth >= 12) return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
+    const source = bytes.subarray(parent.byteStart, parent.byteEnd).toString('utf8');
+    const masked = maskCode(source);
+    const atByte = (offset)=>parent.byteStart + Buffer.byteLength(source.slice(0, offset));
     const intervals = [];
     let depth = 0;
-    let inBacktick = false;
-    let inBlockComment = false;
-    let blockStartLine = 0;
-    let embeddedLang;
-    for(let li = 0; li < subLines.length; li++){
-        const line = subLines[li].text;
-        if (isLineComment(line, spec) && !inBacktick && !inBlockComment) continue;
-        for(let ci = 0; ci < line.length; ci++){
-            const ch = line[ci];
-            const next = line[ci + 1] ?? '';
-            if (inBlockComment) {
-                if (ch === '*' && next === '/') {
-                    inBlockComment = false;
-                    ci++;
-                }
-                continue;
+    let opening = 0;
+    let start = 0;
+    let boundary = 0;
+    let parentheses = 0;
+    let squareBrackets = 0;
+    for(let i = 0; i < masked.length; i++){
+        if (depth === 0 && masked[i] === '(') parentheses++;
+        if (depth === 0 && masked[i] === ')') parentheses--;
+        if (depth === 0 && masked[i] === '[') squareBrackets++;
+        if (depth === 0 && masked[i] === ']') squareBrackets--;
+        if (depth === 0 && (parentheses > 0 || squareBrackets > 0)) continue;
+        if (depth === 0 && (masked[i] === ';' || masked[i] === '}')) boundary = i + 1;
+        if (masked[i] === '{') {
+            if (depth === 0) {
+                opening = i;
+                start = boundary;
+                const prefix = source.slice(start, i);
+                const declaration = /(?:^|\n)([ \t]*(?:(?:export|default|async|public|private|protected|static|abstract)\s+)*(?:function\b|class\b|interface\b|enum\b|namespace\b|(?:const|let|var)\b|[A-Za-z_$][\w$]*\s*\())/g;
+                let match;
+                while(match = declaration.exec(prefix))start = boundary + match.index + (match[0].startsWith('\n') ? 1 : 0);
+                while(start < i && /\s/.test(source[start]))start++;
+                const lineStart = source.lastIndexOf('\n', start - 1) + 1;
+                if (lineStart >= boundary && /^[ \t]*$/.test(source.slice(lineStart, start))) start = lineStart;
             }
-            if (!inBacktick && ch === '/' && next === '*') {
-                inBlockComment = true;
-                ci++;
-                continue;
-            }
-            if (!inBacktick && ch === '/' && next === '/') break;
-            if (!inBacktick && (ch === '"' || ch === "'")) {
-                const quote = ch;
-                ci++;
-                while(ci < line.length){
-                    if (line[ci] === '\\') {
-                        ci += 2;
-                        continue;
-                    }
-                    if (line[ci] === quote) break;
-                    ci++;
-                }
-                continue;
-            }
-            if (ch === '`') {
-                if (!inBacktick) {
-                    inBacktick = true;
-                    if (depth === 0) blockStartLine = li;
-                } else {
-                    inBacktick = false;
-                    if (depth === 0 && li > blockStartLine) {
-                        const sliceText = subLines.slice(blockStartLine, li + 1).map((x)=>x.text).join('');
-                        const det = spec.strings.embeddedDetectors?.find((d)=>d.pattern.test(sliceText));
-                        intervals.push({
-                            startLine: blockStartLine,
-                            endLine: li,
-                            kind: 'embedded_string',
-                            embeddedGrammar: det?.targetGrammar
-                        });
-                        blockStartLine = li + 1;
-                    }
-                }
-                continue;
-            }
-            if (!inBacktick) {
-                if (ch === '{') {
-                    if (depth === 0) blockStartLine = li;
-                    depth++;
-                } else if (ch === '}') {
-                    depth = Math.max(0, depth - 1);
-                    if (depth === 0 && li >= blockStartLine) {
-                        intervals.push({
-                            startLine: blockStartLine,
-                            endLine: li,
-                            kind: 'block'
-                        });
-                        blockStartLine = li + 1;
-                        embeddedLang = undefined;
-                    }
-                }
+            depth++;
+        } else if (masked[i] === '}' && depth > 0) {
+            depth--;
+            if (depth === 0) {
+                let end = i + 1;
+                if (source[end] === ';') end++;
+                const tail = /^[ \t]*(?:\r?\n|$)/.exec(source.slice(end));
+                if (tail) end += tail[0].length;
+                intervals.push({
+                    byteStart: atByte(start),
+                    byteEnd: atByte(end),
+                    headerEnd: atByte(opening + 1),
+                    kind: 'block'
+                });
+                boundary = end;
             }
         }
     }
+    for (const match of masked.matchAll(/(?:^|[;\n])[ \t]*(?:(?:export|default)\s+)*(?:const|let|var)\s+([A-Za-z_$][\w$]*)[^;\n]*?=>/g)){
+        let begin = match.index;
+        if (masked[begin] === ';' || masked[begin] === '\n') begin++;
+        const headerEnd = match.index + match[0].length;
+        if (intervals.some((iv)=>atByte(begin) >= iv.byteStart && atByte(begin) < iv.byteEnd)) continue;
+        let end = headerEnd;
+        let nesting = 0;
+        for(; end < masked.length; end++){
+            const ch = masked[end];
+            if ('([{'.includes(ch)) nesting++;
+            if (')]}'.includes(ch)) nesting--;
+            if (nesting === 0 && (ch === ';' || ch === '\n')) {
+                end++;
+                break;
+            }
+        }
+        const byteStart = atByte(begin), byteEnd = atByte(end);
+        if (intervals.some((iv)=>byteStart < iv.byteEnd && byteEnd > iv.byteStart)) continue;
+        intervals.push({
+            byteStart,
+            byteEnd,
+            headerEnd: atByte(headerEnd),
+            kind: 'block'
+        });
+    }
+    for (const match of source.matchAll(/`(?:\\[\s\S]|[^`\\])*`/g)){
+        const begin = atByte(match.index);
+        const end = atByte(match.index + match[0].length);
+        if (intervals.some((iv)=>begin >= iv.byteStart && end <= iv.byteEnd)) continue;
+        const det = spec.strings.embeddedDetectors?.find((d)=>d.pattern.test(match[0]));
+        if (!det && !match[0].includes('\n')) continue;
+        const lineStart = source.lastIndexOf('\n', match.index - 1) + 1;
+        let charEnd = match.index + match[0].length;
+        const tail = /^[; \t]*(?:\r?\n|$)/.exec(source.slice(charEnd));
+        if (tail) charEnd += tail[0].length;
+        const priorEnd = intervals.reduce((end, iv)=>iv.byteEnd <= begin ? Math.max(end, iv.byteEnd) : end, parent.byteStart);
+        const byteStart = Math.max(atByte(lineStart), priorEnd);
+        const byteEnd = atByte(charEnd);
+        if (intervals.some((iv)=>byteStart < iv.byteEnd && byteEnd > iv.byteStart)) continue;
+        intervals.push({
+            byteStart,
+            byteEnd,
+            headerEnd: begin + 1,
+            kind: 'embedded_string',
+            embeddedGrammar: det?.targetGrammar
+        });
+    }
+    intervals.sort((a, b)=>a.byteStart - b.byteStart);
     if (intervals.length === 0) {
         return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
     }
     const rawSegments = [];
     let cursorByte = parent.byteStart;
     for (const iv of intervals){
-        const sigLineIdx = iv.startLine > 0 && subLines[iv.startLine - 1].byteStart >= cursorByte ? iv.startLine - 1 : iv.startLine;
-        const segStart = Math.max(cursorByte, subLines[sigLineIdx].byteStart);
-        const segEnd = subLines[iv.endLine].byteEnd;
+        if (iv.byteStart < cursorByte || iv.byteStart < parent.byteStart || iv.byteEnd > parent.byteEnd || iv.headerEnd < iv.byteStart || iv.headerEnd > iv.byteEnd) continue;
+        const segStart = iv.byteStart;
+        const segEnd = iv.byteEnd;
         if (segEnd <= segStart) continue;
         if (segStart > cursorByte) {
             rawSegments.push({
@@ -695,6 +740,7 @@ function decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockByt
             byteStart: segStart,
             byteEnd: segEnd,
             kind: iv.kind,
+            headerEnd: iv.headerEnd,
             headerText: bytes.subarray(segStart, Math.min(segEnd, segStart + 320)).toString('utf8'),
             embeddedGrammar: iv.embeddedGrammar
         });
@@ -708,33 +754,6 @@ function decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockByt
             headerText: bytes.subarray(cursorByte, Math.min(parent.byteEnd, cursorByte + 256)).toString('utf8')
         });
     }
-    if (rawSegments.length === 1 && subLines.length > 4 && parent.byteEnd - parent.byteStart > maxBlockBytes) {
-        const firstLine = subLines[0];
-        const lastLine = subLines[subLines.length - 1];
-        const headerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::header`, `${parent.symbolPath}::header`, 'statement', parent.depth + 1, firstLine.byteStart, firstLine.byteEnd, parent.nodeId);
-        const bodyDummy = makeNode(bytes, parent.grammarId, `${parent.symbolName}::body`, `${parent.symbolPath}`, 'block', parent.depth, firstLine.byteEnd, lastLine.byteStart, parent.nodeId);
-        const bodyChildren = decomposeBraceAndStringLanguage(bytes, lines, bodyDummy, spec, maxBlockBytes);
-        const footerNode = makeNode(bytes, parent.grammarId, `${parent.symbolName}::footer`, `${parent.symbolPath}::footer`, 'statement', parent.depth + 1, lastLine.byteStart, lastLine.byteEnd, parent.nodeId);
-        const midNodes = bodyChildren.length ? bodyChildren.map((c)=>({
-                ...c,
-                parentId: parent.nodeId,
-                depth: parent.depth + 1
-            })) : partitionIntoContiguousParts(bytes, lines, bodyDummy, maxBlockBytes).map((c)=>({
-                ...c,
-                parentId: parent.nodeId,
-                depth: parent.depth + 1
-            }));
-        return [
-            headerNode,
-            ...midNodes.length ? midNodes : [
-                {
-                    ...bodyDummy,
-                    depth: parent.depth + 1
-                }
-            ],
-            footerNode
-        ];
-    }
     const children = [];
     const usedNames = new Map();
     for(let i = 0; i < rawSegments.length; i++){
@@ -746,12 +765,27 @@ function decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockByt
         const symPath = `${parent.symbolPath}::${sym}`;
         const childGrammar = seg.embeddedGrammar ?? parent.grammarId;
         const node = makeNode(bytes, childGrammar, sym, symPath, seg.kind, parent.depth + 1, seg.byteStart, seg.byteEnd, parent.nodeId);
-        if (seg.embeddedGrammar && REGISTRY.has(seg.embeddedGrammar) && (node.byteStart > parent.byteStart || node.byteEnd < parent.byteEnd || node.grammarId !== parent.grammarId)) {
+        if (seg.headerEnd !== undefined) {
+            node.headerByteStart = seg.byteStart;
+            node.headerByteEnd = seg.headerEnd;
+        }
+        if (seg.embeddedGrammar && REGISTRY.has(seg.embeddedGrammar)) {
             node.children = decomposeByGrammar(bytes, lines, node, REGISTRY.get(seg.embeddedGrammar), maxBlockBytes);
-        } else if ((node.byteEnd - node.byteStart > maxBlockBytes || node.kind === 'block' && subLines.length > 4) && (node.byteStart > parent.byteStart || node.byteEnd < parent.byteEnd)) {
-            node.children = decomposeBraceAndStringLanguage(bytes, lines, node, spec, maxBlockBytes);
-            if (node.children.length === 0 && node.byteEnd - node.byteStart > maxBlockBytes) {
-                node.children = partitionIntoContiguousParts(bytes, lines, node, maxBlockBytes);
+        } else if (seg.kind === 'block' && seg.headerEnd !== undefined && bytes[seg.headerEnd - 1] === 0x7b) {
+            const closing = bytes.lastIndexOf(0x7d, seg.byteEnd - 1);
+            if (closing > seg.headerEnd) {
+                const body = makeNode(bytes, spec.id, `${sym}::body`, symPath, 'block', node.depth, seg.headerEnd, closing, node.nodeId);
+                const nested = decomposeBraceAndStringLanguage(bytes, lines, body, spec, maxBlockBytes);
+                if (nested.length && (nested.some((n)=>n.kind === 'block' || n.kind === 'embedded_string') || node.byteEnd - node.byteStart > maxBlockBytes)) {
+                    node.children = [
+                        makeNode(bytes, spec.id, `${sym}::header`, `${symPath}::header`, 'statement', node.depth + 1, seg.byteStart, seg.headerEnd, node.nodeId),
+                        ...nested.map((n)=>({
+                                ...n,
+                                parentId: node.nodeId
+                            })),
+                        makeNode(bytes, spec.id, `${sym}::footer`, `${symPath}::footer`, 'statement', node.depth + 1, closing, seg.byteEnd, node.nodeId)
+                    ];
+                }
             }
         }
         children.push(node);
@@ -760,7 +794,7 @@ function decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockByt
 }
 function decomposeByGrammar(bytes, lines, parent, spec, maxBlockBytes) {
     const subLines = lines.filter((l)=>l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
-    if (subLines.length <= 1) return [];
+    if (subLines.length === 0) return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
     if (spec.blocks.sectionHierarchy?.length) {
         for (const levelSpec of spec.blocks.sectionHierarchy){
             const hits = [];
@@ -953,105 +987,86 @@ function decomposeByGrammar(bytes, lines, parent, spec, maxBlockBytes) {
         }
     }
     if (spec.blocks.indentationScoped) {
-        const stripLineNum = (line)=>line.replace(/^\s*\d+\s?(?=[A-Za-z_#@"' \t]|$)/, '');
-        const isCommentOrHeader = (line)=>{
-            const s = stripLineNum(line).trimStart();
-            return !s || s.startsWith('//') || isLineComment(s, spec);
-        };
-        const getIndent = (line)=>{
-            const stripped = stripLineNum(line);
-            const m = /^([ \t]*)\S/.exec(stripped);
-            if (!m) return -1;
-            return m[1].replace(/\t/g, '    ').length;
-        };
-        const isPyBlockHeader = (line)=>{
-            const stripped = stripLineNum(line);
-            return /^[ \t]*(?:async\s+def|def|class)\s+[A-Za-z_][\w]*\b/.test(stripped);
-        };
-        const headerCandidates = [];
-        for(let i = 0; i < subLines.length; i++){
-            if (isCommentOrHeader(subLines[i].text)) continue;
-            if (isPyBlockHeader(subLines[i].text)) {
-                headerCandidates.push({
-                    idx: i,
-                    indent: getIndent(subLines[i].text)
-                });
-            }
-        }
-        const baseIndent = headerCandidates.reduce((min, h)=>h.indent >= 0 && h.indent < min ? h.indent : min, Infinity);
-        if (Number.isFinite(baseIndent)) {
-            const headerIdxs = headerCandidates.filter((h)=>h.indent === baseIndent).map((h)=>h.idx);
-            if (headerIdxs.length >= 2 || headerIdxs.length === 1 && headerIdxs[0] > 0) {
-                const nodes = [];
-                let cursor = parent.byteStart;
-                for(let h = 0; h < headerIdxs.length; h++){
-                    const startIdx = headerIdxs[h];
-                    let decIdx = startIdx;
-                    while(decIdx > (h > 0 ? headerIdxs[h - 1] + 1 : 0)){
-                        const prev = stripLineNum(subLines[decIdx - 1].text).trim();
-                        if (prev.startsWith('@')) decIdx--;
-                        else break;
-                    }
-                    const nextHeaderIdx = h + 1 < headerIdxs.length ? headerIdxs[h + 1] : subLines.length;
-                    let limitIdx = nextHeaderIdx;
-                    if (h + 1 < headerIdxs.length) {
-                        while(limitIdx > startIdx + 1 && stripLineNum(subLines[limitIdx - 1].text).trim().startsWith('@')){
-                            limitIdx--;
-                        }
-                    }
-                    let endIdx = limitIdx - 1;
-                    for(let j = startIdx + 1; j < limitIdx; j++){
-                        if (isCommentOrHeader(subLines[j].text)) continue;
-                        const ind = getIndent(subLines[j].text);
-                        const trimmed = stripLineNum(subLines[j].text).trim();
-                        if (ind >= 0 && ind < baseIndent && !/^[)\]}'"]/.test(trimmed)) {
-                            endIdx = j - 1;
-                            break;
-                        }
-                    }
-                    const s = subLines[decIdx].byteStart;
-                    const e = subLines[endIdx].byteEnd;
-                    if (s > cursor) {
-                        nodes.push(makeNode(bytes, spec.id, `module-preamble-${nodes.length + 1}`, `${parent.symbolPath}::module-preamble-${nodes.length + 1}`, 'statement', parent.depth + 1, cursor, s, parent.nodeId));
-                    }
-                    const sym = inferSymbolName(stripLineNum(subLines[startIdx].text), `block-${nodes.length + 1}`);
-                    const n = makeNode(bytes, spec.id, sym, `${parent.symbolPath}::${sym}`, 'block', parent.depth + 1, s, e, parent.nodeId);
-                    if (endIdx - startIdx >= 3 && (n.byteStart > parent.byteStart || n.byteEnd < parent.byteEnd)) {
-                        const firstLine = subLines[startIdx];
-                        const headerEnd = firstLine.byteEnd;
-                        if (headerEnd < e) {
-                            const headerNode = makeNode(bytes, spec.id, `${sym}::header`, `${n.symbolPath}::header`, 'statement', n.depth + 1, s, headerEnd, n.nodeId);
-                            const bodyDummy = makeNode(bytes, spec.id, `${sym}::body`, n.symbolPath, 'block', n.depth, headerEnd, e, n.nodeId);
-                            const bodyChildren = decomposeByGrammar(bytes, lines, bodyDummy, spec, maxBlockBytes).map((c)=>({
-                                    ...c,
-                                    parentId: n.nodeId,
-                                    depth: n.depth + 1
-                                }));
-                            if (bodyChildren.length > 0) {
-                                n.children = [
-                                    headerNode,
-                                    ...bodyChildren
-                                ];
-                            }
-                        }
-                    }
-                    if (n.children.length === 0 && n.byteEnd - n.byteStart > maxBlockBytes) {
-                        n.children = partitionIntoContiguousParts(bytes, lines, n, maxBlockBytes);
-                    }
-                    nodes.push(n);
-                    cursor = e;
-                }
-                if (cursor < parent.byteEnd) {
-                    nodes.push(makeNode(bytes, spec.id, 'module-epilogue', `${parent.symbolPath}::module-epilogue`, 'statement', parent.depth + 1, cursor, parent.byteEnd, parent.nodeId));
-                }
-                return nodes;
-            }
-        }
+        return decomposePythonDefinitions(bytes, lines, parent, spec, maxBlockBytes);
     }
     if (spec.blocks.brackets?.length) {
         return decomposeBraceAndStringLanguage(bytes, lines, parent, spec, maxBlockBytes);
     }
     return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
+}
+function maskCode(text, python = false) {
+    return text.replace(python ? /("""[\s\S]*?(?:"""|$)|\x27\x27\x27[\s\S]*?(?:\x27\x27\x27|$)|"(?:\\[\s\S]|[^"\\])*"|\x27(?:\\[\s\S]|[^\x27\\])*\x27|#[^\n]*)/g : /("(?:\\[\s\S]|[^"\\])*"|\x27(?:\\[\s\S]|[^\x27\\])*\x27|`(?:\\[\s\S]|[^`\\])*`|\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\n]*)/g, (match)=>match.replace(/[^\n\r]/g, ' '));
+}
+function decomposePythonDefinitions(bytes, lines, parent, spec, maxBlockBytes) {
+    const local = lines.filter((l)=>l.byteStart >= parent.byteStart && l.byteEnd <= parent.byteEnd);
+    const masked = maskCode(bytes.subarray(parent.byteStart, parent.byteEnd).toString('utf8'), true).split(/(?<=\n)/u);
+    const indent = (s)=>/^[ \t]*/.exec(s)[0].replace(/\t/g, '        ').length;
+    const candidates = [];
+    for(let i = 0; i < local.length; i++){
+        const m = /^[ \t]*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b/.exec(masked[i] ?? '');
+        if (!m) continue;
+        let level = 0;
+        let headerEnd = local[i].byteEnd;
+        let found = false;
+        for(let j = i; j < local.length && !found; j++){
+            for(let k = 0; k < (masked[j] ?? '').length; k++){
+                const ch = masked[j][k];
+                if ('([{'.includes(ch)) level++;
+                if (')]}'.includes(ch)) level--;
+                if (ch === ':' && level === 0) {
+                    headerEnd = local[j].byteStart + Buffer.byteLength(local[j].text.slice(0, k + 1));
+                    found = true;
+                    break;
+                }
+            }
+        }
+        candidates.push({
+            index: i,
+            indent: indent(masked[i]),
+            name: m[1],
+            headerEnd
+        });
+    }
+    if (!candidates.length) return partitionIntoContiguousParts(bytes, lines, parent, maxBlockBytes);
+    const minimum = Math.min(...candidates.map((c)=>c.indent));
+    const heads = candidates.filter((c)=>c.indent === minimum);
+    const nodes = [];
+    let cursor = parent.byteStart;
+    for (const head of heads){
+        let first = head.index;
+        while(first > 0 && /^[ \t]*@/.test(masked[first - 1] ?? '') && indent(masked[first - 1]) === minimum)first--;
+        let last = head.index;
+        while(last + 1 < local.length && local[last].byteEnd <= head.headerEnd)last++;
+        while(last + 1 < local.length){
+            const next = masked[last + 1] ?? '';
+            if (next.trim() && indent(next) <= minimum) break;
+            last++;
+        }
+        while(last > head.index && !(masked[last] ?? '').trim())last--;
+        const start = local[first].byteStart;
+        const end = local[last].byteEnd;
+        if (start < cursor) continue;
+        if (start > cursor) nodes.push(makeNode(bytes, spec.id, `gap-${nodes.length + 1}`, `${parent.symbolPath}::gap-${nodes.length + 1}`, 'statement', parent.depth + 1, cursor, start, parent.nodeId));
+        const n = makeNode(bytes, spec.id, head.name, `${parent.symbolPath}::${head.name}`, 'block', parent.depth + 1, start, end, parent.nodeId);
+        n.headerByteStart = start;
+        n.headerByteEnd = head.headerEnd;
+        const bodyStart = local.find((l)=>l.byteStart >= head.headerEnd)?.byteStart ?? end;
+        if (bodyStart < end && candidates.some((c)=>local[c.index].byteStart >= bodyStart && local[c.index].byteStart < end && c.indent > minimum)) {
+            const header = makeNode(bytes, spec.id, `${head.name}::header`, `${n.symbolPath}::header`, 'statement', n.depth + 1, start, bodyStart, n.nodeId);
+            const body = makeNode(bytes, spec.id, `${head.name}::body`, n.symbolPath, 'block', n.depth, bodyStart, end, n.nodeId);
+            n.children = [
+                header,
+                ...decomposePythonDefinitions(bytes, lines, body, spec, maxBlockBytes).map((child)=>({
+                        ...child,
+                        parentId: n.nodeId
+                    }))
+            ];
+        }
+        nodes.push(n);
+        cursor = end;
+    }
+    if (cursor < parent.byteEnd) nodes.push(makeNode(bytes, spec.id, 'trailing', `${parent.symbolPath}::trailing`, 'statement', parent.depth + 1, cursor, parent.byteEnd, parent.nodeId));
+    return nodes;
 }
 export function verifyPartitionConservation(bytes, node) {
     const actualSha = sha256(bytes.subarray(node.byteStart, node.byteEnd));
@@ -1073,15 +1088,39 @@ export function verifyPartitionConservation(bytes, node) {
 export function decomposeCodeSource(textOrBytes, options = {}) {
     const bytes = Buffer.isBuffer(textOrBytes) ? textOrBytes : Buffer.from(textOrBytes, 'utf8');
     const maxBlockBytes = options.maxBlockBytes ?? 4096;
+    if (!Number.isSafeInteger(maxBlockBytes) || maxBlockBytes <= 0) {
+        throw new RangeError('maxBlockBytes must be a positive safe integer');
+    }
     const spec = (options.grammarId ? getLanguageGrammar(options.grammarId) : undefined) ?? (options.originKey ? getLanguageGrammar(options.originKey) : undefined) ?? getLanguageGrammar('typescript');
     const lines = splitLinesWithByteBounds(bytes);
     const rootName = options.originKey ?? spec.id;
     const root = makeNode(bytes, spec.id, rootName, rootName, 'root', 0, 0, bytes.length, null);
     root.children = decomposeByGrammar(bytes, lines, root, spec, maxBlockBytes);
     const flatNodes = [];
+    const lineAt = (offset)=>{
+        let lo = 0, hi = lines.length;
+        while(lo < hi){
+            const mid = lo + hi >>> 1;
+            if (lines[mid].byteStart <= offset) lo = mid + 1;
+            else hi = mid;
+        }
+        return Math.max(1, lo);
+    };
     const walk = (n)=>{
+        n.startLine = lineAt(n.byteStart);
+        n.endLine = lineAt(Math.max(n.byteStart, n.byteEnd - 1));
+        n.subTokens = splitIdentifierSubTokens(n.symbolName);
+        if ((n.kind === 'block' || n.kind === 'section') && n.headerByteStart === undefined) {
+            n.headerByteStart = n.byteStart;
+            n.headerByteEnd = Math.min(n.byteEnd, lines[n.startLine - 1]?.byteEnd ?? n.byteEnd);
+        }
+        if (n.children.length === 0 && n.kind !== 'part') n.children = partitionIntoContiguousParts(bytes, lines, n, maxBlockBytes);
         flatNodes.push(n);
-        for (const c of n.children)walk(c);
+        for (const c of n.children){
+            c.parentId = n.nodeId;
+            c.depth = n.depth + 1;
+            walk(c);
+        }
     };
     walk(root);
     const partitionVerified = verifyPartitionConservation(bytes, root);
@@ -1096,6 +1135,485 @@ export function decomposeCodeSource(textOrBytes, options = {}) {
         root,
         flatNodes
     };
+}
+const BLIND_CODE_STOP = new Set([
+    'this',
+    'that',
+    'with',
+    'from',
+    'have',
+    'when',
+    'what',
+    'which',
+    'where',
+    'should',
+    'would',
+    'could',
+    'there',
+    'their',
+    'about',
+    'after',
+    'before',
+    'return',
+    'import',
+    'class',
+    'function',
+    'Following',
+    'following',
+    'Python',
+    'python',
+    'django',
+    'astropy',
+    'True',
+    'False',
+    'None',
+    'self',
+    'the',
+    'and',
+    'for',
+    'not',
+    'are',
+    'but',
+    'can',
+    'all',
+    'one',
+    'new',
+    'use',
+    'set',
+    'get',
+    'Official',
+    'LongBench',
+    'Code',
+    'Repository',
+    'Options',
+    'Reply',
+    'first',
+    'line',
+    'FINAL_CHOICE',
+    'followed',
+    'sentence',
+    'justification',
+    'citing',
+    'available',
+    'does',
+    'code',
+    'project',
+    'correctly',
+    'statement',
+    'method',
+    'value',
+    'using',
+    'used',
+    'Description',
+    'Current',
+    'Behaviour',
+    'Behavior',
+    'Expected',
+    'However',
+    'When',
+    'There',
+    'Here',
+    'Looking',
+    'other',
+    'methods',
+    'issue',
+    'issues',
+    'problem',
+    'problems',
+    'error',
+    'errors',
+    'message',
+    'messages',
+    'example',
+    'examples',
+    'should',
+    'could',
+    'would',
+    'result',
+    'results',
+    'instead',
+    'default',
+    'something',
+    'another',
+    'because',
+    'provide',
+    'created',
+    'called',
+    'against',
+    'several'
+]);
+export function rankRepositoryAstBlocksBlind(files, query, options = {}) {
+    const maxFiles = options.maxFilesToDecompose ?? 8;
+    const maxBlockBytes = options.maxBlockBytes ?? 2600;
+    const maxTotalChars = options.maxTotalChars ?? 22000;
+    const rawMatches = query.match(/[A-Za-z_][A-Za-z0-9_.]*/g) ?? [];
+    const expandedTokens = [];
+    for (const tok of rawMatches){
+        expandedTokens.push(tok);
+        if (tok.includes('.')) {
+            for (const part of tok.split('.')){
+                if (part.length >= 3) expandedTokens.push(part);
+            }
+        }
+        for (const numMatch of tok.matchAll(/\d{3,}/g)){
+            expandedTokens.push(numMatch[0]);
+        }
+    }
+    const definedSymbols = new Set();
+    for (const f of files){
+        for (const m of f.text.matchAll(/\b(?:def|class|function|interface|enum|type|const|let|var|fn|func)\s+([A-Za-z_$][\w$]*)/g))definedSymbols.add(m[1]);
+        for (const m of f.text.matchAll(/^[ \t]*(?:(?:public|private|protected|static|async)\s+)*([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?::[^{}]+)?\{/gm))definedSymbols.add(m[1]);
+    }
+    const isDefinedSymbol = (token)=>definedSymbols.has(token);
+    const queryIds = [
+        ...new Set(expandedTokens.filter((tok)=>isDefinedSymbol(tok) || !BLIND_CODE_STOP.has(tok) && (hasTechnicalIdentifierFormatting(tok) || tok.length >= 4)))
+    ];
+    const unusedImports = new Set();
+    const usedImports = new Set();
+    const importModuleBySymbol = new Map();
+    if (options.importStatement) {
+        const normalizedImports = options.importStatement.replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner)=>inner.replace(/\s*\n\s*/g, ' '));
+        for (const line of normalizedImports.split('\n')){
+            const mFrom = /from\s+([\w.]+)\s+import\s+(.+)/.exec(line);
+            const mImp = !mFrom ? /^\s*import\s+(.+)/.exec(line) : null;
+            const modName = mFrom ? mFrom[1] : 'global_import';
+            const rhs = mFrom ? mFrom[2] : mImp ? mImp[1] : '';
+            if (rhs) {
+                for (const part of rhs.split(',')){
+                    const clean = part.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+                    if (clean && /^[A-Za-z_]\w+$/.test(clean)) {
+                        importModuleBySymbol.set(clean, modName);
+                        if (options.cursorContext && !options.cursorContext.includes(clean)) unusedImports.add(clean);
+                        else usedImports.add(clean);
+                    }
+                }
+            }
+        }
+    }
+    const cursorTailWords = new Set();
+    if (options.cursorContext) {
+        const tailLines = options.cursorContext.trim().split('\n').slice(-6).join('\n');
+        for (const m of tailLines.match(/[A-Za-z0-9_]{3,}/g) ?? []){
+            for (const sub of [
+                m.toLowerCase(),
+                ...splitIdentifierSubTokens(m)
+            ]){
+                if (sub.length >= 3 && !BLIND_CODE_STOP.has(sub)) cursorTailWords.add(sub);
+            }
+        }
+    }
+    const df = new Map();
+    for (const id of queryIds){
+        let count = 0;
+        for (const f of files){
+            if (f.text.includes(id) || f.path.includes(id)) count++;
+        }
+        if (count >= 1) df.set(id, count);
+    }
+    const phraseClues = [];
+    for (const m of query.matchAll(/\b([a-z]{3,}\s+[a-z]{3,}(?:,?\s+[a-z]{3,}){0,2})\b/g)){
+        const phrase = m[1].trim();
+        const words = phrase.split(/[\s,]+/);
+        if (phrase.length >= 10 && words.every((w)=>!BLIND_CODE_STOP.has(w))) {
+            let c = 0;
+            for (const f of files)if (f.text.includes(`"${phrase}`) || f.text.includes(` ${phrase}`) || f.text.includes(`${phrase}:`) || f.text.includes(`${phrase},`)) c++;
+            if (c === 1) phraseClues.push(phrase);
+        }
+    }
+    const fileHeaderImports = new Map();
+    for (const f of files){
+        const headerSlice = f.text.slice(0, 2400).replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner)=>inner.replace(/\s*\n\s*/g, ' '));
+        const syms = new Set();
+        for (const line of headerSlice.split('\n')){
+            const mFrom = /from\s+[\w.]+\s+import\s+(.+)/.exec(line);
+            if (mFrom) {
+                for (const p of mFrom[1].split(',')){
+                    const clean = p.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+                    if (clean && /^[A-Za-z_]\w{2,}$/.test(clean)) syms.add(clean);
+                }
+            }
+        }
+        fileHeaderImports.set(f.path, syms);
+    }
+    const codeSymbolCache = new Map();
+    const isCodeSymbol = (id)=>{
+        const cached = codeSymbolCache.get(id);
+        if (cached !== undefined) return cached;
+        const val = isDefinedSymbol(id) || /[_0-9]/.test(id) || /[A-Z]/.test(id) && /[a-z]/.test(id) && !/^[A-Z][a-z]+$/.test(id) || files.some((f)=>f.path.toLowerCase().includes(id.toLowerCase()) || f.text.includes(`def ${id}`) || f.text.includes(`class ${id}`) || f.text.includes(`.${id}`));
+        codeSymbolCache.set(id, val);
+        return val;
+    };
+    const rareQueryClues = [
+        ...df.entries()
+    ].filter(([id, c])=>c <= Math.max(2, Math.floor(files.length / 2)) && isCodeSymbol(id)).map(([id])=>id);
+    const fileRareClues = new Map();
+    let maxFileRareCount = 0;
+    for (const f of files){
+        const matched = rareQueryClues.filter((id)=>f.text.includes(id) || f.path.toLowerCase().includes(id.toLowerCase()));
+        fileRareClues.set(f.path, matched);
+        if (matched.length > maxFileRareCount) maxFileRareCount = matched.length;
+    }
+    const scoredFiles = files.map((f, fIdx)=>{
+        let score = fIdx === 0 ? 40 : fIdx === 1 ? 20 : 0;
+        for (const [id, c] of df.entries()){
+            const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
+            const symMult = isCodeSymbol(id) ? 2 : 1;
+            if (f.path.toLowerCase().includes(id.toLowerCase())) score += idf * 8 * symMult;
+            if (f.text.includes(id)) score += idf * 2 * symMult;
+        }
+        for (const ph of phraseClues){
+            if (f.text.includes(ph)) score += 600;
+        }
+        const fRare = fileRareClues.get(f.path) ?? [];
+        if (fRare.length >= 2) {
+            score += fRare.length * fRare.length * 55;
+            if (fRare.length === maxFileRareCount) score += 300;
+        }
+        for (const sym of unusedImports)if (f.text.includes(sym)) score += 500;
+        for (const sym of usedImports)if (f.text.includes(sym)) score += 100;
+        return {
+            ...f,
+            score
+        };
+    }).sort((a, b)=>b.score - a.score);
+    const candidateBlocks = [];
+    let allPartitionsVerified = true;
+    const topRankedFiles = scoredFiles.slice(0, maxFiles);
+    const orientationCandidate = scoredFiles.find((f)=>!topRankedFiles.includes(f) && (/(?:^|\/)(?:readme|architecture|overview|docs?\/)/i.test(f.path) || /\.(?:md|rst)$/i.test(f.path)));
+    if (orientationCandidate && topRankedFiles.length < maxFiles + 1) {
+        topRankedFiles.push(orientationCandidate);
+    }
+    for(let fRank = 0; fRank < topRankedFiles.length; fRank++){
+        const f = topRankedFiles[fRank];
+        const fRare = fileRareClues.get(f.path) ?? [];
+        const fMissingRare = rareQueryClues.filter((c)=>!fRare.includes(c)).slice(0, 4);
+        const fImports = [
+            ...fileHeaderImports.get(f.path) ?? []
+        ];
+        const relevantImports = fImports.filter((s)=>queryIds.includes(s) || /[A-Z]/.test(s)).slice(0, 8);
+        const fileTriangulationNote = fRare.length >= 2 ? `[BRIDGES: ${fRare.slice(0, 4).join(',')}]` : '';
+        const tree = decomposeCodeSource(f.text, {
+            originKey: f.path,
+            maxBlockBytes
+        });
+        if (!tree.partitionVerified) allPartitionsVerified = false;
+        const leaves = [];
+        const selectUnits = (node)=>{
+            const size = node.byteEnd - node.byteStart;
+            if ((node.kind === 'block' || node.kind === 'embedded_string' || node.kind === 'section') && size <= maxBlockBytes) {
+                if (size > 0) leaves.push(node);
+            } else if (node.children.length) {
+                for (const child of node.children)selectUnits(child);
+            } else if (size > 0) leaves.push(node);
+        };
+        selectUnits(tree.root);
+        const buf = Buffer.from(f.text, 'utf8');
+        for (const node of leaves){
+            const txt = buf.subarray(node.byteStart, node.byteEnd).toString('utf8');
+            let bScore = Math.max(1, (maxFiles - fRank) * 6);
+            const matchedClues = new Set();
+            const leafName = node.symbolName.replace(/#part-\d+$|::header$|::footer$/, '');
+            for (const [id, c] of df.entries()){
+                const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
+                const symMult = isCodeSymbol(id) ? 2 : 1;
+                if (node.symbolPath.toLowerCase().includes(id.toLowerCase())) {
+                    bScore += idf * 10 * symMult;
+                    if (isCodeSymbol(id)) matchedClues.add(id);
+                }
+                if (txt.includes(id)) {
+                    bScore += idf * 3 * symMult;
+                    if (isCodeSymbol(id)) matchedClues.add(id);
+                }
+            }
+            for (const ph of phraseClues){
+                if (txt.includes(ph)) {
+                    bScore += 1800;
+                    matchedClues.add(ph);
+                }
+            }
+            for (const impSym of relevantImports){
+                if (txt.includes(impSym)) {
+                    bScore += 60;
+                    matchedClues.add(impSym);
+                }
+            }
+            if (fRare.length >= 2 && matchedClues.size >= 1) {
+                bScore += fRare.length * 45;
+            }
+            for (const sym of unusedImports){
+                const symSubTokens = splitIdentifierSubTokens(sym);
+                const modName = importModuleBySymbol.get(sym) ?? '';
+                const modSubTokens = splitIdentifierSubTokens(modName);
+                let cursorBonus = 0;
+                for (const sub of [
+                    ...symSubTokens,
+                    ...modSubTokens
+                ]){
+                    if (cursorTailWords.has(sub)) cursorBonus += 1800;
+                }
+                if (node.symbolPath.includes(sym)) bScore += 2000 + cursorBonus;
+                else if (txt.includes(sym)) bScore += 400 + Math.round(cursorBonus / 2);
+            }
+            for (const sym of usedImports){
+                const symSubTokens = splitIdentifierSubTokens(sym);
+                let cursorBonus = 0;
+                for (const sub of symSubTokens){
+                    if (cursorTailWords.has(sub)) cursorBonus += 750;
+                }
+                if (node.symbolPath.includes(sym)) bScore += 300 + cursorBonus;
+            }
+            if (bScore > 0) {
+                candidateBlocks.push({
+                    originKey: f.path,
+                    symbolPath: node.symbolPath,
+                    leafName,
+                    matchedClues,
+                    byteStart: node.byteStart,
+                    byteEnd: node.byteEnd,
+                    sha256: node.sha256,
+                    score: bScore,
+                    text: `// FILE: ${f.path} (${node.symbolPath}) ${fileTriangulationNote}\n${txt}`
+                });
+            }
+        }
+    }
+    const topSeeds = [
+        ...candidateBlocks
+    ].sort((a, b)=>b.score - a.score).slice(0, 10);
+    const seedSymbols = new Map();
+    for (const s of topSeeds){
+        if (s.leafName && s.leafName.length >= 4 && !s.leafName.startsWith('module-preamble')) {
+            const prev = seedSymbols.get(s.leafName) ?? new Set();
+            for (const c of s.matchedClues)prev.add(c);
+            seedSymbols.set(s.leafName, prev);
+        }
+    }
+    for (const b of candidateBlocks){
+        let callHopClues = new Set(b.matchedClues);
+        let callEdges = 0;
+        for (const [sym, symClues] of seedSymbols.entries()){
+            if (sym === b.leafName) continue;
+            if (b.text.includes(`${sym}(`) || b.text.includes(`.${sym}`)) {
+                callEdges++;
+                for (const c of symClues)callHopClues.add(c);
+            }
+        }
+        if (callEdges > 0 && callHopClues.size >= 2) {
+            b.score += callEdges * 90 * callHopClues.size;
+        }
+    }
+    const top3Blocks = [
+        ...candidateBlocks
+    ].sort((a, b)=>b.score - a.score).slice(0, 3);
+    const outgoingCalls = new Map();
+    for (const tb of top3Blocks){
+        for (const m of tb.text.matchAll(/\b([a-z_][a-z0-9_]{5,})\s*\(/g)){
+            const fn = m[1];
+            if (!BLIND_CODE_STOP.has(fn) && !outgoingCalls.has(fn)) outgoingCalls.set(fn, tb.originKey);
+        }
+    }
+    if (outgoingCalls.size > 0) {
+        for (const b of candidateBlocks){
+            const callerFile = outgoingCalls.get(b.leafName);
+            if (callerFile && callerFile !== b.originKey) {
+                b.score += 1400;
+                b.text = b.text.replace('\n', ` [CROSS-FILE CALLEE OF ${callerFile}: ${b.leafName}()]\n`);
+            }
+        }
+    }
+    candidateBlocks.sort((a, b)=>b.score - a.score);
+    const selected = [];
+    let chars = 0;
+    for (const b of candidateBlocks){
+        if (chars + b.text.length > maxTotalChars) break;
+        selected.push(b);
+        chars += b.text.length + 2;
+    }
+    selected.sort((a, b)=>{
+        const isOrientA = /(?:^|\/)(?:readme|architecture|overview|docs?\/)/i.test(a.originKey) ? 0 : 1;
+        const isOrientB = /(?:^|\/)(?:readme|architecture|overview|docs?\/)/i.test(b.originKey) ? 0 : 1;
+        if (isOrientA !== isOrientB) return isOrientA - isOrientB;
+        return a.score - b.score;
+    });
+    return {
+        blocks: selected,
+        allPartitionsVerified
+    };
+}
+export function splitCorpusStreamIntoFiles(rawText, options = {}) {
+    const bytes = Buffer.from(rawText, 'utf8');
+    const lines = splitLinesWithByteBounds(bytes);
+    const files = [];
+    const lineAt = (offset)=>{
+        let lo = 0, hi = lines.length;
+        while(lo < hi){
+            const mid = lo + hi >>> 1;
+            if (lines[mid].byteStart <= offset) lo = mid + 1;
+            else hi = mid;
+        }
+        return Math.max(1, lo);
+    };
+    const orientation = (path, text)=>{
+        const grammar = getLanguageGrammar(path);
+        if (grammar && grammar.id !== 'markdown') return false;
+        return /(?:^|\/)(?:readme|architecture|contributing|overview|changelog|docs?\/)/i.test(path) || /\.(?:md|markdown|rst|txt)$/i.test(path) || /^#{1,2}\s+\S/m.test(text.slice(0, 400));
+    };
+    const emit = (start, end, kind, path, provenance = 'inferred')=>{
+        if (end <= start) return;
+        const text = bytes.subarray(start, end).toString('utf8');
+        const label = path ?? options.defaultOriginKey ?? `corpus-segment-${files.length + 1}`;
+        files.push({
+            path: label,
+            ...provenance === 'inferred' ? {
+                inferredLabel: label
+            } : {
+                verifiedPath: label
+            },
+            pathProvenance: provenance,
+            segmentKind: kind,
+            text,
+            byteStart: start,
+            byteEnd: end,
+            startLine: lineAt(start),
+            endLine: lineAt(Math.max(start, end - 1)),
+            isOrientationDoc: orientation(label, text)
+        });
+    };
+    let fence;
+    let activePath;
+    let cursor = 0;
+    let hadMarker = false;
+    for (const line of lines){
+        const fenceMatch = /^\s{0,3}(`{3,}|~{3,})/.exec(line.text);
+        if (fenceMatch) {
+            if (!fence) fence = fenceMatch[1];
+            else if (fenceMatch[1][0] === fence[0] && fenceMatch[1].length >= fence.length) fence = undefined;
+            continue;
+        }
+        if (fence) continue;
+        const m = /^\[(start|end) of ([^\]\r\n]+)\][ \t]*(?:\r?\n)?$/.exec(line.text);
+        if (!m || m[1] === 'end' && m[2].trim() !== activePath) continue;
+        emit(cursor, line.byteStart, activePath ? 'file' : 'outside', activePath, activePath ? 'explicit-marker' : 'inferred');
+        const markerPath = m[2].trim();
+        emit(line.byteStart, line.byteEnd, 'marker', markerPath, 'explicit-marker');
+        activePath = m[1] === 'start' ? markerPath : undefined;
+        cursor = line.byteEnd;
+        hadMarker = true;
+    }
+    if (hadMarker) {
+        emit(cursor, bytes.length, activePath ? 'file' : 'outside', activePath, activePath ? 'explicit-marker' : 'inferred');
+        return files;
+    }
+    if (options.defaultOriginKey) {
+        emit(0, bytes.length, 'file', options.defaultOriginKey, 'caller');
+        return files;
+    }
+    const markdown = /^#{1,2}\s+\S/m.test(rawText.slice(0, 400));
+    const definition = /^(?:class|def|async\s+def)\s+([A-Za-z_]\w*)/m.exec(rawText);
+    const reference = /(?:declared in|defined in|available as|in file)\s+[`'"]?([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[a-zA-Z0-9]+)/i.exec(rawText);
+    const label = markdown ? 'corpus-document.md' : reference?.[1] ?? (definition ? `inferred_${definition[1]}.py` : 'corpus-stream');
+    emit(0, bytes.length, 'inferred', label);
+    return files;
 }
 
 

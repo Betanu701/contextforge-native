@@ -1,7 +1,7 @@
 import { ContextForgeStore, stableId, createStoreReadBudget } from './store.js';
 import { analyzeRecallQuery, scoreFacetCoverage } from './retrieval.js';
 import { estimateTokens } from './symbolic-ir.js';
-import { getLanguageGrammar, decomposeCodeSource } from './code-decomposer.js';
+import { structuralUnits, STRUCTURAL_BLOCK_BYTES, isOrientationDocument, boundedHeaderEnd } from './structure.js';
 export function renderExcerpts(excerpts) {
     const sorted = [
         ...excerpts
@@ -63,68 +63,9 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
                 i,
                 s: scoreFacetCoverage(recall, c.text).gain + recall.facets.filter((f)=>f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'number') && f.surface.length >= 2 && c.text.includes(f.surface)).length * 12 + (/\b(anomal\w*|exception|reject\w*|unchanged|only|no other|must not|never)\b/i.test(c.text) ? 3 : 0)
             })).sort((a, b)=>b.s - a.s || a.i - b.i);
-        const grammar = getLanguageGrammar(source.originKey);
-        if (grammar) {
-            const coveredWindowFacets = new Set();
-            let totalChars = chunks[0].text.length + (chunks.length > 1 ? chunks[chunks.length - 1].text.length : 0);
-            for (const { i, s } of ranked){
-                if (s <= 0) break;
-                const m = scoreFacetCoverage(recall, chunks[i].text).matchedFacetIds;
-                const addsNewFacet = m.some((f)=>!coveredWindowFacets.has(f));
-                if ((indexes.size < 36 || addsNewFacet) && totalChars < 4800) {
-                    for(let j = Math.max(0, i - 2); j <= Math.min(chunks.length - 1, i + 2); j++){
-                        if (!indexes.has(j) && totalChars + chunks[j].text.length <= 5200) {
-                            indexes.add(j);
-                            totalChars += chunks[j].text.length;
-                        }
-                    }
-                    m.forEach((f)=>coveredWindowFacets.add(f));
-                }
-            }
-            if (totalChars < 7200 && chunks.length > 1 && chunks[chunks.length - 1].byteEnd === Buffer.byteLength(full)) {
-                try {
-                    const tree = decomposeCodeSource(full, {
-                        originKey: source.originKey,
-                        grammarId: grammar.id,
-                        maxBlockBytes: 2400
-                    });
-                    const matchedByteOffsets = ranked.slice(0, 4).map((r)=>chunks[r.i].byteStart);
-                    for (const offset of matchedByteOffsets){
-                        const enclosing = tree.flatNodes.filter((n)=>n.depth >= 1 && n.byteStart <= offset && n.byteEnd > offset && n.byteEnd - n.byteStart <= 1600).sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart))[0];
-                        if (enclosing) {
-                            const blockIdxs = chunks.map((c, idx)=>({
-                                    c,
-                                    idx
-                                })).filter(({ c })=>c.byteStart >= enclosing.byteStart && c.byteEnd <= enclosing.byteEnd).map((x)=>x.idx);
-                            const addedChars = blockIdxs.filter((idx)=>!indexes.has(idx)).reduce((n, idx)=>n + chunks[idx].text.length, 0);
-                            if (addedChars > 0 && totalChars + addedChars <= 7500) {
-                                blockIdxs.forEach((idx)=>indexes.add(idx));
-                                totalChars += addedChars;
-                            }
-                        }
-                    }
-                    const candidateNodes = tree.flatNodes.filter((n)=>n.depth >= 1 && n.byteEnd - n.byteStart >= 32 && n.byteEnd - n.byteStart <= 3000).map((n)=>{
-                        const nodeText = Buffer.from(full).subarray(n.byteStart, n.byteEnd).toString('utf8');
-                        const pathBonus = recall.facets.filter((f)=>f.origin === 'question' && f.surface.length >= 3 && n.symbolPath.toLowerCase().includes(f.surface.toLowerCase())).reduce((acc, f)=>acc + f.weight * 4, 0);
-                        const cov = scoreFacetCoverage(recall, `${n.symbolPath}\n${nodeText}`);
-                        return {
-                            n,
-                            score: cov.gain + pathBonus
-                        };
-                    }).filter((x)=>x.score > 0).sort((a, b)=>b.score - a.score || a.n.byteEnd - a.n.byteStart - (b.n.byteEnd - b.n.byteStart));
-                    for (const cand of candidateNodes.slice(0, 3)){
-                        const blockIdxs = chunks.map((c, idx)=>({
-                                c,
-                                idx
-                            })).filter(({ c })=>c.byteStart >= cand.n.byteStart && c.byteEnd <= cand.n.byteEnd).map((x)=>x.idx);
-                        const addedChars = blockIdxs.filter((idx)=>!indexes.has(idx)).reduce((n, idx)=>n + chunks[idx].text.length, 0);
-                        if (addedChars > 0 && totalChars + addedChars <= 7500) {
-                            blockIdxs.forEach((idx)=>indexes.add(idx));
-                            totalChars += addedChars;
-                        }
-                    }
-                } catch  {}
-            }
+        if (isOrientationDocument(source.originKey) || /\.(?:py|pyw|ts|tsx|js|jsx|mjs|cjs|java|cs|go|rs|c|cc|cpp|h|hpp|sql|f90|cob|cbl|html|ejs)$/i.test(source.originKey)) {
+            indexes.clear();
+            for (const { i, s } of ranked.slice(0, 4))if (s > 0) indexes.add(i);
         } else {
             for (const { i, s } of ranked.slice(0, 3))if (s > 0) {
                 for (const j of [
@@ -142,15 +83,109 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
         let start = Math.max(0, at - 2048), end = Math.min(bytes.length, start + 8192);
         while(start > 0 && (bytes[start] & 0xc0) === 0x80)start--;
         while(end < bytes.length && (bytes[end] & 0xc0) === 0x80)end++;
-        const spanId = store.createSpan(sourceId, c.artifactId, c.byteStart + start, c.byteStart + end);
-        return {
-            ...c,
-            spanId,
-            byteStart: c.byteStart + start,
-            byteEnd: c.byteStart + end,
-            text: bytes.subarray(start, end).toString('utf8')
-        };
+        return store.createEvidenceSpan(sourceId, c.artifactId, c.byteStart + start, c.byteStart + end, {
+            namespaceId,
+            budget,
+            deadlineAt
+        });
     });
+    const structuralTrace = [];
+    let structuralIncomplete = false;
+    const complete = !chunks.truncated && chunks.length > 0 && chunks[0].byteStart === 0 && chunks.every((c, i)=>!i || c.artifactId === chunks[i - 1].artifactId && c.byteStart === chunks[i - 1].byteEnd);
+    let selectedExcerpts = excerpts;
+    if (complete && Date.now() < deadlineAt) {
+        const fullBytes = Buffer.from(full), units = structuralUnits(full, source.originKey), byId = new Map(units.map((u)=>[
+                u.unitId,
+                u
+            ]));
+        const artifactId = chunks[0].artifactId;
+        const anchors = [
+            ...required.filter((p)=>p.artifactId === artifactId),
+            ...chunks.map((c)=>({
+                    ...c,
+                    score: scoreFacetCoverage(recall, c.text).gain
+                })).filter((c)=>c.score > 0).sort((a, b)=>b.score - a.score).slice(0, 8)
+        ];
+        const expanded = [];
+        let used = 0;
+        const addRanges = (ranges)=>{
+            const pending = ranges.filter(([start, end], i)=>end > start && !expanded.some((e)=>e.byteStart <= start && e.byteEnd >= end) && !ranges.some(([a, b], j)=>j !== i && a <= start && b >= end && (a < start || b > end || j < i)));
+            const size = pending.reduce((n, [a, b])=>n + b - a, 0);
+            if (used + size > 8192 || budget && (size > budget.maxBytes - budget.bytes || pending.length > budget.maxInspected - budget.inspected) || Date.now() >= deadlineAt) {
+                structuralIncomplete = true;
+                return false;
+            }
+            const staged = [];
+            try {
+                for (const [start, end] of pending)staged.push(store.createEvidenceSpan(sourceId, artifactId, start, end, {
+                    namespaceId,
+                    budget,
+                    deadlineAt
+                }));
+            } catch  {
+                structuralIncomplete = true;
+                return false;
+            }
+            expanded.push(...staged);
+            used += size;
+            return true;
+        };
+        for (const anchor of anchors){
+            const enclosing = units.filter((u)=>u.byteStart <= anchor.byteStart && u.byteEnd >= anchor.byteEnd && u.kind !== 'part' && u.kind !== 'statement').sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart));
+            const symbols = enclosing.filter((u)=>u.kind === 'block' && !/^(?:if|else|for|while|switch|try|catch|finally|do|block|body|statement)(?:$|[-#\s])/.test(u.symbolName));
+            const authority = symbols[0] ?? enclosing[0];
+            const whole = authority && authority.byteEnd - authority.byteStart <= STRUCTURAL_BLOCK_BYTES ? authority : undefined;
+            if (whole) {
+                if (addRanges([
+                    [
+                        whole.byteStart,
+                        whole.byteEnd
+                    ]
+                ])) structuralTrace.push({
+                    unitId: whole.unitId,
+                    symbolPath: whole.symbolPath,
+                    whole: true,
+                    byteStart: whole.byteStart,
+                    byteEnd: whole.byteEnd,
+                    startLine: whole.startLine,
+                    endLine: whole.endLine
+                });
+                continue;
+            }
+            const part = units.filter((u)=>u.kind === 'part' && (!authority || u.parentId === authority.unitId) && u.byteStart <= anchor.byteStart && u.byteEnd > anchor.byteStart).sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart))[0];
+            if (part) {
+                const parent = byId.get(part.parentId);
+                const headerStart = parent?.headerByteStart ?? part.headerByteStart, originalHeaderEnd = parent?.headerByteEnd ?? part.headerByteEnd;
+                const headerEnd = boundedHeaderEnd(fullBytes, headerStart, originalHeaderEnd);
+                if (addRanges([
+                    [
+                        part.byteStart,
+                        part.byteEnd
+                    ],
+                    [
+                        headerStart,
+                        headerEnd
+                    ]
+                ])) structuralTrace.push({
+                    unitId: part.unitId,
+                    symbolPath: parent?.symbolPath ?? part.symbolPath,
+                    partIndex: part.partIndex,
+                    totalParts: part.totalParts,
+                    previousPartId: part.previousPartId ?? null,
+                    nextPartId: part.nextPartId ?? null,
+                    headerByteStart: headerStart,
+                    headerByteEnd: headerEnd,
+                    headerComplete: headerEnd === originalHeaderEnd,
+                    fullHeaderByteEnd: originalHeaderEnd,
+                    byteStart: part.byteStart,
+                    byteEnd: part.byteEnd,
+                    startLine: part.startLine,
+                    endLine: part.endLine
+                });
+            }
+        }
+        if (expanded.length) selectedExcerpts = expanded;
+    }
     const score = scoreFacetCoverage(recall, full + ' ' + required.map((p)=>p.text).join(' '));
     return bind({
         sourceId,
@@ -166,13 +201,20 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
             sourceRevision: source.originRevision,
             sourceStatus: source.status,
             trustClass: source.trustClass,
-            ...chunks.truncated ? {
-                truncated: true
+            ...structuralTrace.length ? {
+                structuralUnits: structuralTrace
+            } : {},
+            ...chunks.truncated || structuralIncomplete ? {
+                truncated: true,
+                structuralIncomplete
             } : {}
         },
-        utility: score.score
+        utility: score.score,
+        ...structuralTrace.some((u)=>u.partIndex) ? {
+            derivedText: 'Structural navigation (not original quote):\n' + structuralTrace.filter((u)=>u.partIndex).map((u)=>`${u.symbolPath}: part-${u.partIndex} of ${u.totalParts}; lines ${u.startLine}-${u.endLine}; previous=${u.previousPartId ?? 'none'}; next=${u.nextPartId ?? 'none'}; enclosing signature bytes ${u.headerByteStart}-${u.headerByteEnd}${u.headerComplete === false ? ' (header incomplete; continues to byte ' + u.fullHeaderByteEnd + ')' : ''}`).join('\n')
+        } : {}
     }, [
-        ...excerpts,
+        ...selectedExcerpts,
         ...required
     ]);
 }
@@ -217,7 +259,7 @@ export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = st
     if (row.status === 'superseded' && !historical(recall)) return [];
     const entries = Array.isArray(canonical.entries) ? canonical.entries : [];
     const matched = entries.filter((e)=>{
-        const s = scoreFacetCoverage(recall, String(e.text));
+        const s = scoreFacetCoverage(recall, String(e.text) + ' ' + (e.structural?.symbolPath ?? '') + ' ' + (e.structural?.subTokens ?? []).join(' '));
         return s.score > 0 && s.anchored;
     }).sort((a, b)=>scoreFacetCoverage(recall, String(b.text)).gain - scoreFacetCoverage(recall, String(a.text)).gain || String(a.entryId).localeCompare(String(b.entryId)));
     if (entries.length && !matched.length) return [];
@@ -271,18 +313,26 @@ export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = st
             ...selectedSpans
         ].sort());
         for (const [sourceId, spans] of bySource){
-            if (windowCache && !windowCache.has(sourceId)) windowCache.set(sourceId, buildEvidenceWindow(store, sourceId, recall, [], namespaceId, deadlineAt, budget));
-            const base = windowCache?.get(sourceId) ?? buildEvidenceWindow(store, sourceId, recall, [], namespaceId, deadlineAt, budget);
+            const structuralSeed = entry.structural ? spans : [];
+            if (windowCache && !windowCache.has(sourceId)) windowCache.set(sourceId, buildEvidenceWindow(store, sourceId, recall, structuralSeed, namespaceId, deadlineAt, budget));
+            let base = windowCache?.get(sourceId) ?? buildEvidenceWindow(store, sourceId, recall, structuralSeed, namespaceId, deadlineAt, budget);
             if (!base) continue;
+            if (entry.structural && !base.trace.structuralUnits?.some((u)=>u.unitId === entry.structural.unitId) && !spans.every((id)=>base.spanIds.includes(id))) {
+                const routed = buildEvidenceWindow(store, sourceId, recall, spans, namespaceId, deadlineAt, budget);
+                if (routed) base = routed;
+            }
             const required = spans.map((id)=>readSupport(id));
             const alternateContext = required.flatMap((p)=>{
                 if (base.artifactIds.includes(p.artifactId)) return [];
                 const a = store.db.prepare('SELECT b.byte_length FROM artifacts a JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.artifact_id=?').get(p.artifactId);
                 if (!a || Number(a.byte_length) > 4096) return [];
-                const id = store.createSpan(sourceId, p.artifactId, 0, Number(a.byte_length));
                 try {
                     return [
-                        readSupport(id)
+                        store.createEvidenceSpan(sourceId, p.artifactId, 0, Number(a.byte_length), {
+                            namespaceId,
+                            budget,
+                            deadlineAt
+                        })
                     ];
                 } catch  {
                     truncated = true;
@@ -361,6 +411,185 @@ export function expandRelatedPremises(store, seedIds, recall, namespaceId = stor
         inspected: related.inspected ?? related.length,
         truncated: related.truncated ?? false
     });
+}
+export function triangulateMultiClueGraph(store, seedNodesByClue, recall, options = {}) {
+    const ns = options.namespaceId ?? store.namespaceId;
+    const maxHops = Math.max(1, Math.min(options.maxHops ?? 3, 4));
+    const deadlineAt = options.deadlineAt ?? Infinity;
+    const budget = options.budget;
+    if (seedNodesByClue.size < 2 || Date.now() >= deadlineAt) return [];
+    const reached = new Map();
+    const originsByTarget = new Map();
+    const seedSet = new Set();
+    let frontier = new Map();
+    for (const [clueId, nodeIds] of seedNodesByClue.entries()){
+        for (const nid of nodeIds){
+            seedSet.add(nid);
+            let m = reached.get(nid);
+            if (!m) {
+                m = new Map();
+                reached.set(nid, m);
+            }
+            m.set(clueId, 0);
+            let o = originsByTarget.get(nid);
+            if (!o) {
+                o = new Map();
+                originsByTarget.set(nid, o);
+            }
+            let cSet = o.get(clueId);
+            if (!cSet) {
+                cSet = new Set();
+                o.set(clueId, cSet);
+            }
+            cSet.add(nid);
+            let f = frontier.get(nid);
+            if (!f) {
+                f = new Set();
+                frontier.set(nid, f);
+            }
+            f.add(clueId);
+        }
+    }
+    for(let hop = 1; hop <= maxHops; hop++){
+        if (Date.now() >= deadlineAt || frontier.size === 0) break;
+        const currentIds = [
+            ...frontier.keys()
+        ].slice(0, 24);
+        const rel = store.getRelatedNodes(currentIds, {
+            namespaceId: ns,
+            limit: 48,
+            maxInspected: Math.min(128, budget ? budget.maxInspected - budget.inspected : 128),
+            includeSuperseded: historical(recall),
+            deadlineAt
+        });
+        if (budget) budget.inspected += rel.inspected ?? rel.length;
+        const nextFrontier = new Map();
+        for (const edge of rel){
+            const targetId = edge.node.nodeId;
+            const parentClues = frontier.get(edge.seedNodeId);
+            const parentOrigins = originsByTarget.get(edge.seedNodeId);
+            if (!parentClues || !parentOrigins) continue;
+            let m = reached.get(targetId);
+            if (!m) {
+                m = new Map();
+                reached.set(targetId, m);
+            }
+            let o = originsByTarget.get(targetId);
+            if (!o) {
+                o = new Map();
+                originsByTarget.set(targetId, o);
+            }
+            for (const cId of parentClues){
+                let cSet = o.get(cId);
+                if (!cSet) {
+                    cSet = new Set();
+                    o.set(cId, cSet);
+                }
+                for (const sId of parentOrigins.get(cId) ?? [])cSet.add(sId);
+                if (!m.has(cId)) {
+                    m.set(cId, hop);
+                    let nf = nextFrontier.get(targetId);
+                    if (!nf) {
+                        nf = new Set();
+                        nextFrontier.set(targetId, nf);
+                    }
+                    nf.add(cId);
+                }
+            }
+        }
+        frontier = nextFrontier;
+    }
+    const bridges = [];
+    for (const [nodeId, clueMap] of reached.entries()){
+        if (seedSet.has(nodeId) || clueMap.size < 2) continue;
+        const originMap = originsByTarget.get(nodeId);
+        let hasDistinctOriginPair = false;
+        const clueEntries = originMap ? [
+            ...originMap.entries()
+        ] : [];
+        for(let i = 0; i < clueEntries.length && !hasDistinctOriginPair; i++){
+            for(let j = i + 1; j < clueEntries.length && !hasDistinctOriginPair; j++){
+                for (const s1 of clueEntries[i][1]){
+                    for (const s2 of clueEntries[j][1]){
+                        if (s1 !== s2) {
+                            hasDistinctOriginPair = true;
+                            break;
+                        }
+                    }
+                    if (hasDistinctOriginPair) break;
+                }
+            }
+        }
+        if (!hasDistinctOriginPair) continue;
+        let score = 0, minHop = Infinity;
+        for (const h of clueMap.values()){
+            if (h < minHop) minHop = h;
+            score += Math.pow(0.65, h);
+        }
+        const triangulationScore = score * clueMap.size;
+        bridges.push({
+            nodeId,
+            convergedClues: [
+                ...clueMap.keys()
+            ],
+            minHop,
+            triangulationScore
+        });
+    }
+    return bridges.sort((a, b)=>b.triangulationScore - a.triangulationScore || a.minHop - b.minHop || a.nodeId.localeCompare(b.nodeId)).slice(0, 12);
+}
+export function buildTemporalStateLedger(store, candidateSourceIds, recall, namespaceId = store.namespaceId) {
+    if (candidateSourceIds.length === 0) return [];
+    const placeholders = candidateSourceIds.map(()=>'?').join(',');
+    const rows = store.db.prepare(`
+  SELECT DISTINCT n.logical_key
+  FROM derived_nodes n
+  JOIN provenance p USING(node_id)
+  JOIN spans sp USING(span_id)
+  WHERE n.namespace_id=? AND n.layer=1 AND n.status<>'withdrawn'
+    AND sp.source_id IN (${placeholders})
+ `).all(namespaceId, ...candidateSourceIds);
+    const ledgers = [];
+    for (const { logical_key } of rows){
+        const chain = store.db.prepare(`
+   SELECT node_id,revision,status,observed_at,title,body,canonical_json
+   FROM derived_nodes
+   WHERE namespace_id=? AND layer=1 AND logical_key=? AND status<>'withdrawn'
+   ORDER BY observed_at ASC, revision ASC
+  `).all(namespaceId, logical_key);
+        if (chain.length < 2) continue;
+        if (!historical(recall) && chain.length < 3) continue;
+        const allSpans = [];
+        const allSources = new Set();
+        const steps = [];
+        for (const item of chain){
+            const prov = store.getProvenance(String(item.node_id));
+            const spIds = prov.map((p)=>p.spanId);
+            prov.forEach((p)=>allSources.add(p.sourceId));
+            allSpans.push(...spIds);
+            const shortTag = spIds[0] ? `[span:${store.formatShortSpanId(spIds[0], namespaceId)} / ${spIds[0]}]` : '';
+            steps.push(`  ${item.revision}. [t=${item.observed_at}, status=${item.status}] ${String(item.body).trim()} ${shortTag}`.trimEnd());
+        }
+        const entity = (()=>{
+            try {
+                return JSON.parse(String(chain[0].canonical_json)).entity ?? logical_key;
+            } catch  {
+                return logical_key;
+            }
+        })();
+        ledgers.push({
+            logicalKey: logical_key,
+            entity: String(entity),
+            ledgerText: `Chronological State Evolution Ledger (${entity}, ${chain.length} ordered revisions):\n${steps.join('\n')}`,
+            spanIds: [
+                ...new Set(allSpans)
+            ],
+            sourceIds: [
+                ...allSources
+            ]
+        });
+    }
+    return ledgers;
 }
 export function discoverEvidenceCandidates(store, query, namespaceId = store.namespaceId, deadlineAt = Infinity) {
     const recall = analyzeRecallQuery(query);
@@ -560,6 +789,53 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
                 direction: r.direction
             };
             merge(c);
+        }
+    }
+    const questionFacetIds = new Set(recall.facets.filter((f)=>f.origin === 'question').map((f)=>f.id));
+    const seedNodesByClue = new Map();
+    for (const h of seeds){
+        const m = scoreFacetCoverage(recall, h.title + ' ' + h.body).matchedFacetIds.filter((id)=>questionFacetIds.has(id));
+        for (const fId of m){
+            const arr = seedNodesByClue.get(fId) ?? [];
+            if (!arr.includes(h.nodeId)) arr.push(h.nodeId);
+            seedNodesByClue.set(fId, arr);
+        }
+    }
+    if (seedNodesByClue.size >= 2 && Date.now() < deadlineAt) {
+        const bridges = triangulateMultiClueGraph(store, seedNodesByClue, recall, {
+            namespaceId,
+            maxHops: 3,
+            deadlineAt,
+            budget
+        });
+        for (const b of bridges){
+            if (Date.now() >= deadlineAt) break;
+            const row = store.db.prepare('SELECT title,body FROM derived_nodes WHERE node_id=? AND namespace_id=?').get(b.nodeId, namespaceId);
+            if (!row || !scoreFacetCoverage(recall, `${row.title} ${row.body}`).anchored) continue;
+            for (const c of hydrateProvenanceSupport(store, b.nodeId, recall, namespaceId, windowCache, deadlineAt, budget)){
+                c.reasons.push('triangulated_bridge');
+                c.utility += b.triangulationScore;
+                c.trace = {
+                    ...c.trace,
+                    triangulatedClues: b.convergedClues,
+                    minHop: b.minHop,
+                    triangulationScore: b.triangulationScore
+                };
+                merge(c);
+            }
+        }
+    }
+    if (out.size > 0 && Date.now() < deadlineAt) {
+        const ledgers = buildTemporalStateLedger(store, [
+            ...out.keys()
+        ], recall, namespaceId);
+        for (const l of ledgers){
+            for (const srcId of l.sourceIds){
+                const cand = out.get(srcId);
+                if (cand && !cand.derivedText?.includes(l.ledgerText)) {
+                    cand.derivedText = (cand.derivedText ? cand.derivedText + '\n' : '') + l.ledgerText;
+                }
+            }
         }
     }
     for (const c of out.values())c.claimSignatures = claimSignatures(recall, c.text);
