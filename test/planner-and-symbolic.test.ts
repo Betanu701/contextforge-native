@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextForgeStore, canonicalJson, stableId } from '../src/store.ts';
 import { ContextForgeCompiler } from '../src/compiler.ts';
+import { analyzeRecallQuery } from '../src/retrieval.ts';
+import { triangulateMultiClueGraph } from '../src/evidence.ts';
 import { resolveCapabilityEnvelope, resolveHistoryCapacity, resolvePromptAndToolProfile, classifyQueryDemand, groupVerbatimTail, planContext, executeTrancheStream } from '../src/planner.ts';
 import type { EnvelopeMetadata, PlanContextInput } from '../src/planner.ts';
 
@@ -180,4 +182,141 @@ test('executeTrancheStream folds a 12-document repo exceeding a 16K window acros
     assert.ok(stream.finalPlan.receipt.tokens.serializedInputTokens < 10000, 'Final synthesis prompt is compact (~9.5k tokens vs ~50k full repo) and contains only surviving verbatim spans');
   }finally{f.clean();}
 });
+
+test('8-char Git-style short span IDs, 3-hop multi-clue triangulation, and court-case temporal state flip-flop ledger (A -> B -> A -> C)', () => {
+  const f = fixture();
+  try {
+    // 1. Short span IDs on the wire + prefix resolution in readEvidenceSpan
+    const doc1 = f.store.ingestSource({
+      originKey: 'docket/order-1-tro.txt',
+      kind: 'document',
+      role: 'user',
+      observedAt: 10,
+      text: 'State: InjunctionCountOne | status = GRANTED_TRO_INITIAL',
+    });
+    const doc2 = f.store.ingestSource({
+      originKey: 'docket/order-2-stay.txt',
+      kind: 'document',
+      role: 'user',
+      observedAt: 20,
+      text: 'Correction: InjunctionCountOne | status = STAYED_BY_PANEL',
+    });
+    const doc3 = f.store.ingestSource({
+      originKey: 'docket/order-3-reinstated.txt',
+      kind: 'document',
+      role: 'user',
+      observedAt: 30,
+      text: 'Correction: InjunctionCountOne | status = GRANTED_TRO_REINSTATED_WITH_BOND',
+    });
+    const doc4 = f.store.ingestSource({
+      originKey: 'docket/order-4-modified.txt',
+      kind: 'document',
+      role: 'user',
+      observedAt: 40,
+      text: 'Correction: InjunctionCountOne | status = DISSOLVED_FINAL',
+    });
+    new ContextForgeCompiler(f.store).compile();
+
+    const chunk1 = f.store.getEvidenceChunks(doc1.sourceId)[0];
+    const shortId = f.store.formatShortSpanId(chunk1.spanId);
+    assert.equal(shortId.length, 8, 'Default short span ID should be 8 hex chars');
+    const resolved = f.store.readEvidenceSpan(shortId, { allowSupersededSource: true });
+    assert.equal(resolved.spanId, chunk1.spanId, 'readEvidenceSpan must resolve 8-char prefix back to exact 64-char SHA-256 spanId');
+
+    // 2. Court-case / temporal flip-flop (`A -> B -> A -> C`) chronological state ledger
+    const courtPlan = planContext(
+      request(f.store, {
+        query: 'Trace the court order history and chronological changes for InjunctionCountOne status',
+      }),
+    );
+    const courtWire = canonicalJson(courtPlan.messages);
+    assert.match(courtWire, /Chronological State Evolution Ledger \(InjunctionCountOne, 4 ordered revisions\)/);
+    assert.match(courtWire, /1\. \[t=10, status=superseded\][\s\S]*GRANTED_TRO_INITIAL/);
+    assert.match(courtWire, /2\. \[t=20, status=superseded\][\s\S]*STAYED_BY_PANEL/);
+    assert.match(courtWire, /3\. \[t=30, status=superseded\][\s\S]*GRANTED_TRO_REINSTATED_WITH_BOND/);
+    assert.match(courtWire, /4\. \[t=40, status=active\][\s\S]*DISSOLVED_FINAL/);
+    // Verify 8-char short span tags are used on the wire
+    assert.match(courtWire, /\[span:[a-f0-9]{8}\]/);
+
+    // 3. Multi-Clue Triangulation across 3 hops (`ClueA -> Hop1A -> BridgeNode <- Hop1B <- ClueB`)
+    const bridgeSrc = f.store.ingestSource({
+      originKey: 'src/core/TriangulatedVaultBridge.ts',
+      kind: 'document',
+      role: 'user',
+      observedAt: 50,
+      text: 'export function reconcileEscrowQuorum() { return "TRIANGULATED_BRIDGE_PAYLOAD_991"; }',
+    });
+    const bridgeSpan = f.store.getEvidenceChunks(bridgeSrc.sourceId)[0].spanId;
+    const bridgeNode = f.store.publishNode({
+      namespaceId: f.store.namespaceId,
+      layer: 1,
+      logicalKey: 'triangulated/bridge',
+      kind: 'fact',
+      title: 'OrbitalLatch and ThermalValve convergence',
+      body: 'OrbitalLatch and ThermalValve converge inside reconcileEscrowQuorum',
+      canonical: { entity: 'EscrowBridge' },
+      compilerVersion: 'test',
+      observedAt: 50,
+      spanIds: [bridgeSpan],
+      extractionRule: 'test',
+    });
+    const midA = f.store.publishNode({
+      namespaceId: f.store.namespaceId,
+      layer: 1,
+      logicalKey: 'triangulated/midA',
+      kind: 'fact',
+      title: 'MidA relay',
+      body: 'MidA relay',
+      canonical: { entity: 'MidA' },
+      compilerVersion: 'test',
+      observedAt: 50,
+      spanIds: [bridgeSpan],
+      dependencyNodeIds: [bridgeNode.nodeId],
+      extractionRule: 'test',
+    });
+    const seedA = f.store.publishNode({
+      namespaceId: f.store.namespaceId,
+      layer: 1,
+      logicalKey: 'triangulated/seedA',
+      kind: 'fact',
+      title: 'OrbitalLatch sensor',
+      body: 'OrbitalLatch sensor',
+      canonical: { entity: 'OrbitalLatch' },
+      compilerVersion: 'test',
+      observedAt: 50,
+      spanIds: [chunk1.spanId],
+      dependencyNodeIds: [midA.nodeId],
+      extractionRule: 'test',
+    });
+    const seedB = f.store.publishNode({
+      namespaceId: f.store.namespaceId,
+      layer: 1,
+      logicalKey: 'triangulated/seedB',
+      kind: 'fact',
+      title: 'ThermalValve actuator',
+      body: 'ThermalValve actuator',
+      canonical: { entity: 'ThermalValve' },
+      compilerVersion: 'test',
+      observedAt: 50,
+      spanIds: [chunk1.spanId],
+      dependencyNodeIds: [bridgeNode.nodeId],
+      extractionRule: 'test',
+    });
+
+    const seedMap = new Map<string, string[]>([
+      ['clue_orbital', [seedA.nodeId]],
+      ['clue_thermal', [seedB.nodeId]],
+    ]);
+    const bridges = triangulateMultiClueGraph(
+      f.store,
+      seedMap,
+      analyzeRecallQuery('How do OrbitalLatch and ThermalValve interact?'),
+      { maxHops: 3 },
+    );
+    assert.ok(bridges.some(b => b.nodeId === bridgeNode.nodeId && b.convergedClues.length === 2), '3-hop multi-clue triangulation must find the bridge node where both clues converge');
+  } finally {
+    f.clean();
+  }
+});
+
 

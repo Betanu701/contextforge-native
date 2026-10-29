@@ -443,19 +443,40 @@ export class ContextForgeStore {
     const result={generation,sourceCount:bySource.size,df,truncated};if(!truncated||cap===1024&&inspected===cap&&Date.now()<deadline)this.recallStatistics.set(ns,result);
     return {...result,inspected,truncated};
   }
-  readEvidenceSpan(spanId:string, options:BoundedReadOptions&{namespaceId?:string;allowSupersededSource?:boolean}={}) {
+  readEvidenceSpan(spanIdOrPrefix:string, options:BoundedReadOptions&{namespaceId?:string;allowSupersededSource?:boolean}={}) {
     const ns=options.namespaceId??this.namespaceId;this.assertNamespace(ns);
     const budget=options.budget??(options.deadlineAt!==undefined||options.maxBytes!==undefined||options.maxInspected!==undefined?readBudget(options):undefined);
     if(budget&&(!available(budget)||Date.now()>=(options.deadlineAt??Infinity)||options.maxInspected===0))throw new Error('EvidenceReadBudgetExceeded');
     if(budget)budget.inspected++;
-    const row=this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(spanId,ns);
+    const clean=String(spanIdOrPrefix).trim().toLowerCase();
+    let row=this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(clean,ns);
+    if(!row && /^[a-f0-9]{8,63}$/.test(clean)) {
+      const matches=this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id LIKE ? AND s.namespace_id=? LIMIT 2`).all(`${clean}%`,ns);
+      if(matches.length===1) row=matches[0];
+    }
     if(!row||row.status==='withdrawn'||row.status!=='active'&&!options.allowSupersededSource)throw new Error('EvidenceSpanUnavailable');
+    const fullSpanId=String(row.span_id);
     const start=Number(row.byte_start),end=Number(row.byte_end);
     if(budget&&(end-start>Math.min(options.maxBytes??Infinity,budget.maxBytes-budget.bytes)||Date.now()>=Math.min(options.deadlineAt??Infinity,budget.deadlineAt)))throw new Error('EvidenceReadBudgetExceeded');
     const bytes=budget?this.readBlobRange(String(row.blob_sha256),start,end):this.readBlobUnchecked(String(row.blob_sha256)).subarray(start,end);
     if(budget)budget.bytes+=bytes.length;
     if(sha256(bytes)!==row.quote_sha256)throw new Error('EvidenceQuoteMismatch');
-    return {spanId,sourceId:String(row.source_id),namespaceId:ns,sourceRevision:String(row.origin_revision),artifactId:String(row.artifact_id),artifactKind:String(row.artifact_kind),fidelity:String(row.fidelity),byteStart:Number(row.byte_start),byteEnd:Number(row.byte_end),text:bytes.toString('utf8'),bytes,status:String(row.status)};
+    return {spanId:fullSpanId,sourceId:String(row.source_id),namespaceId:ns,sourceRevision:String(row.origin_revision),artifactId:String(row.artifact_id),artifactKind:String(row.artifact_kind),fidelity:String(row.fidelity),byteStart:Number(row.byte_start),byteEnd:Number(row.byte_end),text:bytes.toString('utf8'),bytes,status:String(row.status)};
+  }
+  /**
+   * Git-style deterministic short span ID (`>= 8` hex chars) for LLM wire rendering:
+   * Returns an 8-char prefix of the immutable SHA-256 `span_id` (100% stable for cloud KV-caching),
+   * automatically extending to 10/12/16 chars if another span in the namespace shares the prefix.
+   */
+  formatShortSpanId(spanId:string, namespaceId=this.namespaceId):string {
+    const clean=String(spanId).toLowerCase();
+    for(const len of [8,10,12,16,64]){
+      if(len>=clean.length)return clean;
+      const prefix=clean.slice(0,len);
+      const conflict=this.db.prepare('SELECT p.span_id FROM spans p JOIN sources s USING(source_id) WHERE s.namespace_id=? AND p.span_id LIKE ? AND p.span_id<>? LIMIT 1').get(namespaceId,`${prefix}%`,clean);
+      if(!conflict)return prefix;
+    }
+    return clean;
   }
   /** Range hydration verifies each immutable quote, without reading/hashing the
    * complete artifact. Whole-artifact audits remain the readBlob API's job. */

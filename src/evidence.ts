@@ -145,6 +145,142 @@ export function expandRelatedPremises(store:ContextForgeStore,seedIds:string[],r
  const result=related.filter(r=>r.relation==='shared_key'||entryAllows(r)).filter(r=>r.direction==='incoming'&&['compiles','depends_on'].includes(r.relation)||r.relation==='contradicts'||r.relation==='supersedes'&&historical(recall)||scoreFacetCoverage(recall,r.node.title+' '+r.node.body).anchored&&scoreFacetCoverage(recall,r.node.title+' '+r.node.body).score>0);
  return Object.assign(result,{inspected:(related as any).inspected??related.length,truncated:(related as any).truncated??false});
 }
+
+/**
+ * Multi-Clue Triangulation Across Up to `maxHops` (Default `3` Hops):
+ * Given `>= 2` distinct query clue anchors (or seed nodes/excerpts), expands up to `maxHops`
+ * through the L1/L2 derivation & shared-entity graph (`compiles`, `depends_on`, `contradicts`,
+ * `supersedes`, `shared_key`) and scores intermediate/bridge nodes by how many distinct
+ * clue frontiers converge on them (`clueCount >= 2` triangulation bonus, decayed by `0.65^hop`).
+ * Single-clue fan-out beyond hop 1 is suppressed unless the node bridges `>= 2` distinct clues!
+ */
+export function triangulateMultiClueGraph(
+ store:ContextForgeStore,
+ seedNodesByClue:Map<string,string[]>,
+ recall:RecallQuery,
+ options:{namespaceId?:string;maxHops?:number;deadlineAt?:number;budget?:StoreReadBudget}={}
+):Array<{nodeId:string;convergedClues:string[];minHop:number;triangulationScore:number}> {
+ const ns=options.namespaceId??store.namespaceId;
+ const maxHops=Math.max(1,Math.min(options.maxHops??3,4));
+ const deadlineAt=options.deadlineAt??Infinity;
+ const budget=options.budget;
+ if(seedNodesByClue.size<2||Date.now()>=deadlineAt)return [];
+
+ // Track `nodeId -> Map<clueId, hopDistance>`
+ const reached=new Map<string,Map<string,number>>();
+ const seedSet=new Set<string>();
+ let frontier=new Map<string,Set<string>>(); // nodeId -> Set<clueId>
+
+ for(const [clueId,nodeIds] of seedNodesByClue.entries()){
+  for(const nid of nodeIds){
+   seedSet.add(nid);
+   let m=reached.get(nid);if(!m){m=new Map();reached.set(nid,m);}
+   m.set(clueId,0);
+   let f=frontier.get(nid);if(!f){f=new Set();frontier.set(nid,f);}
+   f.add(clueId);
+  }
+ }
+
+ for(let hop=1;hop<=maxHops;hop++){
+  if(Date.now()>=deadlineAt||frontier.size===0)break;
+  const currentIds=[...frontier.keys()].slice(0,24);
+  const rel=store.getRelatedNodes(currentIds,{
+   namespaceId:ns,
+   limit:48,
+   maxInspected:Math.min(128,budget?budget.maxInspected-budget.inspected:128),
+   includeSuperseded:historical(recall),
+   deadlineAt,
+  } as any);
+  if(budget)budget.inspected+=(rel as any).inspected??rel.length;
+  const nextFrontier=new Map<string,Set<string>>();
+  for(const edge of rel){
+   const targetId=edge.node.nodeId;
+   const parentClues=frontier.get(edge.seedNodeId);
+   if(!parentClues)continue;
+   let m=reached.get(targetId);
+   if(!m){m=new Map();reached.set(targetId,m);}
+   for(const cId of parentClues){
+    if(!m.has(cId)){
+     m.set(cId,hop);
+     let nf=nextFrontier.get(targetId);if(!nf){nf=new Set();nextFrontier.set(targetId,nf);}
+     nf.add(cId);
+    }
+   }
+  }
+  frontier=nextFrontier;
+ }
+
+ const bridges:Array<{nodeId:string;convergedClues:string[];minHop:number;triangulationScore:number}>=[];
+ for(const [nodeId,clueMap] of reached.entries()){
+  if(seedSet.has(nodeId)||clueMap.size<2)continue;
+  let score=0,minHop=Infinity;
+  for(const h of clueMap.values()){
+   if(h<minHop)minHop=h;
+   score+=Math.pow(0.65,h);
+  }
+  // Super-linear convergence multiplier when `>= 2` independent clues intersect!
+  const triangulationScore=score*clueMap.size;
+  bridges.push({nodeId,convergedClues:[...clueMap.keys()],minHop,triangulationScore});
+ }
+ return bridges.sort((a,b)=>b.triangulationScore-a.triangulationScore||a.minHop-b.minHop||a.nodeId.localeCompare(b.nodeId)).slice(0,12);
+}
+
+/**
+ * Compile a compact, source-backed Chronological State Evolution Ledger when an entity or
+ * logical key undergoes multiple revisions/supersessions (`A -> B -> A -> C`, e.g. court cases
+ * or iterative requirement flip-flops).
+ */
+export function buildTemporalStateLedger(
+ store:ContextForgeStore,
+ candidateSourceIds:string[],
+ recall:RecallQuery,
+ namespaceId=store.namespaceId
+):Array<{logicalKey:string;entity:string;ledgerText:string;spanIds:string[];sourceIds:string[]}> {
+ if(candidateSourceIds.length===0)return [];
+ const placeholders=candidateSourceIds.map(()=>'?').join(',');
+ const rows=store.db.prepare(`
+  SELECT DISTINCT n.logical_key
+  FROM derived_nodes n
+  JOIN provenance p USING(node_id)
+  JOIN spans sp USING(span_id)
+  WHERE n.namespace_id=? AND n.layer=1 AND n.status<>'withdrawn'
+    AND sp.source_id IN (${placeholders})
+ `).all(namespaceId,...candidateSourceIds) as Array<{logical_key:string}>;
+
+ const ledgers:Array<{logicalKey:string;entity:string;ledgerText:string;spanIds:string[];sourceIds:string[]}>=[];
+ for(const {logical_key} of rows){
+  const chain=store.db.prepare(`
+   SELECT node_id,revision,status,observed_at,title,body,canonical_json
+   FROM derived_nodes
+   WHERE namespace_id=? AND layer=1 AND logical_key=? AND status<>'withdrawn'
+   ORDER BY observed_at ASC, revision ASC
+  `).all(namespaceId,logical_key) as any[];
+  if(chain.length<2)continue;
+  // Only emit a full chronological ledger when the query asks about history/evolution
+  // OR when there are >=3 flip-flop revisions (e.g. A -> B -> A/C).
+  if(!historical(recall)&&chain.length<3)continue;
+  const allSpans:string[]=[];
+  const allSources=new Set<string>();
+  const steps:string[]=[];
+  for(const item of chain){
+   const prov=store.getProvenance(String(item.node_id));
+   const spIds=prov.map(p=>p.spanId);
+   prov.forEach(p=>allSources.add(p.sourceId));
+   allSpans.push(...spIds);
+   const shortTag=spIds[0]?`[span:${store.formatShortSpanId(spIds[0],namespaceId)} / ${spIds[0]}]`:'';
+   steps.push(`  ${item.revision}. [t=${item.observed_at}, status=${item.status}] ${String(item.body).trim()} ${shortTag}`.trimEnd());
+  }
+  const entity= (() => { try { return JSON.parse(String(chain[0].canonical_json)).entity ?? logical_key; } catch { return logical_key; } })();
+  ledgers.push({
+   logicalKey:logical_key,
+   entity:String(entity),
+   ledgerText:`Chronological State Evolution Ledger (${entity}, ${chain.length} ordered revisions):\n${steps.join('\n')}`,
+   spanIds:[...new Set(allSpans)],
+   sourceIds:[...allSources],
+  });
+ }
+ return ledgers;
+}
 export function discoverEvidenceCandidates(store:ContextForgeStore,query:string,namespaceId=store.namespaceId,deadlineAt=Infinity):{candidates:EvidenceCandidate[];work:Record<string,number>;truncated:boolean;redundantSourceIds?:string[]} {
  const recall=analyzeRecallQuery(query);if(!recall.substantiveTerms.length)return {candidates:[],work:{seeds:0,chunks:0,neighbors:0},truncated:false};
  const budget=createStoreReadBudget({maxInspected:8192,maxBytes:8*1024*1024,deadlineAt});
@@ -180,6 +316,45 @@ export function discoverEvidenceCandidates(store:ContextForgeStore,query:string,
  for(const h of seeds){if(Date.now()>=deadlineAt)break;for(const c of hydrateProvenanceSupport(store,h.nodeId!,recall,namespaceId,windowCache,deadlineAt,budget))merge(c);}
  const related=expandRelatedPremises(store,seeds.map(h=>h.nodeId!),recall,namespaceId,deadlineAt,budget);
  for(const r of related){if(Date.now()>=deadlineAt)break;for(const c of hydrateProvenanceSupport(store,r.node.nodeId,recall,namespaceId,windowCache,deadlineAt,budget)){c.reasons.push(r.relation==='contradicts'?'contradiction':'dependency');c.trace={...c.trace,relation:r.relation,direction:r.direction};merge(c);}}
+ // Multi-Clue Triangulation (up to 3 hops):
+ // When a query has >= 2 distinct substantive clues (`question` facets) that are NOT all
+ // already covered in a single candidate source, expand up to 3 hops through the L1/L2
+ // derivation graph to discover intermediate bridge nodes where >= 2 distinct clues converge!
+ const questionFacets=recall.facets.filter(f=>f.origin==='question');
+ const singleSourceCoversAll=questionFacets.length>0 && [...out.values()].some(c=>questionFacets.every(f=>c.matchedFacetIds.includes(f.id)));
+ const seedNodesByClue=new Map<string,string[]>();
+ if(!singleSourceCoversAll && questionFacets.length>=2){
+  for(const h of seeds){
+   const m=scoreFacetCoverage(recall,h.title+' '+h.body).matchedFacetIds;
+   for(const fId of m){const arr=seedNodesByClue.get(fId)??[];if(!arr.includes(h.nodeId!))arr.push(h.nodeId!);seedNodesByClue.set(fId,arr);}
+  }
+ }
+ if(seedNodesByClue.size>=2&&Date.now()<deadlineAt){
+  const bridges=triangulateMultiClueGraph(store,seedNodesByClue,recall,{namespaceId,maxHops:3,deadlineAt,budget});
+  for(const b of bridges){
+   if(Date.now()>=deadlineAt)break;
+   const row=store.db.prepare('SELECT title,body FROM derived_nodes WHERE node_id=? AND namespace_id=?').get(b.nodeId,namespaceId) as any;
+   if(!row||!scoreFacetCoverage(recall,`${row.title} ${row.body}`).anchored)continue;
+   for(const c of hydrateProvenanceSupport(store,b.nodeId,recall,namespaceId,windowCache,deadlineAt,budget)){
+    c.reasons.push('triangulated_bridge');
+    c.utility+=b.triangulationScore;
+    c.trace={...c.trace,triangulatedClues:b.convergedClues,minHop:b.minHop,triangulationScore:b.triangulationScore};
+    merge(c);
+   }
+  }
+ }
+ // Chronological State Evolution Ledger (for multi-revision flip-flops / court-case style timelines):
+ if(out.size>0&&Date.now()<deadlineAt){
+  const ledgers=buildTemporalStateLedger(store,[...out.keys()],recall,namespaceId);
+  for(const l of ledgers){
+   for(const srcId of l.sourceIds){
+    const cand=out.get(srcId);
+    if(cand&&!cand.derivedText?.includes(l.ledgerText)){
+     cand.derivedText=(cand.derivedText?cand.derivedText+'\n':'')+l.ledgerText;
+    }
+   }
+  }
+ }
  for(const c of out.values())c.claimSignatures=claimSignatures(recall,c.text);
  const candidates=[...out.values()].sort((a,b)=>b.utility-a.utility||a.sourceId.localeCompare(b.sourceId));
  // Equivalent claims with irrelevant archive boilerplate are alternatives.
