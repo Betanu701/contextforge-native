@@ -8,8 +8,14 @@ import {
   listLanguageGrammars,
   fromVSCodeLanguageConfig,
   verifyPartitionConservation,
+  rankRepositoryAstBlocksBlind,
+  splitCorpusStreamIntoFiles,
 } from '../src/code-decomposer.ts';
-import { sha256 } from '../src/store.ts';
+import { ContextForgeStore, sha256 } from '../src/store.ts';
+import { isCommonEnglishProseToken, splitIdentifierSubTokens } from '../src/lexicon-priors.ts';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 test('LanguageGrammarRegistry ships modern, markup, SQL, and legacy mainframe grammars (COBOL, Fortran) and imports VS Code language-configuration.json', () => {
   const ids = new Set(listLanguageGrammars().map(g => g.id));
@@ -150,3 +156,81 @@ test('25,000-byte giant monolithic function decomposes into contiguous parts tha
   const reconstructed = Buffer.concat(leaves.map(l => bytes.subarray(l.byteStart, l.byteEnd)));
   assert.equal(sha256(reconstructed), sha256(bytes), 'Concatenated leaf parts must equal exact original file SHA-256');
 });
+
+test('SQLite lexicon_priors + symbol_bm25_index, camelCase/snake_case sub-token triangulation, virtual file stream splitter, and orientation-first/recency-last ordering', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cf-lex-test-'));
+  try {
+    const store = new ContextForgeStore(join(dir, 's.sqlite'));
+    const lexCount = Number((store.db.prepare('SELECT count(*) AS cnt FROM lexicon_priors').get() as any).cnt);
+    assert.ok(lexCount >= 10000, `Expected >=10,000 lexicon_priors rows, got ${lexCount}`);
+
+    // Common English prose words from LongBench questions must be recognized as prose
+    for (const prose of ['mainly', 'important', 'provides', 'library', 'documents', 'refinement', 'factors']) {
+      assert.equal(isCommonEnglishProseToken(prose), true, `Expected "${prose}" to be classified as common English prose`);
+    }
+    // Technical symbols must NOT be classified as prose
+    for (const sym of ['ContrastiveEmbed', 'start_port', 'load_audio', 'Http404', 'HPGMG']) {
+      assert.equal(isCommonEnglishProseToken(sym), false, `Expected "${sym}" to be classified as technical symbol`);
+    }
+    assert.deepEqual(splitIdentifierSubTokens('ContrastiveEmbed'), ['contrastive', 'embed']);
+    assert.deepEqual(splitIdentifierSubTokens('convert_ldm_vae_checkpoint'), ['convert', 'ldm', 'vae', 'checkpoint']);
+
+    // Ingesting a code file indexes its AST definitions and sub-tokens into symbol_bm25_index
+    const src = store.ingestSource({
+      originKey: 'models/utils.py',
+      kind: 'document',
+      role: 'user',
+      text: 'from .blocks import UpBlock3D\nclass ContrastiveEmbed:\n    def forward(self, x):\n        return x\n',
+    });
+    const indexed = store.db.prepare('SELECT symbol_lower, role FROM symbol_bm25_index WHERE source_id=?').all(src.sourceId) as any[];
+    assert.ok(indexed.some(r => r.symbol_lower === 'contrastiveembed' && r.role === 'definition'));
+    assert.ok(indexed.some(r => r.symbol_lower === 'contrastive' && r.role === 'definition_subtoken'));
+    assert.ok(indexed.some(r => r.symbol_lower === 'upblock3d' && r.role === 'import'));
+
+    // Multi-line imports + cursor comment sub-token triangulation + orientation-first / recency-last ordering
+    const files = [
+      { path: 'README.md', text: '# Project Architecture\nThis repository implements contrastive vision-language grounding.\n' },
+      { path: 'models/unrelated.py', text: 'class COCOVisualizer:\n    def draw(self):\n        pass\n' },
+      { path: 'models/utils.py', text: 'class ContrastiveEmbed:\n    def __init__(self):\n        self.proj = 256\n' },
+    ];
+    const importStmt = `from models.utils import (\n    COCOVisualizer,\n    ContrastiveEmbed,\n)`;
+    const cursorCtx = `    # prepare class & box embed\n`;
+    const ranked = rankRepositoryAstBlocksBlind(files, 'Complete next line after prepare class & box embed', {
+      importStatement: importStmt,
+      cursorContext: cursorCtx,
+    });
+    assert.equal(ranked.allPartitionsVerified, true);
+    assert.ok(ranked.blocks.length >= 2);
+    // Orientation doc (README.md) sits at index 0 (top of window), while #1 highest-scoring implementation block (ContrastiveEmbed) sits at the VERY BOTTOM!
+    assert.equal(ranked.blocks[0].originKey, 'README.md');
+    assert.equal(ranked.blocks[ranked.blocks.length - 1].originKey, 'models/utils.py');
+    assert.ok(ranked.blocks[ranked.blocks.length - 1].text.includes('ContrastiveEmbed'));
+    assert.ok(ranked.blocks[ranked.blocks.length - 1].score > ranked.blocks[1].score * 2);
+
+    // Virtual file stream splitter preserves 1-based per-file line numbers and binds declared paths
+    const docSection = Array.from({ length: 22 }, (_, i) =>
+      i === 0
+        ? '# Overview'
+        : i === 1
+          ? 'The task class must be declared in `evaluation/auto_test.py`. For basic evaluation we use `"TextOnlyMobileTask_AutoTest"`.'
+          : i === 5
+            ? 'def doc_example():\n    pass'
+            : `# doc line ${i}`,
+    ).join('\n');
+    const stream = [
+      docSection,
+      '',
+      'import os\nimport socket\nclass TextOnlyMobileTask_AutoTest:\n    def init_worker(self):\n        port = find_free_ports(start_port=6060)',
+    ].join('\n');
+    const vFiles = splitCorpusStreamIntoFiles(stream, { includeLineNumbers: true });
+    assert.equal(vFiles.length, 2);
+    assert.equal(vFiles[0].isOrientationDoc, true);
+    assert.equal(vFiles[1].path, 'evaluation/auto_test.py');
+    assert.ok(vFiles[1].text.includes('5:         port = find_free_ports(start_port=6060)'));
+
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

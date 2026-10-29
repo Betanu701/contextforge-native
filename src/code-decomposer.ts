@@ -1,4 +1,5 @@
 import { sha256, stableId } from './store.ts';
+import { isCommonEnglishProseToken, splitIdentifierSubTokens, hasTechnicalIdentifierFormatting } from './lexicon-priors.ts';
 
 export interface LanguageGrammarSpec {
   id: string;
@@ -958,36 +959,47 @@ export function rankRepositoryAstBlocksBlind(
       expandedTokens.push(numMatch[0]);
     }
   }
-  const queryIds = [...new Set(expandedTokens.filter(tok => !BLIND_CODE_STOP.has(tok) && (/[_.\dA-Z]/.test(tok) || tok.length >= 5)))];
+  const queryIds = [...new Set(expandedTokens.filter(tok => !BLIND_CODE_STOP.has(tok) && !isCommonEnglishProseToken(tok) && (hasTechnicalIdentifierFormatting(tok) || tok.length >= 4)))];
 
   // Extract static unused/used imports if `importStatement` is provided (including multi-line `from X import (\n A,\n B\n)`)
+  // and record sibling import groups (`from module import A, B, C`) so tuple/sibling patterns stay grouped!
   const unusedImports = new Set<string>();
   const usedImports = new Set<string>();
+  const importModuleBySymbol = new Map<string, string>();
+  const siblingImportsByModule = new Map<string, string[]>();
   if (options.importStatement) {
     const normalizedImports = options.importStatement.replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner) => inner.replace(/\s*\n\s*/g, ' '));
     for (const line of normalizedImports.split('\n')) {
-      const mFrom = /from\s+[\w.]+\s+import\s+(.+)/.exec(line);
+      const mFrom = /from\s+([\w.]+)\s+import\s+(.+)/.exec(line);
       const mImp = !mFrom ? /^\s*import\s+(.+)/.exec(line) : null;
-      const rhs = mFrom ? mFrom[1] : mImp ? mImp[1] : '';
+      const modName = mFrom ? mFrom[1] : 'global_import';
+      const rhs = mFrom ? mFrom[2] : mImp ? mImp[1] : '';
       if (rhs) {
+        const modSyms: string[] = [];
         for (const part of rhs.split(',')) {
           const clean = part.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
           if (clean && /^[A-Za-z_]\w+$/.test(clean)) {
+            modSyms.push(clean);
+            importModuleBySymbol.set(clean, modName);
             if (options.cursorContext && !options.cursorContext.includes(clean)) unusedImports.add(clean);
             else usedImports.add(clean);
           }
+        }
+        if (modSyms.length > 0) {
+          siblingImportsByModule.set(modName, [...(siblingImportsByModule.get(modName) ?? []), ...modSyms]);
         }
       }
     }
   }
 
-  // Extract cursor-tail clues (identifiers & sub-words in the last 6 lines before the cursor)
+  // Extract cursor-tail clues (identifiers & camelCase/snake_case sub-tokens in the last 6 lines before the cursor)
   const cursorTailWords = new Set<string>();
   if (options.cursorContext) {
     const tailLines = options.cursorContext.trim().split('\n').slice(-6).join('\n');
-    for (const m of tailLines.match(/[A-Za-z]{3,}/g) ?? []) {
-      const low = m.toLowerCase();
-      if (!BLIND_CODE_STOP.has(low) && !BLIND_CODE_STOP.has(m)) cursorTailWords.add(low);
+    for (const m of tailLines.match(/[A-Za-z0-9_]{3,}/g) ?? []) {
+      for (const sub of [m.toLowerCase(), ...splitIdentifierSubTokens(m)]) {
+        if (sub.length >= 3 && !BLIND_CODE_STOP.has(sub)) cursorTailWords.add(sub);
+      }
     }
   }
 
@@ -1074,8 +1086,18 @@ export function rankRepositoryAstBlocksBlind(
   const candidateBlocks: Array<BlindCodeBlockRankResult & { matchedClues: Set<string>; leafName: string }> = [];
   let allPartitionsVerified = true;
 
-  for (let fRank = 0; fRank < Math.min(maxFiles, scoredFiles.length); fRank++) {
-    const f = scoredFiles[fRank];
+  const topRankedFiles = scoredFiles.slice(0, maxFiles);
+  // Ensure the repo's primary README / architecture / docs orientation file is included in the candidate pool
+  // if present, so high-level intent/architecture is preserved alongside implementation files!
+  const orientationCandidate = scoredFiles.find(
+    f => !topRankedFiles.includes(f) && (/(?:^|\/)(?:readme|architecture|overview|docs?\/)/i.test(f.path) || /\.(?:md|rst)$/i.test(f.path)),
+  );
+  if (orientationCandidate && topRankedFiles.length < maxFiles + 1) {
+    topRankedFiles.push(orientationCandidate);
+  }
+
+  for (let fRank = 0; fRank < topRankedFiles.length; fRank++) {
+    const f = topRankedFiles[fRank];
     const fRare = fileRareClues.get(f.path) ?? [];
     const fMissingRare = rareQueryClues.filter(c => !fRare.includes(c)).slice(0, 4);
     const fImports = [...(fileHeaderImports.get(f.path) ?? [])];
@@ -1121,20 +1143,21 @@ export function rankRepositoryAstBlocksBlind(
         bScore += fRare.length * 45;
       }
       for (const sym of unusedImports) {
-        const symLower = sym.toLowerCase();
-        // Check if this unused import also triangulates with the cursor tail words!
+        const symSubTokens = splitIdentifierSubTokens(sym);
+        const modName = importModuleBySymbol.get(sym) ?? '';
+        const modSubTokens = splitIdentifierSubTokens(modName);
         let cursorBonus = 0;
-        for (const cw of cursorTailWords) {
-          if (symLower.includes(cw)) cursorBonus += 1500;
+        for (const sub of [...symSubTokens, ...modSubTokens]) {
+          if (cursorTailWords.has(sub)) cursorBonus += 1800;
         }
         if (node.symbolPath.includes(sym)) bScore += 2000 + cursorBonus;
         else if (txt.includes(sym)) bScore += 400 + Math.round(cursorBonus / 2);
       }
       for (const sym of usedImports) {
+        const symSubTokens = splitIdentifierSubTokens(sym);
         let cursorBonus = 0;
-        const symLower = sym.toLowerCase();
-        for (const cw of cursorTailWords) {
-          if (symLower.includes(cw)) cursorBonus += 600;
+        for (const sub of symSubTokens) {
+          if (cursorTailWords.has(sub)) cursorBonus += 750;
         }
         if (node.symbolPath.includes(sym)) bScore += 300 + cursorBonus;
       }
@@ -1215,6 +1238,145 @@ export function rankRepositoryAstBlocksBlind(
     chars += b.text.length + 2;
   }
 
+  // Sort selected blocks in ASCENDING score order (`lowest -> highest`), with orientation/README
+  // blocks placed first at the top of the window (stable prefix orientation) and the #1 highest-scoring
+  // implementation block at the VERY BOTTOM (immediately above the pending query/cursor)!
+  selected.sort((a, b) => {
+    const isOrientA = /(?:^|\/)(?:readme|architecture|overview|docs?\/)/i.test(a.originKey) ? 0 : 1;
+    const isOrientB = /(?:^|\/)(?:readme|architecture|overview|docs?\/)/i.test(b.originKey) ? 0 : 1;
+    if (isOrientA !== isOrientB) return isOrientA - isOrientB;
+    return a.score - b.score;
+  });
+
   return { blocks: selected, allPartitionsVerified };
+}
+
+export interface VirtualCorpusFile {
+  path: string;
+  text: string;
+  isOrientationDoc: boolean;
+}
+
+/**
+ * Universal Multi-File Corpus / Stream Decomposer (`splitCorpusStreamIntoFiles`):
+ * Scans any concatenated repository dump, document stream, or multi-file text and splits it
+ * along real file/section boundaries (never arbitrary character crops):
+ * - Explicit `[start of path] ... [end of path]` markers
+ * - Documentation/comment path declarations (`available as EXAMPLE/pddrive.c`, `declared in evaluation/auto_test.py`)
+ * - Top-level module import headers (`import ...` / `from ... import ...` / `#include <...>`) and Markdown `# ` sections
+ * - Tags `README`, `ARCHITECTURE`, `docs/`, and overview sections with `isOrientationDoc: true`
+ * - Renders 1-based per-file line numbers (`L1..Ln`) so line-specific references (`line 121 in evaluation/auto_test.py`) are preserved verbatim.
+ */
+export function splitCorpusStreamIntoFiles(
+  rawText: string,
+  options: { defaultOriginKey?: string; includeLineNumbers?: boolean } = {},
+): VirtualCorpusFile[] {
+  const defaultKey = options.defaultOriginKey ?? 'corpus_stream.py';
+  const includeLineNums = options.includeLineNumbers ?? false;
+
+  const isOrientationPath = (p: string, sampleText: string) =>
+    /(?:^|\/)(?:readme|architecture|contributing|overview|changelog|docs?\/|doc\/)/i.test(p) ||
+    /\.(?:md|rst|txt)$/i.test(p) ||
+    /^#{1,2}\s+\S/m.test(sampleText.slice(0, 400));
+
+  const formatWithLineNumbers = (text: string) => {
+    if (!includeLineNums) return text;
+    return text
+      .split('\n')
+      .map((l, idx) => `${idx + 1}: ${l}`)
+      .join('\n');
+  };
+
+  // 1. Check explicit `[start of path] ... [end of path]` markers
+  const sweRegex = /\[start of ([^\]]+)\]\n([\s\S]*?)\[end of \1\]/g;
+  const explicitFiles: VirtualCorpusFile[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = sweRegex.exec(rawText)) !== null) {
+    const p = m[1].trim();
+    const body = m[2];
+    explicitFiles.push({
+      path: p,
+      text: formatWithLineNumbers(body),
+      isOrientationDoc: isOrientationPath(p, body),
+    });
+  }
+  if (explicitFiles.length > 0) return explicitFiles;
+
+  // 2. Pre-scan documentation cross-references (`declared in \`path\``, `available as path`)
+  //    that bind a specific file path to a class/function identifier in concatenated streams.
+  const symbolToDeclaredPath = new Map<string, string>();
+  for (const dm of rawText.matchAll(/(?:declared in|defined in|available as|in file)\s+[`'"]?([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[a-zA-Z0-9]+)[`'"]?([^\n]{0,220})/gi)) {
+    const dPath = dm[1];
+    const tail = dm[2] ?? '';
+    for (const symMatch of tail.matchAll(/[`'"]([A-Za-z_][A-Za-z0-9_]{3,})[`'"]/g)) {
+      symbolToDeclaredPath.set(symMatch[1], dPath);
+    }
+  }
+
+  // 3. Scan lines for top-level file/module/section boundaries
+  const lines = rawText.split('\n');
+  const files: VirtualCorpusFile[] = [];
+  let curStart = 0;
+  let inCodeBody = false;
+
+  const inferVirtualPath = (chunkLines: string[], idx: number): string => {
+    const full = chunkLines.join('\n');
+    const sample = chunkLines.slice(0, 35).join('\n');
+    const explicitPath =
+      /(?:available as|file|in|path:?)\s+[`'"]?([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[a-zA-Z0-9]+)[`'"]?/i.exec(sample) ??
+      /^#\s*([A-Za-z0-9_./-]+\.(?:yaml|yml|json|py|c|h|cpp|md|sh|toml|ini))\b/m.exec(sample);
+    if (explicitPath) return explicitPath[1];
+    for (const [sym, dPath] of symbolToDeclaredPath.entries()) {
+      if (full.includes(`class ${sym}`) || full.includes(`def ${sym}`)) return dPath;
+    }
+    const clsMatch = /^class\s+([A-Za-z_]\w+)/m.exec(full);
+    const defMatch = /^def\s+([A-Za-z_]\w+)/m.exec(full);
+    const mdMatch = /^#{1,2}\s+([^\n]+)/m.exec(sample);
+    if (mdMatch) return `docs/section_${idx}_${mdMatch[1].replace(/[^A-Za-z0-9_]+/g, '_').slice(0, 32)}.md`;
+    if (clsMatch) return `module_${idx}_${clsMatch[1]}.py`;
+    if (defMatch) return `module_${idx}_${defMatch[1]}.py`;
+    return `${defaultKey}_part_${idx}`;
+  };
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const prevBlank = lines[i - 1].trim() === '';
+    const isTopLevelImport = /^(?:import\s+[A-Za-z_]|from\s+[A-Za-z_.]+\s+import\s+|#include\s+[<"])/.test(line);
+    const isTopLevelDocHeader = /^#{1,2}\s+[A-Z0-9🔥]/.test(line) && inCodeBody && prevBlank;
+
+    if ((isTopLevelImport || isTopLevelDocHeader) && inCodeBody && i - curStart >= 20) {
+      const chunkLines = lines.slice(curStart, i);
+      const vPath = inferVirtualPath(chunkLines, files.length + 1);
+      const rawChunk = chunkLines.join('\n');
+      files.push({
+        path: vPath,
+        text: formatWithLineNumbers(rawChunk),
+        isOrientationDoc: isOrientationPath(vPath, rawChunk),
+      });
+      curStart = i;
+      inCodeBody = false;
+    }
+
+    if (
+      /^(?:def\s+|class\s+|async\s+def\s+|main\s*\(|void\s+|int\s+|export\s+|function\s+|\s{4,}\S)/.test(line) &&
+      !isTopLevelImport &&
+      !/^\s+[a-z0-9_,\s\\]+$/i.test(line)
+    ) {
+      inCodeBody = true;
+    }
+  }
+
+  if (curStart < lines.length) {
+    const chunkLines = lines.slice(curStart);
+    const vPath = inferVirtualPath(chunkLines, files.length + 1);
+    const rawChunk = chunkLines.join('\n');
+    files.push({
+      path: vPath,
+      text: formatWithLineNumbers(rawChunk),
+      isOrientationDoc: isOrientationPath(vPath, rawChunk),
+    });
+  }
+
+  return files;
 }
 

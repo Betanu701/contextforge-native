@@ -275,6 +275,9 @@ export function planContext(input: PlanContextInput): ContextPlan {
       const renderedArtifactIds=new Set<string>(windowedArtifacts??(rawText?[String(rawText.artifact_id)]:[]));
       let mediaTokens=0,imageCount=0,audioMs=0,videoMs=0;
       const item=makeItem(id,text,derivedFallback?`L${derivedFallback.layer}` as 'L1'|'L2':'L0','quoted_evidence',required,derivedFallback?String(derivedFallback.node_id):undefined);
+      const rawCov=scoreFacetCoverage(recall,`${String(row.origin_key)}\n${text}`);
+      item.matchedFacetIds=rawCov.matchedFacetIds;
+      item.utility=(required?100:10)+rawCov.gain*15;
       for(const a of mediaArtifacts) {
         const mime=String(a.mime_type), modality=(mime==='application/pdf'?'document':mime.split('/')[0]) as Modality|'document';
         const supported=modality==='document'?e.nativeDocumentMimeTypes.includes(mime):e.input.includes(modality);
@@ -434,9 +437,11 @@ export function planContext(input: PlanContextInput): ContextPlan {
     const isTemporalQuery=/\b(history|historical|previous|prior|old|changed?|changes|compare|comparison|diff|versus|vs|before|original|initial|supersed\w*|release|timeline|chronolog\w*|court|order|ruling|reinstat\w*)\b/i.test(input.query);
     const evidenceRelevance=(b:Bundle)=>{
       const it=b.items[0];
-      const idx=orderIndex.get(it.sourceId);
-      if(input.strictExplicitObligationsOnly && it.required && idx!==undefined) {
-        return Math.max(0, 1000 - idx * 10) + it.utility;
+      const srcMeta=object(store.getSource(it.sourceId)?.metadata);
+      // Orientation/architecture/README docs sit at the top of the evidence window (lowest sort key)
+      // so the model reads global intent/architecture first and live implementation truth at the bottom!
+      if(srcMeta.orientationDoc===true || /(?:^|\/)(?:readme|architecture|overview|contributing|docs?\/)/i.test(String(store.getSource(it.sourceId)?.originKey??''))) {
+        return -1000 + it.utility * 0.01;
       }
       return it.utility;
     };
