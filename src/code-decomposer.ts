@@ -1080,9 +1080,7 @@ export function rankRepositoryAstBlocksBlind(
     const fMissingRare = rareQueryClues.filter(c => !fRare.includes(c)).slice(0, 4);
     const fImports = [...(fileHeaderImports.get(f.path) ?? [])];
     const relevantImports = fImports.filter(s => queryIds.includes(s) || /[A-Z]/.test(s)).slice(0, 8);
-    const fileTriangulationNote = fRare.length >= 2
-      ? `[FILE TRIANGULATION: ${f.path} bridges ${fRare.length} code clues (${fRare.slice(0, 6).join(', ')})${fMissingRare.length === 0 ? ' — FULL CLUE INTERSECTION' : ''}${relevantImports.length ? `; imports: ${relevantImports.join(', ')}` : ''}]`
-      : `[FILE SCOPE: ${f.path} matches (${fRare.slice(0, 4).join(', ') || 'general'})${fMissingRare.length ? `; does NOT reference (${fMissingRare.join(', ')})` : ''}]`;
+    const fileTriangulationNote = fRare.length >= 2 ? `[BRIDGES: ${fRare.slice(0, 4).join(',')}]` : '';
 
     const tree = decomposeCodeSource(f.text, { originKey: f.path, maxBlockBytes });
     if (!tree.partitionVerified) allPartitionsVerified = false;
