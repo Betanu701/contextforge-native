@@ -213,9 +213,7 @@ test('SQLite lexicon_priors + symbol_bm25_index, camelCase/snake_case sub-token 
         ? '# Overview'
         : i === 1
           ? 'The task class must be declared in `evaluation/auto_test.py`. For basic evaluation we use `"TextOnlyMobileTask_AutoTest"`.'
-          : i === 5
-            ? 'def doc_example():\n    pass'
-            : `# doc line ${i}`,
+          : `- documentation bullet ${i}`,
     ).join('\n');
     const stream = [
       docSection,

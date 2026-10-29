@@ -771,7 +771,7 @@ function decomposeByGrammar(
 
   // 4.5. Indentation-Scoped Languages (Python `class` / `def` / `async def`)
   if (spec.blocks.indentationScoped) {
-    const stripLineNum = (line: string): string => line.replace(/^\s*\d+\s?(?=[A-Za-z_#@"' \t]|$)/, '');
+    const stripLineNum = (line: string): string => line.replace(/^\s*\d+:?\s?(?=[A-Za-z_#@"' \t]|$)/, '');
     const isCommentOrHeader = (line: string): boolean => {
       const s = stripLineNum(line).trimStart();
       return !s || s.startsWith('//') || isLineComment(s, spec);
@@ -834,7 +834,9 @@ function decomposeByGrammar(
           }
           const sym = inferSymbolName(stripLineNum(subLines[startIdx].text), `block-${nodes.length + 1}`);
           const n = makeNode(bytes, spec.id, sym, `${parent.symbolPath}::${sym}`, 'block', parent.depth + 1, s, e, parent.nodeId);
-          if (endIdx - startIdx >= 3 && (n.byteStart > parent.byteStart || n.byteEnd < parent.byteEnd)) {
+          const isClassHeader = /^[ \t]*class\s+/.test(stripLineNum(subLines[startIdx].text));
+          // Keep classes/functions intact when they fit within maxBlockBytes (or keep small classes <= maxBlockBytes intact so __init__ + forward stay together)
+          if (endIdx - startIdx >= 3 && (n.byteStart > parent.byteStart || n.byteEnd < parent.byteEnd) && (n.byteEnd - n.byteStart > maxBlockBytes || (isClassHeader && n.byteEnd - n.byteStart > 2200))) {
             // Peel the outer class/def header line to decompose nested methods!
             const firstLine = subLines[startIdx];
             const headerEnd = firstLine.byteEnd;
@@ -1193,6 +1195,14 @@ export function rankRepositoryAstBlocksBlind(
         }
         if (node.symbolPath.includes(sym)) bScore += 300 + cursorBonus;
       }
+      // Penalize boilerplate `__init__` constructor leaves when a sibling `forward` / core method of the same class exists,
+      // unless `__init__` itself is mentioned in the query
+      if (leafName === '__init__' && !query.includes('__init__')) {
+        bScore = Math.max(1, Math.round(bScore * 0.65));
+      }
+      if (leafName === 'forward' || leafName === '__call__') {
+        bScore = Math.round(bScore * 1.25);
+      }
       if (bScore > 0) {
         candidateBlocks.push({
           originKey: f.path,
@@ -1306,10 +1316,17 @@ export function splitCorpusStreamIntoFiles(
   const defaultKey = options.defaultOriginKey ?? 'corpus_stream.py';
   const includeLineNums = options.includeLineNumbers ?? false;
 
-  const isOrientationPath = (p: string, sampleText: string) =>
-    /(?:^|\/)(?:readme|architecture|contributing|overview|changelog|docs?\/|doc\/)/i.test(p) ||
-    /\.(?:md|rst|txt)$/i.test(p) ||
-    /^#{1,2}\s+\S/m.test(sampleText.slice(0, 400));
+  const hasPythonCodeDeclarations = (text: string) =>
+    /^(?:\d+:?\s*)?(?:class\s+[A-Za-z_]\w*|def\s+[A-Za-z_]\w*|async\s+def\s+[A-Za-z_]\w*|from\s+[A-Za-z_.]+\s+import\s+)/m.test(text);
+
+  const isOrientationPath = (p: string, sampleText: string) => {
+    if (hasPythonCodeDeclarations(sampleText)) return false;
+    return (
+      /(?:^|\/)(?:readme|architecture|contributing|overview|changelog|docs?\/|doc\/)/i.test(p) ||
+      /\.(?:md|rst|txt)$/i.test(p) ||
+      /^#{1,2}\s+\S/m.test(sampleText.slice(0, 400))
+    );
+  };
 
   const formatWithLineNumbers = (text: string) => {
     if (!includeLineNums) return text;
@@ -1350,6 +1367,7 @@ export function splitCorpusStreamIntoFiles(
   const files: VirtualCorpusFile[] = [];
   let curStart = 0;
   let inCodeBody = false;
+  let inDocBody = false;
 
   const inferVirtualPath = (chunkLines: string[], idx: number): string => {
     const full = chunkLines.join('\n');
@@ -1364,23 +1382,40 @@ export function splitCorpusStreamIntoFiles(
     const clsMatch = /^class\s+([A-Za-z_]\w+)/m.exec(full);
     const defMatch = /^def\s+([A-Za-z_]\w+)/m.exec(full);
     const mdMatch = /^#{1,2}\s+([^\n]+)/m.exec(sample);
-    if (mdMatch) return `docs/section_${idx}_${mdMatch[1].replace(/[^A-Za-z0-9_]+/g, '_').slice(0, 32)}.md`;
     if (clsMatch) return `module_${idx}_${clsMatch[1]}.py`;
     if (defMatch) return `module_${idx}_${defMatch[1]}.py`;
+    if (mdMatch && !hasPythonCodeDeclarations(full)) {
+      return `docs/section_${idx}_${mdMatch[1].replace(/[^A-Za-z0-9_]+/g, '_').slice(0, 32)}.md`;
+    }
     return `${defaultKey}_part_${idx}`;
   };
 
-  for (let i = 1; i < lines.length; i++) {
+  for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (i === 0) {
+      if (/^(?:#{1,3}\s+\S|<div\b|<h[1-3]\b)/.test(line.trim())) inDocBody = true;
+      continue;
+    }
     const prevBlank = lines[i - 1].trim() === '';
+    const nextFewLines = lines.slice(i + 1, Math.min(lines.length, i + 6)).join('\n');
     const isTopLevelImport = /^(?:import\s+[A-Za-z_]|from\s+[A-Za-z_.]+\s+import\s+|#include\s+[<"]|package\s+[A-Za-z_]|using\s+[A-Za-z_])/.test(line);
-    const isTopLevelDocHeader = /^#{1,2}\s+[A-Z0-9🔥]/.test(line) && inCodeBody && prevBlank;
+    // Only treat `# Heading` as a Markdown doc section boundary if we are currently in code AND it is NOT immediately followed by Python `def`/`class`/`@decorator`
+    const isTopLevelDocHeader =
+      /^#{1,2}\s+[A-Z0-9🔥]/.test(line) &&
+      inCodeBody &&
+      prevBlank &&
+      !/^(?:def\s+|class\s+|async\s+def\s+|@|#)/.test(nextFewLines.trimStart());
     const isChunkOverflowBoundary =
       i - curStart >= 900 &&
       prevBlank &&
-      /^(?:class\s+|def\s+|async\s+def\s+|export\s+|function\s+|public\s+|private\s+|protected\s+|interface\s+|struct\s+|impl\s+|fn\s+|#{1,3}\s+)/.test(line);
+      /^(?:class\s+|def\s+|async\s+def\s+|export\s+|function\s+|public\s+|private\s+|protected\s+|interface\s+|struct\s+|impl\s+|fn\s+)/.test(line);
 
-    if (((isTopLevelImport || isTopLevelDocHeader) && inCodeBody && i - curStart >= 20) || isChunkOverflowBoundary || i - curStart >= 2000) {
+    if (
+      ((isTopLevelImport && (inCodeBody || (inDocBody && prevBlank))) || (isTopLevelDocHeader && inCodeBody)) &&
+      i - curStart >= 20 ||
+      isChunkOverflowBoundary ||
+      i - curStart >= 2000
+    ) {
       const chunkLines = lines.slice(curStart, i);
       const vPath = inferVirtualPath(chunkLines, files.length + 1);
       const rawChunk = chunkLines.join('\n');
@@ -1391,14 +1426,20 @@ export function splitCorpusStreamIntoFiles(
       });
       curStart = i;
       inCodeBody = false;
+      inDocBody = isTopLevelDocHeader;
+    }
+
+    if (/^(?:#{1,3}\s+\S|<div\b|<h[1-3]\b|\*\s+\[\d{4}\.)/.test(line.trim()) && !inCodeBody) {
+      inDocBody = true;
     }
 
     if (
-      /^(?:def\s+|class\s+|async\s+def\s+|main\s*\(|void\s+|int\s+|export\s+|function\s+|\s{4,}\S)/.test(line) &&
+      /^(?:def\s+|class\s+|async\s+def\s+|main\s*\(|void\s+|int\s+|export\s+|function\s+|\s{4,}(?:return\b|self\.|if\b|for\b|while\b|with\b|try:|raise\b|assert\b|super\())/.test(line) &&
       !isTopLevelImport &&
       !/^\s+[a-z0-9_,\s\\]+$/i.test(line)
     ) {
       inCodeBody = true;
+      inDocBody = false;
     }
   }
 
