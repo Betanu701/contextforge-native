@@ -944,23 +944,45 @@ export function rankRepositoryAstBlocksBlind(
   const maxTotalChars = options.maxTotalChars ?? 22000;
 
   const rawMatches = query.match(/[A-Za-z_][A-Za-z0-9_.]{2,}/g) ?? [];
-  const queryIds = [...new Set(rawMatches.filter(tok => !BLIND_CODE_STOP.has(tok) && (/[_.\dA-Z]/.test(tok) || tok.length >= 5)))];
+  const expandedTokens: string[] = [];
+  for (const tok of rawMatches) {
+    expandedTokens.push(tok);
+    if (tok.includes('.')) {
+      for (const part of tok.split('.')) {
+        if (part.length >= 3) expandedTokens.push(part);
+      }
+    }
+  }
+  const queryIds = [...new Set(expandedTokens.filter(tok => !BLIND_CODE_STOP.has(tok) && (/[_.\dA-Z]/.test(tok) || tok.length >= 5)))];
 
-  // Extract static unused/used imports if `importStatement` is provided
+  // Extract static unused/used imports if `importStatement` is provided (including multi-line `from X import (\n A,\n B\n)`)
   const unusedImports = new Set<string>();
   const usedImports = new Set<string>();
   if (options.importStatement) {
-    for (const line of options.importStatement.split('\n')) {
+    const normalizedImports = options.importStatement.replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner) => inner.replace(/\s*\n\s*/g, ' '));
+    for (const line of normalizedImports.split('\n')) {
       const mFrom = /from\s+[\w.]+\s+import\s+(.+)/.exec(line);
-      if (mFrom) {
-        for (const part of mFrom[1].split(',')) {
-          const clean = part.replace(/[()]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+      const mImp = !mFrom ? /^\s*import\s+(.+)/.exec(line) : null;
+      const rhs = mFrom ? mFrom[1] : mImp ? mImp[1] : '';
+      if (rhs) {
+        for (const part of rhs.split(',')) {
+          const clean = part.replace(/#.*/, '').replace(/[()\\]/g, '').trim().split(/\s+as\s+/).pop()?.trim() ?? '';
           if (clean && /^[A-Za-z_]\w+$/.test(clean)) {
             if (options.cursorContext && !options.cursorContext.includes(clean)) unusedImports.add(clean);
             else usedImports.add(clean);
           }
         }
       }
+    }
+  }
+
+  // Extract cursor-tail clues (identifiers & sub-words in the last 6 lines before the cursor)
+  const cursorTailWords = new Set<string>();
+  if (options.cursorContext) {
+    const tailLines = options.cursorContext.trim().split('\n').slice(-6).join('\n');
+    for (const m of tailLines.match(/[A-Za-z]{3,}/g) ?? []) {
+      const low = m.toLowerCase();
+      if (!BLIND_CODE_STOP.has(low) && !BLIND_CODE_STOP.has(m)) cursorTailWords.add(low);
     }
   }
 
@@ -985,7 +1007,7 @@ export function rankRepositoryAstBlocksBlind(
     return { ...f, score };
   }).sort((a, b) => b.score - a.score);
 
-  const candidateBlocks: BlindCodeBlockRankResult[] = [];
+  const candidateBlocks: Array<BlindCodeBlockRankResult & { matchedClues: Set<string>; leafName: string }> = [];
   let allPartitionsVerified = true;
 
   for (let fRank = 0; fRank < Math.min(maxFiles, scoredFiles.length); fRank++) {
@@ -997,22 +1019,43 @@ export function rankRepositoryAstBlocksBlind(
     for (const node of leaves) {
       const txt = buf.subarray(node.byteStart, node.byteEnd).toString('utf8');
       let bScore = Math.max(1, (maxFiles - fRank) * 6);
+      const matchedClues = new Set<string>();
+      const leafName = node.symbolName.replace(/#part-\d+$|::header$|::footer$/, '');
       for (const [id, c] of df.entries()) {
         const idf = Math.max(1, Math.round(Math.max(25, files.length) / c));
-        if (node.symbolPath.toLowerCase().includes(id.toLowerCase())) bScore += idf * 10;
-        if (txt.includes(id)) bScore += idf * 3;
+        if (node.symbolPath.toLowerCase().includes(id.toLowerCase())) {
+          bScore += idf * 10;
+          matchedClues.add(id);
+        }
+        if (txt.includes(id)) {
+          bScore += idf * 3;
+          matchedClues.add(id);
+        }
       }
       for (const sym of unusedImports) {
-        if (node.symbolPath.includes(sym)) bScore += 2000;
-        else if (txt.includes(sym)) bScore += 400;
+        const symLower = sym.toLowerCase();
+        // Check if this unused import also triangulates with the cursor tail words!
+        let cursorBonus = 0;
+        for (const cw of cursorTailWords) {
+          if (symLower.includes(cw)) cursorBonus += 1500;
+        }
+        if (node.symbolPath.includes(sym)) bScore += 2000 + cursorBonus;
+        else if (txt.includes(sym)) bScore += 400 + Math.round(cursorBonus / 2);
       }
       for (const sym of usedImports) {
-        if (node.symbolPath.includes(sym)) bScore += 300;
+        let cursorBonus = 0;
+        const symLower = sym.toLowerCase();
+        for (const cw of cursorTailWords) {
+          if (symLower.includes(cw)) cursorBonus += 600;
+        }
+        if (node.symbolPath.includes(sym)) bScore += 300 + cursorBonus;
       }
       if (bScore > 0) {
         candidateBlocks.push({
           originKey: f.path,
           symbolPath: node.symbolPath,
+          leafName,
+          matchedClues,
           byteStart: node.byteStart,
           byteEnd: node.byteEnd,
           sha256: node.sha256,
@@ -1020,6 +1063,36 @@ export function rankRepositoryAstBlocksBlind(
           text: `// FILE: ${f.path} (${node.symbolPath})\n${txt}`,
         });
       }
+    }
+  }
+
+  // Cross-Block Call-Graph & Multi-Clue Triangulation:
+  // Identify the top seed blocks and boost any AST block that:
+  // (a) calls or is called by a high-scoring seed symbol from a DIFFERENT clue/file, OR
+  // (b) intersects >= 2 rare query clues across call hops!
+  const topSeeds = [...candidateBlocks].sort((a, b) => b.score - a.score).slice(0, 10);
+  const seedSymbols = new Map<string, Set<string>>(); // leafName -> Set<matchedClue>
+  for (const s of topSeeds) {
+    if (s.leafName && s.leafName.length >= 4 && !s.leafName.startsWith('module-preamble') && s.leafName !== '__init__') {
+      const prev = seedSymbols.get(s.leafName) ?? new Set<string>();
+      for (const c of s.matchedClues) prev.add(c);
+      seedSymbols.set(s.leafName, prev);
+    }
+  }
+
+  for (const b of candidateBlocks) {
+    let callHopClues = new Set<string>(b.matchedClues);
+    let callEdges = 0;
+    for (const [sym, symClues] of seedSymbols.entries()) {
+      if (sym === b.leafName) continue;
+      if (b.text.includes(`${sym}(`) || b.text.includes(`.${sym}`)) {
+        callEdges++;
+        for (const c of symClues) callHopClues.add(c);
+      }
+    }
+    if (callEdges > 0 && callHopClues.size >= 2) {
+      // Super-linear multi-clue call-graph triangulation boost!
+      b.score += callEdges * 90 * callHopClues.size;
     }
   }
 
