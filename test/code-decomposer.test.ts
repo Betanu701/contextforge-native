@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+// Same original fixture roots in source and compiled-test executions.
+const repositoryUrl = new URL(import.meta.url.includes('/dist/test/') ? '../../' : '../', import.meta.url);
 import {
   decomposeCodeSource,
   registerLanguageGrammar,
@@ -37,7 +39,7 @@ test('LanguageGrammarRegistry ships modern, markup, SQL, and legacy mainframe gr
 });
 
 test('TypeScript with embedded String.raw SQL DDL and HTML template strings preserves Partition-of-Unity SHA-256 byte conservation', () => {
-  const schemaBytes = readFileSync(new URL('../src/schema.ts', import.meta.url));
+  const schemaBytes = readFileSync(new URL('src/schema.ts', repositoryUrl));
   const tree = decomposeCodeSource(schemaBytes, { originKey: 'src/schema.ts', maxBlockBytes: 2048 });
   assert.equal(tree.partitionVerified, true);
   assert.equal(tree.rootSha256, sha256(schemaBytes));
@@ -211,12 +213,15 @@ test('dictionary-free identifier helpers, structural source views, lossless stre
       'import os\nimport socket\nclass TextOnlyMobileTask_AutoTest:\n    def init_worker(self):\n        port = find_free_ports(start_port=6060)',
     ].join('\n');
     const vFiles = splitCorpusStreamIntoFiles(stream, { includeLineNumbers: true });
-    assert.equal(vFiles.length,1);
+    assert.equal(vFiles.length,2);
+    assert.ok(vFiles.every(f=>f.segmentKind==='inferred'&&!f.verifiedPath));
+    assert.ok(vFiles.some(f=>f.grammarId==='python'));
+    assert.equal(vFiles.map(f=>f.text).join(''),stream);
     assert.equal(vFiles[0].isOrientationDoc,true);
     assert.equal(vFiles[0].verifiedPath,undefined);
-    assert.equal(vFiles[0].text,stream);
+    assert.ok(!vFiles[0].text.includes('class TextOnlyMobileTask_AutoTest:'));
     assert.equal(vFiles[0].startLine,1);
-    assert.equal(vFiles[0].endLine,stream.split('\n').length);
+    assert.equal(vFiles.at(-1)!.endLine,stream.split('\n').length);
 
     store.close();
   } finally {

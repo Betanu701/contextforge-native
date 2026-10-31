@@ -1,4 +1,4 @@
-import { decomposeCodeSource, getLanguageGrammar, splitCorpusStreamIntoFiles } from './code-decomposer.js';
+import { decomposeCodeSource, getLanguageGrammar, splitCorpusStreamIntoFiles, isDefinitionNode, lexicalCodeReferences } from './code-decomposer.js';
 import { splitIdentifierSubTokens } from './lexicon-priors.js';
 import { stableId } from './store.js';
 export const STRUCTURAL_VERSION = 'source-structure-v1';
@@ -14,9 +14,12 @@ export function isOrientationDocument(path) {
 export function isDocumentationDocument(path) {
     return isOrientationDocument(path) || /\.(?:md|markdown|rst|txt)$/i.test(path);
 }
+export function hasStructuralContent(text, originKey) {
+    return !!getLanguageGrammar(originKey) || isDocumentationDocument(originKey) || /^\[start of [^\]]+\]/m.test(text) || /^#{1,6}\s+|^(?:(?:async|export|default|abstract)\s+)*(?:def|class|function|interface|enum|namespace|const|let|var)\s+[A-Za-z_$]/m.test(text);
+}
 export function structuralUnits(text, originKey, maxBlockBytes = STRUCTURAL_BLOCK_BYTES) {
     if (!Number.isSafeInteger(maxBlockBytes) || maxBlockBytes <= 0) throw new RangeError('maxBlockBytes must be a positive safe integer');
-    if (!getLanguageGrammar(originKey) && !isDocumentationDocument(originKey) && !/^\[start of [^\]]+\]/m.test(text)) return [];
+    if (!hasStructuralContent(text, originKey)) return [];
     const bytes = Buffer.from(text), out = [];
     const lineStarts = [
         0
@@ -40,9 +43,9 @@ export function structuralUnits(text, originKey, maxBlockBytes = STRUCTURAL_BLOC
         cursor += Buffer.byteLength(file.text);
         const start = file.byteStart ?? base, end = file.byteEnd ?? cursor;
         if (file.segmentKind === 'marker') continue;
-        const grammar = getLanguageGrammar(file.path);
-        const documentation = isDocumentationDocument(file.path) || !grammar && file.isOrientationDoc;
-        const orientation = isOrientationDocument(file.path);
+        const grammar = getLanguageGrammar(file.grammarId ?? file.path);
+        const documentation = grammar?.id === 'markdown' || !grammar && (isDocumentationDocument(file.path) || file.isOrientationDoc);
+        const orientation = documentation && (isOrientationDocument(file.path) || /^(?:section: )?(?:architecture|overview|readme)\b/i.test(file.inferredLabel ?? ''));
         if (!grammar && !documentation) continue;
         const id = stableId(STRUCTURAL_VERSION, originKey, start, end, 'file');
         const root = {
@@ -64,6 +67,9 @@ export function structuralUnits(text, originKey, maxBlockBytes = STRUCTURAL_BLOC
             pathVerified: !!file.verifiedPath,
             pathProvenance: file.pathProvenance,
             segmentKind: file.segmentKind,
+            ...file.inferredLabel ? {
+                inferredLabel: file.inferredLabel
+            } : {},
             orientation
         };
         out.push(root);
@@ -106,6 +112,14 @@ export function structuralUnits(text, originKey, maxBlockBytes = STRUCTURAL_BLOC
                 grammarId: grammar.id,
                 maxBlockBytes
             });
+            const headers = tree.flatNodes.filter((n)=>isDefinitionNode(n, file.text)).map((n)=>({
+                    byteStart: n.headerByteStart,
+                    byteEnd: n.headerByteEnd
+                }));
+            const references = lexicalCodeReferences(file.text, tree.grammarId, headers);
+            root.references = [
+                ...new Set(references.map((ref)=>ref.name))
+            ].sort();
             const ids = new Map(tree.flatNodes.map((n)=>[
                     n.nodeId,
                     n === tree.root ? id : stableId(STRUCTURAL_VERSION, id, n.nodeId)
@@ -113,10 +127,7 @@ export function structuralUnits(text, originKey, maxBlockBytes = STRUCTURAL_BLOC
             for (const node of tree.flatNodes){
                 if (node === tree.root) continue;
                 const a = start + node.byteStart, b = start + node.byteEnd, body = bytes.subarray(a, b).toString('utf8');
-                const refs = [
-                    ...body.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)
-                ].map((m)=>m[1]);
-                for (const m of body.matchAll(/\b(?:from|import|require)\s*\(?\s*['"]?([\w./-]+)/g))refs.push(m[1]);
+                const refs = references.filter((ref)=>ref.byteStart >= node.byteStart && ref.byteStart < node.byteEnd).map((ref)=>ref.name);
                 out.push({
                     ...root,
                     unitId: ids.get(node.nodeId),
@@ -178,7 +189,8 @@ export function structuralUnits(text, originKey, maxBlockBytes = STRUCTURAL_BLOC
                 startLine: lineAt(a),
                 endLine: lineAt(Math.max(a, b - 1)),
                 partIndex: i + 1,
-                totalParts: ranges.length
+                totalParts: ranges.length,
+                references: []
             }));
     }
     const byId = new Map(out.map((n)=>[

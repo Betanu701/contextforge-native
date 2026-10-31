@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs';
+// Same original fixture roots in source and compiled-test executions.
+const repositoryUrl = new URL(import.meta.url.includes('/dist/test/') ? '../../' : '../', import.meta.url);
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stripTypeScriptTypes } from 'node:module';
@@ -101,9 +103,23 @@ test('pre-compile ordinary hydration creates bounded structural spans using expl
 }finally{f.clean();}});
 
 test('packaged entry point and every compiled source are exact build projections',async()=>{
- for(const rel of ['index.ts',...readdirSync(new URL('../src/',import.meta.url)).filter(f=>f.endsWith('.ts')).map(f=>'src/'+f)]){
-  const code=readFileSync(new URL('../'+rel,import.meta.url),'utf8');const expected=stripTypeScriptTypes(code,{mode:'transform',sourceUrl:rel}).replace(/(from\s+["']\.?\.\/[^"']+)\.ts(["'])/g,'$1.js$2');
-  assert.equal(readFileSync(new URL('../dist/'+rel.replace(/\.ts$/,'.js'),import.meta.url),'utf8'),expected,rel);
+ for(const rel of ['index.ts',...readdirSync(new URL('src/',repositoryUrl)).filter(f=>f.endsWith('.ts')).map(f=>'src/'+f)]){
+  const code=readFileSync(new URL(rel,repositoryUrl),'utf8');const expected=stripTypeScriptTypes(code,{mode:'transform',sourceUrl:rel}).replace(/(from\s+["']\.?\.\/[^"']+)\.ts(["'])/g,'$1.js$2');
+  assert.equal(readFileSync(new URL('dist/'+rel.replace(/\.ts$/,'.js'),repositoryUrl),'utf8'),expected,rel);
  }
- const packaged=await import('../dist/index.js');const source=await import('../index.ts');assert.deepEqual(Object.keys(packaged).sort(),Object.keys(source).sort());
+ const packaged=await import(new URL('dist/index.js',repositoryUrl).href);const source=await import(new URL('index.ts',repositoryUrl).href);assert.deepEqual(Object.keys(packaged).sort(),Object.keys(source).sort());
 });
+
+test('unknown source inferred code regions reach persisted compilation and ordinary retrieval',()=>{const f=fixture();try{
+ const text='# Overview\nMixed documentation.\n\ndef unique_inferred_operation(value):\n    return value + 7\n';
+ const source=f.store.ingestSource({originKey:'attachment-unknown',text});
+ assert.ok(f.store.getStructuralUnits(source.sourceId).some(u=>u.symbolName==='unique_inferred_operation'&&u.segmentKind==='inferred'&&!u.pathVerified));
+ const compiler=new ContextForgeCompiler(f.store);compiler.compileSource(source.sourceId);
+ assert.equal(compiler.lintWiki().ok,true);assert.equal(f.store.readSourceBlob(source.sourceId).toString(),text);
+ assert.ok(wire(plan(f.store,'unique_inferred_operation')).includes('def unique_inferred_operation'));
+}finally{f.clean();}});
+test('large indexed seed hydration labels continuation and never claims signature-only parents are whole',()=>{const f=fixture();try{
+ const text='export function huge(x) {\n'+Array.from({length:3000},(_,i)=>`  x += ${i}; // ${i===1200?'BIGNEEDLE':'padding padding'}\n`).join('')+'  return x;\n}\n';const s=f.store.ingestSource({originKey:'big.ts',text});new ContextForgeCompiler(f.store).compileSource(s.sourceId);
+ const hit=f.store.search('BIGNEEDLE',{layers:[0],limit:1})[0];const win=buildEvidenceWindow(f.store,s.sourceId,analyzeRecallQuery('BIGNEEDLE'),[hit.spanId!])!;
+ assert.ok(win.trace.indexedSeedHydration);assert.ok(win.trace.structuralIncomplete);assert.match(win.derivedText!,/part-\d+ of \d+/);assert.ok(Buffer.byteLength(win.text)<=8192);assert.ok(win.trace.structuralUnits.every((u:any)=>u.whole||win.derivedText!.includes('partial structural evidence')));
+}finally{f.clean();}});

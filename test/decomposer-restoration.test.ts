@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+// Same original fixture roots in source and compiled-test executions.
+const repositoryUrl = new URL(import.meta.url.includes('/dist/test/') ? '../../' : '../', import.meta.url);
 import { decomposeCodeSource, splitCorpusStreamIntoFiles, rankRepositoryAstBlocksBlind, verifyPartitionConservation } from '../src/code-decomposer.ts';
 import { sha256 } from '../src/store.ts';
 
@@ -141,7 +143,9 @@ test('inferred labels never claim verified paths, long files never split by line
   assert.equal(segments.length, 1);
   assert.equal(segments[0].text, text);
   assert.equal(segments[0].verifiedPath, undefined);
-  assert.equal(segments[0].inferredLabel, 'src/claims.py');
+  assert.equal(segments[0].inferredLabel, 'unclassified source');
+  assert.ok(!segments[0].path.includes('src/claims.py'));
+  assert.equal(segments[0].segmentKind, 'inferred');
   const known = splitCorpusStreamIntoFiles(text, { defaultOriginKey: 'actual.py' });
   assert.equal(known[0].verifiedPath, 'actual.py');
   assert.equal(known[0].pathProvenance, 'caller');
@@ -165,7 +169,7 @@ test('unmatched stream markers, no final newline and empty input conserve bytes'
 });
 
 test('deterministic identifiers, metadata and embedded SQL are retained', () => {
-  const source = readFileSync(new URL('../src/schema.ts', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('src/schema.ts', repositoryUrl), 'utf8');
   const a = check(source, 'schema.ts', 2048);
   const b = decomposeCodeSource(source, { originKey: 'schema.ts', maxBlockBytes: 2048 });
   assert.deepEqual(a, b);
@@ -195,7 +199,7 @@ test('type-literal parameters and expression-bodied arrows are whole structural 
 });
 
 test('every repository source conserves bytes and keeps structural headers within nodes', () => {
-  const directory = new URL('../src/', import.meta.url);
+  const directory = new URL('src/', repositoryUrl);
   for (const name of readdirSync(directory).filter(name => name.endsWith('.ts'))) {
     const source = readFileSync(new URL(name, directory), 'utf8');
     const tree = check(source, `src/${name}`);

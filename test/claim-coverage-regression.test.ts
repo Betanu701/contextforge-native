@@ -1,0 +1,10 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';import {ContextForgeStore} from '../src/store.ts';import {ContextForgeCompiler} from '../src/compiler.ts';import {planContext} from '../src/planner.ts';
+test('compressed transcript alternatives cannot erase distinct multi-clue observations at the quality knee',()=>{
+ for(const compressed of [false,true]){const dir=mkdtempSync(join(tmpdir(),'cf-claims-')),store=new ContextForgeStore(join(dir,'db'));try{
+ const rows=Array.from({length:24},(_,i)=>`Vela sensor observation ${i+1}: cumulative flow is ${100+i*3} litres.`);const rich='Vela sensor maintenance correction changes calibration_gain and retry_interval; retain valve_state and cooling_mode; reject rollback and preserve incident evidence.';
+ for(const [i,text] of rows.entries()){store.ingestSource({originKey:'reading-'+i,kind:'turn',role:'user',text,observedAt:i});store.ingestSource({originKey:'transcript-'+i,kind:'turn',role:'user',text:text+'\n'+(compressed&&i%8===0?rich:'Routine recorded context. ')+('Archive commentary. '.repeat(400)),observedAt:i});}
+ store.ingestSource({originKey:'maintenance',text:rich});new ContextForgeCompiler(store).compileNamespace();
+ const query='Reconstruct Vela sensor observations and cumulative flow. Explain maintenance correction calibration_gain retry_interval valve_state cooling_mode and rejected rollback incident evidence.';
+ const p=planContext({store,query,sessionId:'s',admissionId:'q',rawSystemPrompt:'Cite originals.',envelope:{nativeContextTokens:64000,hostTokenBudget:32000,hostBudgetScope:'history_only',input:['text']}});const wire=JSON.stringify(p.messages);for(const row of rows)assert.ok(wire.includes(row),row);assert.ok(p.receipt.tokens.selectedHistory<=32000);assert.ok(!p.receipt.demand.obligations.some(o=>o.kind==='exhaustive_coverage'));
+ }finally{store.close();rmSync(dir,{recursive:true,force:true});}}
+});

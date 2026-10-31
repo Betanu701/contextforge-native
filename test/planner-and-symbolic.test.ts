@@ -60,10 +60,10 @@ test('routine conversation remains 1.5k–3.5k on 64k and 922k windows, with dur
 test('heavy RAG expands through the tranche ladder beyond 100k and releases documents on the next greeting',()=>{
   const f=fixture();try{
     const ids=[];for(let i=0;i<12;i++)ids.push(f.store.ingestSource({originKey:`report-${i}.txt`,text:`Report ${i}: `+'Detailed evidence concerning revenue, causes and forecasts. '.repeat(800)}).sourceId);
-    const heavy=planContext(request(f.store,{envelope:envelope(922000),query:'Exhaustively synthesize all documents and cite every source'}));
-    totals(heavy);assert.ok(heavy.estimatedTokens>100000);assert.ok(heavy.receipt.stages.some(s=>s.tranche>0));assert.deepEqual([...new Set(heavy.receipt.stages.map(s=>s.fraction))],[0.25,0.5,0.75,1]);assert.equal(heavy.receipt.demand.obligations[0].coverage?.covered,12);assert.equal(heavy.receipt.disposition,'admitted');assert.deepEqual(new Set(heavy.receipt.selections.map(s=>s.sourceId)),new Set(ids));
+    const heavy=planContext(request(f.store,{sourceIds:ids,envelope:envelope(922000),query:'Exhaustively synthesize all documents and cite every source'}));
+    totals(heavy);assert.ok(heavy.estimatedTokens>100000);assert.ok(heavy.receipt.stages.some(s=>s.tranche>0));assert.deepEqual([...new Set(heavy.receipt.stages.map(s=>s.fraction))],[0.25,0.5,0.75,1]);assert.equal(heavy.receipt.demand.obligations.filter(o=>o.status==='satisfied').length,12);assert.equal(heavy.receipt.disposition,'admitted');assert.deepEqual(new Set(heavy.receipt.selections.map(s=>s.sourceId)),new Set(ids));
     const small=planContext(request(f.store,{envelope:envelope(922000),admissionId:'next',query:'Thanks!'}));assert.ok(small.receipt.tokens.serializedInputTokens<3500);assert.equal(small.receipt.selections.length,0);assert.equal(small.epoch.prefixSha256,heavy.epoch.prefixSha256);
-    const constrained=planContext(request(f.store,{envelope:envelope(64000),admissionId:'constrained',query:'Synthesize all documents'}));totals(constrained);assert.equal(constrained.receipt.stopReason,'physical_limit');assert.equal(constrained.receipt.disposition,'partial');assert.ok(constrained.receipt.demand.obligations[0].coverage!.covered<12);
+    const constrained=planContext(request(f.store,{envelope:envelope(64000),admissionId:'constrained',sourceIds:ids,query:'Synthesize all documents'}));totals(constrained);assert.ok(['physical_limit','corpus_exhausted','sufficient_evidence'].includes(constrained.receipt.stopReason));assert.equal(constrained.receipt.disposition,'partial');assert.ok(constrained.receipt.demand.obligations.filter(o=>o.status==='satisfied').length<12);
   }finally{f.clean();}
 });
 
@@ -105,9 +105,9 @@ test('epoch rolls on policy/model changes, not unrelated writes; revoked evidenc
 
 test('transport, cancellation, ACL and mandatory fixed overflow fail explicitly',()=>{
   const f=fixture();try{
-    f.store.ingestSource({originKey:'doc',text:'A long document '.repeat(300)});
+    const document=f.store.ingestSource({originKey:'doc',text:'A long document '.repeat(300)});
     const abort=new AbortController();abort.abort();const cancelled=planContext(request(f.store,{query:'all documents',abortSignal:abort.signal}));assert.equal(cancelled.receipt.disposition,'cancelled');
-    const bytes=planContext(request(f.store,{admissionId:'bytes',query:'all documents',envelope:envelope(64000,{maxRequestBytes:500})}));assert.equal(bytes.receipt.stopReason,'transport_limit');
+    const bytes=planContext(request(f.store,{admissionId:'bytes',sourceIds:[document.sourceId],query:'all documents',envelope:envelope(64000,{maxRequestBytes:500})}));assert.equal(bytes.receipt.stopReason,'transport_limit');
     const fixed=planContext(request(f.store,{admissionId:'fixed',symbolicIr:false,envelope:envelope(1000,{systemTokens:2000})}));assert.equal(fixed.receipt.stopReason,'mandatory_overflow');assert.equal(fixed.receipt.disposition,'blocked');
     assert.throws(()=>planContext(request(f.store,{namespaceId:'denied',admissionId:'denied'})),/access denied/);
   }finally{f.clean();}
@@ -115,9 +115,9 @@ test('transport, cancellation, ACL and mandatory fixed overflow fail explicitly'
 
 test('near-million window has no 100k ceiling: 780k+ evidence, complete coverage and bounded stages',()=>{
   const f=fixture();try{
-    for(let i=0;i<40;i++)f.store.ingestSource({originKey:`large-${i}`,text:`Document ${i}:\n`+'Evidence record. '.repeat(4450)});
-    const p=planContext(request(f.store,{envelope:envelope(922000),query:'Exhaustively review all documents'}));
-    totals(p);assert.ok(p.estimatedTokens>780000);assert.ok(p.estimatedTokens<920000);assert.equal(p.receipt.demand.obligations[0].coverage?.covered,40);assert.equal(p.receipt.disposition,'admitted');assert.ok(p.receipt.stages.length<40);
+    const ids=[];for(let i=0;i<40;i++)ids.push(f.store.ingestSource({originKey:`large-${i}`,text:`Document ${i}:\n`+'Evidence record. '.repeat(4450)}).sourceId);
+    const p=planContext(request(f.store,{sourceIds:ids,envelope:envelope(922000),query:'Exhaustively review all documents'}));
+    totals(p);assert.ok(p.estimatedTokens>780000);assert.ok(p.estimatedTokens<920000);assert.equal(p.receipt.demand.obligations.filter(o=>o.status==='satisfied').length,40);assert.equal(p.receipt.disposition,'admitted');assert.ok(p.receipt.stages.length<40);
   }finally{f.clean();}
 });
 

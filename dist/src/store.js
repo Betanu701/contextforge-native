@@ -3,8 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, lstatSync, chmodSync, openSync, closeSync, readSync, fstatSync, writeFileSync, fsyncSync, renameSync, readFileSync, unlinkSync, existsSync, constants } from 'node:fs';
 import { resolve, dirname, join, parse } from 'node:path';
 import { analyzeRecallQuery, tokenizeRecallText, buildFtsQuery, lexicalProjectionTitle, canonicalRecallTitle, LEXICAL_VERSION } from './retrieval.js';
-import { getLanguageGrammar } from './code-decomposer.js';
-import { structuralUnits, isDocumentationDocument } from './structure.js';
+import { structuralUnits, hasStructuralContent } from './structure.js';
 import { configureDatabase, migrate } from './schema.js';
 export const COMPILER_VERSION = 'deterministic-v1';
 export const INLINE_THRESHOLD = 64 * 1024;
@@ -123,6 +122,7 @@ export class ContextForgeStore {
     namespaceId;
     ownerId;
     depth = 0;
+    auditedBlobs = new Set();
     writtenBlobs = new Set();
     recallStatistics = new Map();
     constructor(config){
@@ -145,6 +145,7 @@ export class ContextForgeStore {
             this.db.exec('CREATE INDEX IF NOT EXISTS cf_edges_child ON derivation_edges(child_node_id,parent_node_id,relation)');
             this.db.exec('CREATE INDEX IF NOT EXISTS cf_spans_artifact_range ON spans(artifact_id,byte_start,span_id)');
             this.db.exec('CREATE INDEX IF NOT EXISTS cf_chunks_span ON chunks(span_id,chunk_id)');
+            this.db.exec('CREATE INDEX IF NOT EXISTS cf_artifact_metadata ON artifacts(artifact_id,source_id,blob_sha256,kind,fidelity)');
             if (this.db.prepare('PRAGMA journal_mode').get()?.journal_mode !== 'wal') throw new Error('WAL unavailable');
             this.namespaceId = this.resolveNamespace({
                 namespaceId: config.namespaceId,
@@ -173,6 +174,7 @@ export class ContextForgeStore {
             throw e;
         } finally{
             this.depth--;
+            if (outer) this.auditedBlobs.clear();
         }
     }
     resolveNamespace(options = {}) {
@@ -364,8 +366,25 @@ export class ContextForgeStore {
             if (input.text !== undefined) {
                 if (!Buffer.from(input.text).equals(bytes)) throw new Error('Text artifact bytes differ from indexed text');
                 let offset = 0, ordinal = 0;
-                for (const line of input.text.split(/(?<=\n)/u)){
-                    const lineEnd = offset + Buffer.byteLength(line);
+                const lineEnds = function*() {
+                    let at = 0;
+                    while(at < bytes.length){
+                        if (bytes.length > 4 * 1024 * 1024) {
+                            let end = Math.min(bytes.length, at + EVIDENCE_CHUNK_BYTES);
+                            const newline = bytes.lastIndexOf(10, end - 1);
+                            if (newline >= at) end = newline + 1;
+                            while(end < bytes.length && (bytes[end] & 0xc0) === 0x80)end--;
+                            yield end;
+                            at = end;
+                        } else {
+                            const newline = bytes.indexOf(10, at);
+                            const end = newline < 0 ? bytes.length : newline + 1;
+                            yield end;
+                            at = end;
+                        }
+                    }
+                };
+                for (const lineEnd of lineEnds()){
                     while(offset < lineEnd){
                         let end = Math.min(lineEnd, offset + EVIDENCE_CHUNK_BYTES);
                         while(end < lineEnd && (bytes[end] & 0xc0) === 0x80)end--;
@@ -406,7 +425,7 @@ export class ContextForgeStore {
         if (!source || source.status !== 'active') return [];
         const artifact = artifactId ? this.db.prepare('SELECT * FROM artifacts WHERE source_id=? AND artifact_id=?').get(sourceId, artifactId) : this.db.prepare("SELECT * FROM artifacts WHERE source_id=? AND text_content IS NOT NULL AND kind<>'normalized_message' ORDER BY CASE kind WHEN 'raw' THEN 0 WHEN 'text' THEN 1 ELSE 2 END,artifact_id LIMIT 1").get(sourceId);
         if (!artifact || artifact.text_content === null) return [];
-        if (!getLanguageGrammar(source.originKey) && !isDocumentationDocument(source.originKey) && !/^\[start of [^\]]+\]/m.test(String(artifact.text_content))) return [];
+        if (!hasStructuralContent(String(artifact.text_content), source.originKey)) return [];
         const bytes = this.readBlob(String(artifact.blob_sha256));
         return structuralUnits(bytes.toString('utf8'), source.originKey, maxBlockBytes).map((unit)=>({
                 ...unit,
@@ -414,14 +433,49 @@ export class ContextForgeStore {
                 artifactId: String(artifact.artifact_id)
             }));
     }
+    auditBlob(hash) {
+        if (this.depth > 0 && this.auditedBlobs.has(hash)) return;
+        const row = this.db.prepare('SELECT byte_length,storage_kind,relative_path,state FROM blobs WHERE sha256=?').get(hash);
+        if (!row || row.state !== 'ready') throw new Error('BlobUnavailable');
+        if (row.storage_kind === 'inline') {
+            this.readBlobUnchecked(hash);
+        } else {
+            const expected = join(hash.slice(0, 2), hash.slice(2, 4), hash);
+            if (row.relative_path !== expected) throw new Error('Unsafe CAS path');
+            const path = join(this.blobRoot, expected);
+            safeFile(path);
+            const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+            try {
+                const h = createHash('sha256'), buf = Buffer.alloc(1024 * 1024);
+                let total = 0, n = 0;
+                while((n = readSync(fd, buf, 0, buf.length, null)) > 0){
+                    h.update(buf.subarray(0, n));
+                    total += n;
+                }
+                if (total !== Number(row.byte_length) || h.digest('hex') !== hash) throw new Error('Blob hash mismatch');
+            } catch (error) {
+                this.db.prepare("UPDATE blobs SET state='quarantined' WHERE sha256=?").run(hash);
+                throw error;
+            } finally{
+                closeSync(fd);
+            }
+        }
+        if (this.depth > 0) this.auditedBlobs.add(hash);
+    }
     createSpan(sourceId, artifactId, start, end) {
         const source = this.getSource(sourceId);
         if (!source) throw new Error('Unknown source');
         this.assertNamespace(source.namespaceId, 'write');
-        const artifact = this.db.prepare('SELECT * FROM artifacts WHERE artifact_id=? AND source_id=?').get(artifactId, sourceId);
+        const artifact = this.db.prepare('SELECT artifact_id,blob_sha256,text_content IS NOT NULL AS is_text FROM artifacts WHERE artifact_id=? AND source_id=?').get(artifactId, sourceId);
         if (!artifact) throw new Error('Span source mismatch');
-        const bytes = this.readBlobUnchecked(artifact.blob_sha256);
-        return this.insertSpan(sourceId, artifactId, start, end, bytes, source.observedAt, artifact.text_content !== null);
+        const meta = this.db.prepare('SELECT byte_length FROM blobs WHERE sha256=?').get(artifact.blob_sha256);
+        if (!meta || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > Number(meta.byte_length)) throw new Error('Span bounds invalid');
+        this.auditBlob(String(artifact.blob_sha256));
+        const bytes = this.readBlobRange(String(artifact.blob_sha256), start, end);
+        if (artifact.is_text && !Buffer.from(bytes.toString('utf8')).equals(bytes)) throw new Error('Span splits UTF-8 codepoint');
+        const id = stableId('cf-span-v1', artifactId, start, end);
+        this.db.prepare('INSERT OR IGNORE INTO spans(span_id,source_id,artifact_id,byte_start,byte_end,selector_json,quote_sha256,observed_at) VALUES(?,?,?,?,?,?,?,?)').run(id, sourceId, artifactId, start, end, '{}', sha256(bytes), source.observedAt);
+        return id;
     }
     createEvidenceSpan(sourceId, artifactId, start, end, options = {}) {
         const ns = options.namespaceId ?? this.namespaceId;
@@ -530,7 +584,8 @@ export class ContextForgeStore {
                 const span = this.db.prepare('SELECT p.*,s.namespace_id,l.status FROM spans p JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) WHERE span_id=?').get(spanId);
                 if (!span || span.namespace_id !== input.namespaceId || span.status !== 'active') throw new Error('Invalid or revoked provenance');
                 const a = this.db.prepare('SELECT blob_sha256 FROM artifacts WHERE artifact_id=?').get(span.artifact_id);
-                if (span.byte_start !== null && sha256(this.readBlobUnchecked(a.blob_sha256).subarray(Number(span.byte_start), Number(span.byte_end))) !== span.quote_sha256) throw new Error('Provenance quote mismatch');
+                this.auditBlob(String(a.blob_sha256));
+                if (span.byte_start !== null && sha256(this.readBlobRange(String(a.blob_sha256), Number(span.byte_start), Number(span.byte_end))) !== span.quote_sha256) throw new Error('Provenance quote mismatch');
             }
             const dependencies = [
                 ...new Set(input.dependencyNodeIds ?? [])
@@ -695,7 +750,7 @@ export class ContextForgeStore {
     search(query, options = {}) {
         const ns = options.namespaceId ?? this.namespaceId;
         this.assertNamespace(ns);
-        const recall = analyzeRecallQuery(query), match = buildFtsQuery(recall);
+        const recall = analyzeRecallQuery(query), baseMatch = buildFtsQuery(recall), match = baseMatch && (options.requiredTerms?.length ? `(${baseMatch}) AND (${options.requiredTerms.map((t)=>'"' + t.replaceAll('"', '""') + '"').join(' AND ')})` : baseMatch);
         const limit = options.limit ?? 100, offset = options.offset ?? 0, maxInspected = options.maxInspected ?? Math.max(256, limit + offset), maxBytes = options.maxBytes ?? 2 * 1024 * 1024, maxRowBytes = options.maxRowBytes ?? 16384, after = options.afterRowid ?? 0;
         for (const n of [
             limit,
@@ -739,12 +794,12 @@ export class ContextForgeStore {
             truncated = true;
             return done();
         }
-        const statistics = this.activeSourceStatistics(ns, {
-            ...options,
-            budget,
-            deadlineAt: deadline,
-            maxInspected: options.maxStatisticsInspected ?? 1024
-        });
+        const statistics = {
+            inspected: 0,
+            truncated: false,
+            df: new Map(),
+            sourceCount: 1
+        };
         statisticsInspected = statistics.inspected;
         truncated = statistics.truncated;
         if (!available(budget) || Date.now() >= deadline) {
@@ -753,21 +808,34 @@ export class ContextForgeStore {
         }
         const terms = new Set(recall.facets.flatMap((f)=>f.aliases));
         const rowAllowance = Math.min(maxBytes, budget.maxBytes - budget.bytes), titleCap = Math.min(2048, Math.floor(rowAllowance / 4)), bodyCap = Math.min(maxRowBytes, rowAllowance - titleCap);
-        const statement = this.db.prepare(`SELECT d.rowid AS discovery_rowid,d.namespace_id,d.node_id,d.chunk_id,d.source_id,substr(CAST(d.body AS BLOB),1,?) AS bounded_body,length(CAST(d.body AS BLOB)) AS body_bytes,coalesce(d.source_id,sp.source_id) AS resolved_source_id,sp.span_id,sp.artifact_id,sp.byte_start,sp.byte_end,coalesce(n.layer,0) AS layer,coalesce(n.status,sl.status) AS lifecycle_status,n.logical_key,substr(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB),1,?) AS bounded_title,length(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB)) AS title_bytes,0 AS score FROM retrieval_fts JOIN retrieval_documents d ON d.rowid=retrieval_fts.rowid
+        const statement = this.db.prepare(`WITH candidates AS MATERIALIZED (
+      SELECT d.rowid,bm25(retrieval_fts,3.0,1.0) AS fts_score FROM retrieval_fts CROSS JOIN retrieval_documents d ON d.rowid=retrieval_fts.rowid
+      LEFT JOIN derived_nodes lane_node ON lane_node.node_id=d.node_id
+      LEFT JOIN chunks lane_chunk ON lane_chunk.chunk_id=d.chunk_id LEFT JOIN spans lane_span ON lane_span.span_id=lane_chunk.span_id
+      LEFT JOIN sources lane_source ON lane_source.source_id=coalesce(d.source_id,lane_span.source_id)
+      LEFT JOIN artifacts lane_artifact ON lane_artifact.artifact_id=lane_span.artifact_id
+      WHERE retrieval_fts MATCH ? AND d.namespace_id=? AND d.rowid>?
+      AND (? IS NULL OR coalesce(lane_node.layer,0) IN (SELECT value FROM json_each(?)))
+      AND (? OR (CASE WHEN d.node_id IS NOT NULL THEN lane_node.status='active' AND NOT EXISTS(SELECT 1 FROM provenance pv JOIN spans ps USING(span_id) JOIN source_lifecycle life USING(source_id) WHERE pv.node_id=d.node_id AND life.status<>'active') ELSE EXISTS(SELECT 1 FROM chunks lc JOIN spans ls USING(span_id) JOIN source_lifecycle life USING(source_id) WHERE lc.chunk_id=d.chunk_id AND life.status='active') END))
+      AND (lane_artifact.kind IS NULL OR lane_artifact.kind<>'normalized_message')
+      AND (? IS NULL OR (lane_node.kind IN (SELECT value FROM json_each(?)) OR lane_chunk.chunk_kind IN (SELECT value FROM json_each(?)) OR lane_source.kind IN (SELECT value FROM json_each(?))))
+      AND (? IS NULL OR coalesce(lane_source.observed_at,lane_node.observed_at)>=?) AND (? IS NULL OR coalesce(lane_source.observed_at,lane_node.observed_at)<?)
+      ORDER BY fts_score,d.rowid LIMIT ?
+    ) SELECT d.rowid AS discovery_rowid,d.namespace_id,d.node_id,d.chunk_id,d.source_id,substr(CAST(d.body AS BLOB),1,?) AS bounded_body,length(CAST(d.body AS BLOB)) AS body_bytes,coalesce(d.source_id,sp.source_id) AS resolved_source_id,sp.span_id,sp.artifact_id,sp.byte_start,sp.byte_end,coalesce(n.layer,0) AS layer,coalesce(n.status,sl.status) AS lifecycle_status,n.logical_key,substr(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB),1,?) AS bounded_title,length(CAST(coalesce(n.title,c.title,d.title,'') AS BLOB)) AS title_bytes,candidates.fts_score AS fts_score,0 AS score FROM candidates CROSS JOIN retrieval_documents d ON d.rowid=candidates.rowid
       LEFT JOIN chunks c ON c.chunk_id=d.chunk_id LEFT JOIN spans sp ON sp.span_id=c.span_id LEFT JOIN artifacts search_artifact ON search_artifact.artifact_id=sp.artifact_id
       LEFT JOIN sources s ON s.source_id=coalesce(d.source_id,sp.source_id) LEFT JOIN source_lifecycle sl ON sl.source_id=s.source_id
       LEFT JOIN derived_nodes n ON n.node_id=d.node_id
-      WHERE retrieval_fts MATCH ? AND d.namespace_id=?
+      WHERE d.namespace_id=?
       AND (search_artifact.kind IS NULL OR search_artifact.kind<>'normalized_message')
       AND (? IS NULL OR coalesce(n.layer,0) IN (SELECT value FROM json_each(?)))
       AND (? IS NULL OR (n.kind IN (SELECT value FROM json_each(?)) OR c.chunk_kind IN (SELECT value FROM json_each(?)) OR s.kind IN (SELECT value FROM json_each(?))))
       AND (? OR (coalesce(sl.status,n.status)='active' AND NOT EXISTS(SELECT 1 FROM provenance p JOIN spans ps USING(span_id) JOIN source_lifecycle pl ON pl.source_id=ps.source_id WHERE p.node_id=n.node_id AND pl.status<>'active')))
       AND (? IS NULL OR coalesce(s.observed_at,n.observed_at)>=?) AND (? IS NULL OR coalesce(s.observed_at,n.observed_at)<?)
-      AND d.rowid>? ORDER BY retrieval_fts.rowid LIMIT ?
+      AND d.rowid>? ORDER BY fts_score,d.rowid LIMIT ?
       `);
         const rowCap = Math.min(maxInspected, budget.maxInspected - budget.inspected);
         const rowCeiling = bodyCap + titleCap;
-        const iterator = statement.iterate(bodyCap, titleCap, match, ns, options.layers ? JSON.stringify(options.layers) : null, options.layers ? JSON.stringify(options.layers) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.includeHistory ? 1 : 0, options.observedFrom ?? null, options.observedFrom ?? null, options.observedTo ?? null, options.observedTo ?? null, after, rowCap);
+        const iterator = statement.iterate(match, ns, after, options.layers ? JSON.stringify(options.layers) : null, options.layers ? JSON.stringify(options.layers) : null, options.includeHistory ? 1 : 0, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.observedFrom ?? null, options.observedFrom ?? null, options.observedTo ?? null, options.observedTo ?? null, rowCap, bodyCap, titleCap, ns, options.layers ? JSON.stringify(options.layers) : null, options.layers ? JSON.stringify(options.layers) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.kinds ? JSON.stringify(options.kinds) : null, options.includeHistory ? 1 : 0, options.observedFrom ?? null, options.observedFrom ?? null, options.observedTo ?? null, options.observedTo ?? null, after, rowCap);
         let exhausted = false;
         try {
             while(inspected < rowCap && maxBytes - bytes >= rowCeiling && budget.maxBytes - budget.bytes >= rowCeiling && available(budget) && Date.now() < deadline){
@@ -887,9 +955,9 @@ export class ContextForgeStore {
         if (budget && (!available(budget) || Date.now() >= (options.deadlineAt ?? Infinity) || options.maxInspected === 0)) throw new Error('EvidenceReadBudgetExceeded');
         if (budget) budget.inspected++;
         const clean = String(spanIdOrPrefix).trim().toLowerCase();
-        let row = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(clean, ns);
+        let row = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a INDEXED BY cf_artifact_metadata USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id=? AND s.namespace_id=?`).get(clean, ns);
         if (!row && /^[a-f0-9]{8,63}$/.test(clean)) {
-            const matches = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id LIKE ? AND s.namespace_id=? LIMIT 2`).all(`${clean}%`, ns);
+            const matches = this.db.prepare(`SELECT p.*,a.blob_sha256,a.kind AS artifact_kind,a.fidelity,s.namespace_id,s.origin_revision,l.status FROM spans p JOIN artifacts a INDEXED BY cf_artifact_metadata USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id WHERE p.span_id LIKE ? AND s.namespace_id=? LIMIT 2`).all(`${clean}%`, ns);
             if (matches.length === 1) row = matches[0];
         }
         if (!row || row.status === 'withdrawn' || row.status !== 'active' && !options.allowSupersededSource) throw new Error('EvidenceSpanUnavailable');
@@ -981,7 +1049,7 @@ export class ContextForgeStore {
         }
         const source = this.getSource(sourceId);
         if (!source || source.namespaceId !== ns || source.status === 'withdrawn' || source.status !== 'active' && !options.allowSupersededSource) return done();
-        const preferred = this.db.prepare(`SELECT a.artifact_id,a.blob_sha256,a.kind,a.fidelity FROM artifacts a WHERE a.source_id=? AND EXISTS(SELECT 1 FROM spans p JOIN chunks c USING(span_id) WHERE p.artifact_id=a.artifact_id)
+        const preferred = this.db.prepare(`SELECT a.artifact_id,a.blob_sha256,a.kind,a.fidelity FROM artifacts a INDEXED BY cf_artifact_metadata WHERE a.source_id=? AND EXISTS(SELECT 1 FROM spans p JOIN chunks c USING(span_id) WHERE p.artifact_id=a.artifact_id)
       ORDER BY CASE WHEN a.kind=? THEN -1 WHEN a.kind='text' THEN 0 WHEN a.kind='raw' THEN 1 WHEN a.kind='transcript' THEN 2 WHEN a.kind='ocr' THEN 3 WHEN a.kind='caption' THEN 4 WHEN a.kind='normalized_message' THEN 10 ELSE 9 END,a.artifact_id LIMIT 1`).get(sourceId, source.kind === 'turn' || source.kind === 'tool_result' ? 'text' : 'raw');
         if (!preferred) return done();
         const iterator = this.db.prepare(`SELECT c.chunk_id,c.ordinal,p.* FROM spans p INDEXED BY cf_spans_artifact_range JOIN chunks c INDEXED BY cf_chunks_span USING(span_id) WHERE p.artifact_id=? AND p.byte_start>? AND p.byte_end>? AND p.byte_start<? ORDER BY p.byte_start,p.span_id LIMIT ?`).iterate(preferred.artifact_id, after, from, to, Math.min(cap, budget.maxInspected - budget.inspected));

@@ -1,4 +1,4 @@
-import { ContextForgeStore, COMPILER_VERSION, canonicalJson, sha256, stableId } from './store.ts';
+import { ContextForgeStore, COMPILER_VERSION, createStoreReadBudget, canonicalJson, sha256, stableId } from './store.ts';
 import { STRUCTURAL_BLOCK_BYTES, isOrientationDocument, boundedHeaderEnd } from './structure.ts';
 import type { StructuralUnit } from './structure.ts';
 import type { DerivedNodeRecord, FactRecord, JsonValue } from './types.ts';
@@ -11,6 +11,11 @@ export interface RoutingEntry {
   ordinal:number; observedAt:number; sourceId:string; artifactId:string; trustClass:string; fidelity:string;
   spans:Array<{spanId:string;sourceId:string;artifactId:string;byteStart:number;byteEnd:number}>;
 }
+// Beyond this size, lexical facets are navigation samples, not exhaustive claims.
+const LARGE_SOURCE_BYTES=256*1024;
+const ROUTING_GROUP_BYTES=4096;
+const ROUTING_GROUP_SPANS=64;
+const ROUTING_SAMPLE_ENTRIES=24;
 type WikiPage = { title:string; entries:RoutingEntry[]; observed:number; omission?:{totalEntries:number;includedEntries:number;omittedEntries:number;complete:boolean;sourceHandle:string} };
 const compareText=(a:string,b:string)=>a<b?-1:a>b?1:0;
 const routingKey=(s:string)=>s.normalize('NFKC').toLowerCase().trim().replace(/\s+/gu,' ');
@@ -21,7 +26,7 @@ const entryOrder=(a:RoutingEntry,b:RoutingEntry)=>a.observedAt-b.observedAt||com
 export function collectEvidence(store:ContextForgeStore,namespaceId=store.namespaceId):{l1:Evidence[];l2:Evidence[]} {
   store.assertNamespace(namespaceId);
   const rows=store.db.prepare(`SELECT s.source_id,s.namespace_id,s.observed_at,s.trust_class,s.kind AS source_kind,c.span_id,c.body,c.ordinal,a.fidelity,a.artifact_id,a.kind AS artifact_kind,p.byte_start,p.byte_end
-    FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id
+    FROM chunks c JOIN spans p USING(span_id) JOIN artifacts a INDEXED BY cf_artifact_metadata USING(artifact_id) JOIN sources s ON s.source_id=p.source_id JOIN source_lifecycle l ON l.source_id=s.source_id
     WHERE s.namespace_id=? AND l.status='active' AND a.kind<>'normalized_message' AND a.text_content IS NOT NULL
     ORDER BY s.observed_at,s.source_id,a.artifact_id,c.ordinal,c.chunk_id`).all(namespaceId) as Evidence[];
   const sources=new Map<string,Map<string,Evidence[]>>();
@@ -35,7 +40,8 @@ export function collectEvidence(store:ContextForgeStore,namespaceId=store.namesp
     };
     groups.sort((a,b)=>preference(a[0])-preference(b[0])||compareText(a[0].artifact_id,b[0].artifact_id));
     // Opaque raw JSON for accepted turns has no text_content, and is excluded above.
-    l2.push(...groups[0]);
+    // Avoid the engine's variadic-argument limit on very large artifacts.
+    for(const row of groups[0])l2.push(row);
   }
   l2.sort((a,b)=>a.observed_at-b.observed_at||compareText(a.source_id,b.source_id)||compareText(a.artifact_id,b.artifact_id)||a.ordinal-b.ordinal);
   return {l1:l2.filter(e=>e.source_kind!=='tool_result'),l2};
@@ -80,14 +86,41 @@ function evidenceEntry(rows:Evidence[],dependencies:string[]=[],extraKinds:strin
 
 /** Deterministic bounded routing pages, including partitioned source fallbacks. */
 export function buildWikiPages(evidence:Evidence[],facts:RoutingEntry[]):Map<string,WikiPage> {
-  const pages=new Map<string,WikiPage>();
+  const pages=new Map<string,WikiPage>(),pageEntryIds=new Map<string,Set<string>>();
   const add=(key:string,title:string,entry:RoutingEntry)=>{
     let page=pages.get(key);if(!page){page={title,entries:[],observed:entry.observedAt};pages.set(key,page);}
-    if(!page.entries.some(e=>e.entryId===entry.entryId))page.entries.push(entry);page.observed=Math.max(page.observed,entry.observedAt);
+    let ids=pageEntryIds.get(key);if(!ids){ids=new Set();pageEntryIds.set(key,ids);}if(!ids.has(entry.entryId)){ids.add(entry.entryId);page.entries.push(entry);}page.observed=Math.max(page.observed,entry.observedAt);
   };
   const bySource=new Map<string,Evidence[]>();for(const e of evidence){const rows=bySource.get(e.source_id)??[];rows.push(e);bySource.set(e.source_id,rows);}
   const spanDeps=new Map<string,string[]>();for(const fact of facts)for(const span of fact.spanIds)spanDeps.set(span,unique([...(spanDeps.get(span)??[]),...fact.dependencyNodeIds]));
   for(const [sourceId,rows] of bySource) {
+    if(rows.reduce((n,row)=>n+row.byte_end-row.byte_start,0)>LARGE_SOURCE_BYTES) {
+      // Keep every original range in partitioned source pages. Group nearby chunks
+      // rather than duplicating each short line across entity/status/timeline pages.
+      // The sampled lexical views explicitly point back to this complete fallback.
+      const entries:RoutingEntry[]=[];let group:Evidence[]=[],bytes=0;
+      const flush=()=>{if(!group.length)return;entries.push(evidenceEntry(group,unique(group.flatMap(e=>spanDeps.get(e.span_id)??[]))));group=[];bytes=0;};
+      for(const row of rows){const size=row.byte_end-row.byte_start;
+        if(group.length&&(group.length>=ROUTING_GROUP_SPANS||bytes+size>ROUTING_GROUP_BYTES||row.artifact_id!==group[0].artifact_id||/^\s*#{1,6}\s+/u.test(row.body)))flush();
+        group.push(row);bytes+=size;
+      }flush();
+      for(const entry of entries)add(`wiki/sources/${sourceId}`,`Source ${sourceId}`,entry);
+      // Evenly distributed exact excerpts keep late-source navigation represented.
+      const selected=new Set<number>();for(let i=0;i<Math.min(ROUTING_SAMPLE_ENTRIES,entries.length);i++)selected.add(Math.floor(i*(entries.length-1)/Math.max(1,Math.min(ROUTING_SAMPLE_ENTRIES,entries.length)-1)));
+      const sampled=new Map<string,WikiPage>();
+      const sample=(key:string,title:string,entry:RoutingEntry)=>{let p=sampled.get(key);if(!p){p={title,entries:[],observed:entry.observedAt};sampled.set(key,p);}p.entries.push(entry);};
+      for(const index of selected){const entry=entries[index];
+        sample(`wiki/summaries/${sourceId}`,`Source excerpts: ${sourceId}`,entry);
+        sample(`wiki/timeline/${new Date(entry.observedAt).toISOString().slice(0,10)}/sources/${sourceId}`,'Timeline excerpts',entry);
+        // Bounded labels are hints only; all omitted labels/text remain in L0 and
+        // the complete source partitions. Controlled L1 facts route independently.
+        for(const entity of entry.entityKeys.slice(0,4))sample(`wiki/entities/${encodeURIComponent(entity)}/sources/${sourceId}`,entity,entry);
+        for(const topic of entry.topicKeys.slice(0,2))sample(`wiki/concepts/${encodeURIComponent(topic)}/sources/${sourceId}`,topic,entry);
+        for(const kind of entry.facetKinds.filter(k=>['status','change','proposal','anomaly','constraint','decision','negative'].includes(k)).slice(0,3))sample(`wiki/status/source-${sourceId}/${kind}`,`${kind} excerpts`,entry);
+      }
+      for(const [key,page] of sampled){page.omission={totalEntries:entries.length,includedEntries:page.entries.length,omittedEntries:entries.length-page.entries.length,complete:page.entries.length===entries.length,sourceHandle:`wiki/sources/${sourceId}`};pages.set(key,page);}
+      continue;
+    }
     let heading:string|undefined;let headingEntities:string[]=[];const entries:RoutingEntry[]=[];
     for(const row of rows) {
       const entry=evidenceEntry([row],spanDeps.get(row.span_id));
@@ -98,7 +131,9 @@ export function buildWikiPages(evidence:Evidence[],facts:RoutingEntry[]):Map<str
       add(`wiki/timeline/${new Date(row.observed_at).toISOString().slice(0,10)}`,'Timeline',entry);
     }
     // Table entries bind each row to its original header, introduction, and adjacent qualifications.
+    let tableHeading:RoutingEntry|undefined;
     for(let i=0;i<rows.length;i++) {
+      if(entries[i].facetKinds.includes('heading'))tableHeading=entries[i];
       if(!/[|\t]/u.test(rows[i].body))continue;
       const start=i;while(i+1<rows.length&&/[|\t]/u.test(rows[i+1].body))i++;
       const end=i;const prefix=rows.slice(Math.max(0,start-2),start);
@@ -107,7 +142,6 @@ export function buildWikiPages(evidence:Evidence[],facts:RoutingEntry[]):Map<str
       for(let j=start+(divider?2:1);j<=end;j++) {
         const members=[...prefix,header,...(divider?[divider]:[]),rows[j],...suffix];
         const entry=evidenceEntry(members,unique(members.flatMap(e=>spanDeps.get(e.span_id)??[])),['table']);
-        const tableHeading=entries.filter(e=>e.ordinal<=rows[start].ordinal&&e.facetKinds.includes('heading')).at(-1);
         if(tableHeading){entry.topicKeys=unique([...entry.topicKeys,...tableHeading.topicKeys]);entry.entityKeys=unique([...entry.entityKeys,...tableHeading.entityKeys]);}
         entry.ordinal=rows[j].ordinal;
         entries.push(entry);add(`wiki/tables/${sourceId}`,'Table excerpts',entry);
@@ -149,7 +183,7 @@ export function buildWikiPages(evidence:Evidence[],facts:RoutingEntry[]):Map<str
   for(const [key,page] of [...pages].sort(([a],[b])=>compareText(a,b))) {
     page.entries.sort(entryOrder);
     let part=0,chars=0,entries:RoutingEntry[]=[];
-    const flush=()=>{if(entries.length){bounded.set(part===0?key:`${key}/part-${String(part+1).padStart(4,'0')}`,{...page,entries});part++;entries=[];chars=0;}};
+    const flush=()=>{if(entries.length){bounded.set(part===0?key:`${key}/part-${String(part+1).padStart(4,'0')}`,{...page,entries,...(page.omission?{omission:{...page.omission,includedEntries:entries.length,omittedEntries:page.omission.totalEntries-entries.length,complete:page.omission.totalEntries===entries.length}}:{})});part++;entries=[];chars=0;}};
     for(const entry of page.entries){if(entries.length&&(entries.length>=64||chars+entry.text.length>16384))flush();entries.push(entry);chars+=entry.text.length;}flush();
   }
   return bounded;
@@ -249,7 +283,8 @@ export class ContextForgeCompiler {
       const sourceIds=unique(collected.l2.map(e=>e.source_id));
       const before=db.prepare("SELECT node_id,logical_key FROM derived_nodes WHERE namespace_id=? AND layer IN (1,2) AND status='active'").all(namespaceId);
       const beforeIds=new Set(before.map(n=>String(n.node_id))),beforeKeys=new Set(before.map(n=>String(n.logical_key)));
-      const made:DerivedNodeRecord[]=[];
+      // Receipts need identities, not another retained copy of every canonical page.
+      const made:Array<Pick<DerivedNodeRecord,'nodeId'|'logicalKey'>>=[];
       for(const e of evidence) {
         const assertions=extractAssertions(e.body), extracted:string[]=[];
         assertions.forEach((parsed,index)=>{
@@ -284,10 +319,11 @@ export class ContextForgeCompiler {
           }
           const node=this.store.publishNode({namespaceId,layer:1,logicalKey:key,kind:parsed.predicate,title:`${parsed.entity}: ${parsed.predicate}`,body:formattedFactBody,canonical:{entity:parsed.entity,predicate:parsed.predicate,object:parsed.object,polarity:parsed.polarity,assertionKind:kind,formula:parsed.formula??null,inputFactIds:operands,authority:e.trust_class},compilerVersion:COMPILER_VERSION,observedAt:e.observed_at,spanIds:[e.span_id],dependencyNodeIds:operands,extractionRule:'controlled-grammar-v1'});
           db.prepare('INSERT OR IGNORE INTO facts VALUES(?,?,?,?,?,?,?,?,?,?)').run(node.nodeId,entityId,parsed.predicate,canonicalJson(parsed.object),parsed.polarity,kind,parsed.unit??null,parsed.stateKey??null,e.trust_class,kind==='unresolved_candidate'?null:1);
-          extracted.push(node.nodeId); made.push(node);
+          extracted.push(node.nodeId); made.push({nodeId:node.nodeId,logicalKey:node.logicalKey});
         });
       }
       const facts=db.prepare(`SELECT n.*,f.entity_id,f.predicate,f.polarity,f.assertion_kind,e.display_name,e.entity_key FROM derived_nodes n JOIN facts f USING(node_id) LEFT JOIN entities e USING(entity_id) WHERE n.namespace_id=? AND n.status='active' ORDER BY n.observed_at,n.node_id`).all(namespaceId);
+      const evidenceBySpan=new Map(collected.l2.map(e=>[e.span_id,e]));
       const factEntries:RoutingEntry[]=[];
       for(const f of facts) {
         const provenance=this.store.getProvenance(String(f.node_id));
@@ -298,8 +334,8 @@ export class ContextForgeCompiler {
         factEntries.push({textKind:'derived',entryId:stableId('cf-wiki-fact-entry-v2',f.node_id,body),text:body,spanIds:provenance.map(p=>p.spanId),dependencyNodeIds:[String(f.node_id)],
           entityKeys:unique([...facets.entityKeys,...(f.entity_key==='record'?[]:[routingKey(String(f.entity_key))])]),topicKeys:unique([...facets.topicKeys,routingKey(String(f.predicate)),...(['net_mass','cumulative_mass'].includes(String(f.predicate))?String(f.entity_key).split(/\s+/u).map(routingKey):[])]),
           facetKinds:unique([...facets.facetKinds,...(f.polarity===-1?['negative']:[]),...(['decision','constraint','concept'].includes(String(f.predicate))?[String(f.predicate)]:[])]),
-          ordinal:collected.l2.find(e=>e.span_id===primary.spanId)?.ordinal??0,observedAt:Number(f.observed_at),sourceId:primary.sourceId,artifactId:primary.artifactId,trustClass:source.trustClass,
-          fidelity:String(db.prepare('SELECT fidelity FROM artifacts WHERE artifact_id=?').get(primary.artifactId)!.fidelity),
+          ordinal:evidenceBySpan.get(primary.spanId)?.ordinal??0,observedAt:Number(f.observed_at),sourceId:primary.sourceId,artifactId:primary.artifactId,trustClass:source.trustClass,
+          fidelity:String(db.prepare('SELECT fidelity FROM artifacts INDEXED BY cf_artifact_metadata WHERE artifact_id=?').get(primary.artifactId)!.fidelity),
           spans:provenance.map(p=>({spanId:p.spanId,sourceId:p.sourceId,artifactId:p.artifactId,byteStart:p.byteStart!,byteEnd:p.byteEnd!}))});
       }
       // Old stores can contain a whole long line in one chunk. Keep collection
@@ -320,16 +356,17 @@ export class ContextForgeCompiler {
         }
       }
       const pages=buildWikiPages(routingEvidence,factEntries);
+      const orientationSources=new Set(sourceIds.filter(id=>isOrientationDocument(this.store.getSource(id)!.originKey)));
+      for(const page of pages.values())for(const entry of page.entries)if(orientationSources.has(entry.sourceId)){entry.orientation=true;entry.facetKinds=unique([...entry.facetKinds,'orientation']);}
       // Structural navigation reuses L2 entry/provenance custody, not a second index/schema.
       for(const sourceId of sourceIds) {
         const source=this.store.getSource(sourceId)!;
-        if(isOrientationDocument(source.originKey))for(const page of pages.values())for(const entry of page.entries)if(entry.sourceId===sourceId){entry.orientation=true;entry.facetKinds=unique([...entry.facetKinds,'orientation']);}
         const units=this.store.getStructuralUnits(sourceId);
         const artifacts=new Map<string,Buffer>();
         const structuralEntries=new Map<string,RoutingEntry>();
         for(const unit of units) {
           let bytes=artifacts.get(unit.artifactId);if(!bytes){const a=db.prepare('SELECT blob_sha256 FROM artifacts WHERE artifact_id=?').get(unit.artifactId)!;bytes=this.store.readBlob(String(a.blob_sha256));artifacts.set(unit.artifactId,bytes);}
-          const artifact=db.prepare('SELECT fidelity FROM artifacts WHERE artifact_id=?').get(unit.artifactId)!;
+          const artifact=db.prepare('SELECT fidelity FROM artifacts INDEXED BY cf_artifact_metadata WHERE artifact_id=?').get(unit.artifactId)!;
           // Large parents route via their signature; parts hold bounded exact body support.
           const end=unit.byteEnd-unit.byteStart<=STRUCTURAL_BLOCK_BYTES?unit.byteEnd:Math.min(unit.byteEnd,unit.headerByteEnd,unit.byteStart+STRUCTURAL_BLOCK_BYTES);
           let safeEnd=end;while(safeEnd<bytes.length&&(bytes[safeEnd]&0xc0)===0x80)safeEnd--;
@@ -363,7 +400,7 @@ export class ContextForgeCompiler {
       // Cross-source lexical symbol/import references are routing edges, never claims of
       // semantic call resolution. Target span IDs remain authorized namespace provenance.
       const definitions=new Map<string,RoutingEntry[]>();
-      const structures=[...pages.values()].flatMap(p=>p.entries).filter(e=>e.structural);
+      const structures:RoutingEntry[]=[];for(const page of pages.values())for(const entry of page.entries)if(entry.structural)structures.push(entry);
       for(const entry of structures)if(entry.structural!.kind==='block'){const key=entry.structural!.symbolName;const entries=definitions.get(key)??[];entries.push(entry);definitions.set(key,entries);}
       for(const entry of structures)for(const ref of entry.structural!.references){
         for(const target of definitions.get(ref)??[]){if(target.sourceId===entry.sourceId)continue;
@@ -375,15 +412,17 @@ export class ContextForgeCompiler {
         const deps=unique(p.entries.flatMap(e=>e.dependencyNodeIds)),spans=unique(p.entries.flatMap(e=>e.spanIds));
         // Citation-looking original bytes are data, not a way to forge a compiler reference.
         const render=(text:string)=>text.replace(/\[span:([a-f0-9]{64})\]/g,'[ref-span:$1]');
-        made.push(this.store.publishNode({namespaceId,layer:2,logicalKey:key,kind:'wiki',title:p.title,
+        const node=this.store.publishNode({namespaceId,layer:2,logicalKey:key,kind:'wiki',title:p.title,
           body:p.entries.map(e=>`${render(e.text)} ${e.spanIds.map(s=>`[span:${s}]`).join(' ')}`).join('\n'),
           canonical:{template:WIKI_COMPILER_VERSION,entries:p.entries as unknown as JsonValue,dependencies:deps,...(p.omission?{omission:p.omission}:{})},
-          compilerVersion:WIKI_COMPILER_VERSION,observedAt:p.observed,spanIds:spans,dependencyNodeIds:deps,extractionRule:WIKI_COMPILER_VERSION}));
+          compilerVersion:WIKI_COMPILER_VERSION,observedAt:p.observed,spanIds:spans,dependencyNodeIds:deps,extractionRule:WIKI_COMPILER_VERSION});
+        made.push({nodeId:node.nodeId,logicalKey:node.logicalKey});
       }
       const retiredNodeIds:string[]=[];
       // Do not touch hand-published wiki pages, L3, or arbitrary dependent keyspaces.
-      const obsolete=db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND layer=2 AND kind='wiki' AND status='active' ORDER BY logical_key,node_id").all(namespaceId);
+      const obsolete=db.prepare("SELECT node_id,logical_key,canonical_json,compiler_version FROM derived_nodes WHERE namespace_id=? AND layer=2 AND kind='wiki' AND status='active' ORDER BY logical_key,node_id").iterate(namespaceId);
       for(const node of obsolete) {
+        if(pages.has(String(node.logical_key)))continue;
         const template=JSON.parse(String(node.canonical_json)).template;
         if(!String(node.logical_key).startsWith('wiki/')||![COMPILER_VERSION,WIKI_COMPILER_VERSION].includes(String(node.compiler_version))||!['extractive-v1',WIKI_COMPILER_VERSION].includes(template)||pages.has(String(node.logical_key)))continue;
         const cause=collected.l2[0]?.span_id??this.store.getProvenance(String(node.node_id))[0]?.spanId;
@@ -399,7 +438,8 @@ export class ContextForgeCompiler {
       const revisedNodeIds=unique(made.filter(n=>!beforeIds.has(n.nodeId)&&beforeKeys.has(n.logicalKey)).map(n=>n.nodeId));
       const unchangedNodeIds=unique(made.filter(n=>beforeIds.has(n.nodeId)).map(n=>n.nodeId));
       const activeSourceIds=db.prepare("SELECT s.source_id FROM sources s JOIN source_lifecycle l USING(source_id) WHERE s.namespace_id=? AND l.status='active' ORDER BY s.source_id").all(namespaceId).map(s=>String(s.source_id));
-      const unprocessedSourceIds=activeSourceIds.filter(id=>!sourceIds.includes(id));
+      const processedSourceIds=new Set(sourceIds);
+      const unprocessedSourceIds=activeSourceIds.filter(id=>!processedSourceIds.has(id));
       const changed=createdNodeIds.length+revisedNodeIds.length+retiredNodeIds.length>0;
       const generation=changed?this.store.bumpGeneration(namespaceId):Number(db.prepare('SELECT generation FROM namespaces WHERE namespace_id=?').get(namespaceId)!.generation);
       // An L2-only upgrade also receives an immutable receipt even when every L1 job was already done.
@@ -412,23 +452,38 @@ export class ContextForgeCompiler {
       return {compilerVersion:COMPILER_VERSION,wikiCompilerVersion:WIKI_COMPILER_VERSION,createdNodeIds,revisedNodeIds,unchangedNodeIds,retiredNodeIds,unprocessedSourceIds,namespaceId,sourceIds,nodeIds:nodes.map(r=>r.node_id as string),deterministicOutputSha256:hash,provenanceGaps:lint.provenanceGaps};
     });
   }
+  /** Explicit namespace-wide entry point; compile remains the single implementation owner. */
+  compileNamespace(namespaceId=this.store.namespaceId):CompileResult { return this.compile(namespaceId); }
   compilePending(namespaceId=this.store.namespaceId):CompileResult { return this.compile(namespaceId); }
+  /** Resolve a namespace from a source, then compile all active evidence in that namespace. */
   compileSource(sourceId:string):CompileResult { const source=this.store.getSource(sourceId);if(!source)throw new Error('Unknown source');return this.compile(source.namespaceId); }
   lintWiki(namespaceId=this.store.namespaceId):WikiLintResult {
     this.store.assertNamespace(namespaceId);const issues:WikiLintResult['issues']=[];
-    const nodes=this.store.db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND status='active'").all(namespaceId);
-    const blobCache=new Map<string,Buffer>();
+    const nodes=this.store.db.prepare("SELECT * FROM derived_nodes WHERE namespace_id=? AND status='active'").iterate(namespaceId);
+    // Per-page ranges, never a namespace-wide cache of complete CAS artifacts.
+    // Every range is verified by the public custody-aware reader before reuse.
     for(const node of nodes) {
       const provenance=this.store.getProvenance(node.node_id as string);
+      const provenanceBySpan=new Map(provenance.map(p=>[p.spanId,p]));
+      const spanCache=new Map<string,Buffer>();let cachedBytes=0;
+      const readSpan=(spanId:string)=>{
+        let bytes=spanCache.get(spanId);
+        if(!bytes){
+          bytes=this.store.readEvidenceSpan(spanId,{namespaceId,budget:createStoreReadBudget({maxBytes:Number.MAX_SAFE_INTEGER,maxInspected:1})}).bytes;
+          if(bytes.length<=1024*1024){
+            if(cachedBytes+bytes.length>1024*1024){spanCache.clear();cachedBytes=0;}
+            spanCache.set(spanId,bytes);cachedBytes+=bytes.length;
+          }
+        }
+        return bytes;
+      };
+      const artifactMetadata=new Map<string,{fidelity:string;trustClass:string}>();
       if(!provenance.length)issues.push({nodeId:node.node_id as string,code:'missing_provenance'});
       for(const p of provenance) {
         const row=this.store.db.prepare('SELECT s.namespace_id,l.status,a.blob_sha256,sp.quote_sha256 FROM spans sp JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) JOIN artifacts a USING(artifact_id) WHERE sp.span_id=?').get(p.spanId)!;
         if(row.namespace_id!==namespaceId||row.status!=='active')issues.push({nodeId:node.node_id as string,code:'invalid_source'});
         try {
-          const sha=row.blob_sha256 as string;
-          let bytes=blobCache.get(sha);
-          if(!bytes){bytes=this.store.readBlob(sha);blobCache.set(sha,bytes);}
-          if(p.byteStart!==null&&sha256(bytes.subarray(p.byteStart,p.byteEnd!))!==row.quote_sha256)throw new Error();
+          if(p.byteStart!==null&&sha256(readSpan(p.spanId))!==row.quote_sha256)throw new Error();
         }
         catch {issues.push({nodeId:node.node_id as string,code:'quote_hash_mismatch'});}
       }
@@ -449,22 +504,22 @@ export class ContextForgeCompiler {
               for(const spanId of entry.spanIds){entrySpans.add(spanId);if(!pageSpans.has(spanId))issue('entry_unlinked_span');}
               const exactParts:Buffer[]=[];
               for(const span of entry.spans) {
-                const p=provenance.find(p=>p.spanId===span.spanId);
+                const p=provenanceBySpan.get(span.spanId);
                 if(!p||!entry.spanIds.includes(span.spanId)||p.sourceId!==span.sourceId||p.artifactId!==span.artifactId||p.byteStart!==span.byteStart||p.byteEnd!==span.byteEnd){issue('entry_span_mismatch');continue;}
-                const artifact=this.store.db.prepare('SELECT blob_sha256,fidelity FROM artifacts WHERE artifact_id=?').get(p.artifactId)!;
-                const source=this.store.getSource(p.sourceId);
-                if(entry.textKind==='extractive'&&(entry.sourceId!==p.sourceId||entry.artifactId!==p.artifactId||entry.trustClass!==source?.trustClass||entry.fidelity!==artifact.fidelity))issue('entry_authority_mismatch');
+                let metadata=artifactMetadata.get(p.artifactId);
+                if(!metadata){const row=this.store.db.prepare('SELECT a.fidelity,s.trust_class FROM artifacts a INDEXED BY cf_artifact_metadata JOIN sources s USING(source_id) WHERE a.artifact_id=?').get(p.artifactId)!;metadata={fidelity:String(row.fidelity),trustClass:String(row.trust_class)};artifactMetadata.set(p.artifactId,metadata);}
+                if(entry.textKind==='extractive'&&(entry.sourceId!==p.sourceId||entry.artifactId!==p.artifactId||entry.trustClass!==metadata.trustClass||entry.fidelity!==metadata.fidelity))issue('entry_authority_mismatch');
                 try {
-                  const sha=String(artifact.blob_sha256);let bytes=blobCache.get(sha);if(!bytes){bytes=this.store.readBlob(sha);blobCache.set(sha,bytes);}
+                  const bytes=readSpan(span.spanId);
                   const index=entry.spans.indexOf(span),previous=entry.spans[index-1];if(previous&&!(previous.artifactId===span.artifactId&&previous.byteEnd===span.byteStart))exactParts.push(Buffer.from('\n[noncontiguous excerpt]\n'));
-                  exactParts.push(bytes.subarray(p.byteStart!,p.byteEnd!));
+                  exactParts.push(bytes);
                 }catch{issue('quote_hash_mismatch');}
               }
               if(unique(entry.spans.map((s:any)=>String(s.spanId))).join(',')!==unique(entry.spanIds).join(','))issue('entry_span_mismatch');
               if(entry.structural) {
-                const u=entry.structural,artifact=this.store.db.prepare('SELECT blob_sha256 FROM artifacts WHERE artifact_id=? AND source_id=?').get(entry.artifactId,entry.sourceId);
-                const bytes=artifact?blobCache.get(String(artifact.blob_sha256)):undefined;
-                if(!bytes||!Number.isSafeInteger(u.byteStart)||!Number.isSafeInteger(u.byteEnd)||u.byteStart<0||u.byteEnd>bytes.length||u.byteEnd<u.byteStart||u.headerByteStart<0||u.headerByteEnd<u.headerByteStart||u.headerByteEnd>bytes.length)issue('invalid_structural_range');
+                const u=entry.structural,artifact=this.store.db.prepare('SELECT b.byte_length FROM artifacts a JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.artifact_id=? AND a.source_id=?').get(entry.artifactId,entry.sourceId);
+                const byteLength=Number(artifact?.byte_length);
+                if(!artifact||!Number.isSafeInteger(u.byteStart)||!Number.isSafeInteger(u.byteEnd)||u.byteStart<0||u.byteEnd>byteLength||u.byteEnd<u.byteStart||u.headerByteStart<0||u.headerByteEnd<u.headerByteStart||u.headerByteEnd>byteLength)issue('invalid_structural_range');
                 else if(!entry.spans.some((span:any)=>span.byteStart>=u.byteStart&&span.byteEnd<=u.byteEnd))issue('structural_support_mismatch');
                 for(const link of entry.structuralLinks??[])for(const spanId of link.spanIds??[]){
                   const span=this.store.db.prepare('SELECT p.source_id,p.artifact_id,s.namespace_id,l.status FROM spans p JOIN sources s USING(source_id) JOIN source_lifecycle l USING(source_id) WHERE span_id=?').get(spanId);
@@ -502,7 +557,7 @@ export class ContextForgeCompiler {
           }
         }
       }
-      if(node.layer===2)for(const match of String(node.body).matchAll(/\[span:([a-f0-9]{64})\]/g))if(!provenance.some(p=>p.spanId===match[1]))issues.push({nodeId:node.node_id as string,code:'unlinked_citation'});
+      if(node.layer===2)for(const match of String(node.body).matchAll(/\[span:([a-f0-9]{64})\]/g))if(!provenanceBySpan.has(match[1]))issues.push({nodeId:node.node_id as string,code:'unlinked_citation'});
     }
     return {ok:issues.length===0,provenanceGaps:issues.filter(i=>['missing_provenance','invalid_source','unlinked_citation','quote_hash_mismatch','entry_unlinked_span','entry_span_mismatch','entry_quote_mismatch','entry_authority_mismatch','entry_source_mismatch','entry_dependency_unlinked','invalid_entry_dependency','unmapped_page_provenance','unmapped_page_text'].includes(i.code)).length,issues};
   }

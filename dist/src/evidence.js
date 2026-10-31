@@ -1,7 +1,123 @@
+import { getLanguageGrammar } from './code-decomposer.js';
 import { ContextForgeStore, stableId, createStoreReadBudget } from './store.js';
-import { analyzeRecallQuery, scoreFacetCoverage } from './retrieval.js';
+import { analyzeRecallQuery, scoreFacetCoverage, resolveRetrievalWorkPolicy } from './retrieval.js';
 import { estimateTokens } from './symbolic-ir.js';
 import { structuralUnits, STRUCTURAL_BLOCK_BYTES, isOrientationDocument, boundedHeaderEnd } from './structure.js';
+const DEFAULT_WINDOW_POLICY = {
+    maxAnchors: 4,
+    maxWindowBytes: 8192,
+    maxSourceBytes: 12288
+};
+export function resolveEvidenceWindowPolicy(historyTokens, sourceCount, maxReadBytes = 64 * 1024 * 1024) {
+    if (!Number.isFinite(historyTokens) || historyTokens < 0 || !Number.isSafeInteger(sourceCount) || sourceCount < 0 || !Number.isFinite(maxReadBytes) || maxReadBytes < 0) throw new RangeError('Invalid evidence window resources');
+    const sources = Math.max(1, sourceCount), tokens = Math.max(512, historyTokens);
+    const share = Math.floor(tokens * 3.6 * 0.85 / Math.sqrt(sources));
+    const maxSourceBytes = Math.min(Math.floor(maxReadBytes / 2), Math.max(2048, Math.min(32768, share)));
+    return {
+        maxSourceBytes,
+        maxWindowBytes: Math.min(maxSourceBytes, Math.max(2048, Math.floor(maxSourceBytes * 0.85))),
+        maxAnchors: Math.max(2, Math.min(12, Math.floor(maxSourceBytes / 2048)))
+    };
+}
+export function selectEvidenceAnchors(hits, recall, limit) {
+    const pool = [
+        ...hits
+    ], selected = [], covered = new Set();
+    while(pool.length && selected.length < limit){
+        pool.sort((a, b)=>scoreFacetCoverage(recall, (b.title ?? '') + ' ' + (b.body ?? b.text ?? ''), covered).gain - scoreFacetCoverage(recall, (a.title ?? '') + ' ' + (a.body ?? a.text ?? ''), covered).gain || scoreFacetCoverage(recall, (b.title ?? '') + ' ' + (b.body ?? b.text ?? '')).score - scoreFacetCoverage(recall, (a.title ?? '') + ' ' + (a.body ?? a.text ?? '')).score);
+        const hit = pool.shift();
+        selected.push(hit);
+        const text = (hit.title ?? '') + ' ' + (hit.body ?? hit.text ?? '');
+        for (const facet of recall.facets)if (scoreFacetCoverage({
+            ...recall,
+            facets: [
+                facet
+            ]
+        }, text).score >= 0.9) covered.add(facet.id);
+    }
+    return selected;
+}
+function evidenceWindowCharge(excerpts, policy) {
+    const raw = Buffer.byteLength(renderExcerpts(excerpts));
+    if (policy === DEFAULT_WINDOW_POLICY) return raw;
+    let groups = 0, lastEnd = -1, lastArtifact = '';
+    for (const e of [
+        ...excerpts
+    ].sort((a, b)=>a.artifactId.localeCompare(b.artifactId) || a.byteStart - b.byteStart || b.byteEnd - a.byteEnd)){
+        if (e.artifactId !== lastArtifact || e.byteStart > lastEnd) {
+            groups++;
+            lastEnd = e.byteEnd;
+            lastArtifact = e.artifactId;
+        } else lastEnd = Math.max(lastEnd, e.byteEnd);
+    }
+    return raw + groups * 384 + 512;
+}
+function rangesCover(excerpts, start, end, artifactId) {
+    let cursor = start;
+    for (const e of [
+        ...excerpts
+    ].filter((e)=>e.artifactId === artifactId).sort((a, b)=>a.byteStart - b.byteStart)){
+        if (e.byteStart > cursor) break;
+        if (e.byteEnd > cursor) cursor = e.byteEnd;
+        if (cursor >= end) return true;
+    }
+    return cursor >= end;
+}
+function mergeEvidenceMetadata(target, extra) {
+    bind(target, [
+        ...target.excerpts ?? [],
+        ...extra.excerpts ?? []
+    ]);
+    target.supportGroupIds = [
+        ...new Set([
+            ...target.supportGroupIds,
+            ...extra.supportGroupIds
+        ])
+    ];
+    target.supportRequirements = {
+        ...target.supportRequirements,
+        ...extra.supportRequirements
+    };
+    target.reasons = [
+        ...new Set([
+            ...target.reasons,
+            ...extra.reasons
+        ])
+    ];
+    target.matchedFacetIds = [
+        ...new Set([
+            ...target.matchedFacetIds,
+            ...extra.matchedFacetIds
+        ])
+    ];
+    target.derivedNodeIds = [
+        ...new Set([
+            ...target.derivedNodeIds ?? [],
+            ...extra.derivedNodeIds ?? []
+        ])
+    ];
+    target.claimSignatures = [
+        ...new Set([
+            ...target.claimSignatures ?? [],
+            ...extra.claimSignatures ?? []
+        ])
+    ];
+    if (extra.derivedText && !target.derivedText?.includes(extra.derivedText)) target.derivedText = [
+        target.derivedText,
+        extra.derivedText
+    ].filter(Boolean).join('\n');
+    target.trace = {
+        ...target.trace,
+        ...extra.trace,
+        documentStructuralRoute: !!(target.trace.documentStructuralRoute || extra.trace.documentStructuralRoute),
+        semanticInterpretation: !!(target.trace.semanticInterpretation || extra.trace.semanticInterpretation),
+        structuralUnits: uniqueStructuralTrace([
+            ...target.trace.structuralUnits ?? [],
+            ...extra.trace.structuralUnits ?? []
+        ])
+    };
+    target.utility = Math.max(target.utility, extra.utility);
+}
 export function renderExcerpts(excerpts) {
     const sorted = [
         ...excerpts
@@ -15,6 +131,61 @@ export function renderExcerpts(excerpts) {
         prev = c;
     }
     return text;
+}
+export function renderAttributedEvidence(store, c, recall, namespaceId = store.namespaceId) {
+    const units = c.trace?.structuralUnits ?? [];
+    if (!units.length || !c.excerpts?.length) return c.text;
+    const groups = [];
+    for (const e of [
+        ...c.excerpts
+    ].sort((a, b)=>a.artifactId.localeCompare(b.artifactId) || a.byteStart - b.byteStart || b.byteEnd - a.byteEnd)){
+        const last = groups.at(-1), end = last ? Math.max(...last.map((x)=>x.byteEnd)) : -1;
+        if (last && last[0].artifactId === e.artifactId && e.byteStart <= end) last.push(e);
+        else groups.push([
+            e
+        ]);
+    }
+    const rendered = groups.map((group)=>{
+        const start = Math.min(...group.map((e)=>e.byteStart)), end = Math.max(...group.map((e)=>e.byteEnd)), text = renderExcerpts(group);
+        const overlapping = units.filter((u)=>(!u.artifactId || u.artifactId === group[0].artifactId) && (u.byteStart < end && u.byteEnd > start || u.headerByteStart <= start && u.headerByteEnd >= end));
+        const unit = overlapping.filter((u)=>u.byteStart <= start && u.byteEnd >= end || u.headerByteStart <= start && u.headerByteEnd >= end).sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart))[0];
+        const paths = [
+            ...new Set(overlapping.filter((u)=>u.pathVerified).map((u)=>String(u.originKey)))
+        ];
+        const symbol = unit?.symbolPath;
+        const name = [
+            ...symbol ? [
+                symbol
+            ] : [],
+            ...paths.filter((path)=>!symbol?.includes(path))
+        ].join(' | ') || store.getSource(c.sourceId)?.originKey || c.sourceId;
+        const label = `Evidence ${String(name).slice(0, 240)}; bytes ${start}-${end}${unit?.kind === 'part' ? `; part-${unit.partIndex} of ${unit.totalParts}` : ''}${unit?.headerComplete === false ? '; header incomplete' : ''}`;
+        const citation = store.createEvidenceSpan(c.sourceId, group[0].artifactId, start, end, {
+            namespaceId,
+            maxBytes: end - start
+        });
+        if (!c.spanIds.includes(citation.spanId)) c.spanIds.push(citation.spanId);
+        const spans = `[span:${store.formatShortSpanId(citation.spanId, namespaceId)}]`;
+        return {
+            start,
+            text: `${label} ${spans}\n<source_quote>\n${text}\n</source_quote>`,
+            quality: scoreFacetCoverage(recall, text + ' ' + (unit?.symbolPath ?? '')).score
+        };
+    });
+    if (!/\b(history|historical|previous|prior|changed?|compare|comparison|before|timeline|chronolog\w*)\b/i.test(recall.original)) rendered.sort((a, b)=>a.quality - b.quality || a.start - b.start);
+    return rendered.map((g)=>g.text).join('\n\n');
+}
+export function remainingStructuralNavigation(c, quote) {
+    if (c.trace?.semanticInterpretation) return c.derivedText;
+    const lines = (c.derivedText ?? '').split('\n').filter((line)=>{
+        const path = /^(?:Verified source path|Inferred source region): ([^;]+)/.exec(line)?.[1];
+        const symbol = /; symbol ([^;]+)/.exec(line)?.[1];
+        if (path || symbol) return !!(path && !quote.includes(path) || symbol && !quote.includes(symbol) || line.includes('partial structural evidence') && !quote.includes('partial structural evidence') || line.includes('header incomplete') && !quote.includes('header incomplete'));
+        return /part-\d+ of \d+|header incomplete/.test(line) && !quote.includes(line);
+    });
+    return [
+        ...new Set(lines)
+    ].join('\n').slice(0, STRUCTURAL_NAVIGATION_CHARS) || undefined;
 }
 function bind(c, excerpts) {
     c.excerpts = [
@@ -31,16 +202,45 @@ function bind(c, excerpts) {
     ];
     return c;
 }
-export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], namespaceId = store.namespaceId, deadlineAt = Infinity, budget) {
+export const STRUCTURAL_NAVIGATION_CHARS = 2048;
+export function uniqueStructuralTrace(units) {
+    return [
+        ...new Map(units.map((u)=>[
+                `${u.artifactId ?? ''}:${u.byteStart}:${u.byteEnd}:${u.partIndex ?? 'whole'}`,
+                u
+            ])).values()
+    ];
+}
+export function renderStructuralNavigation(units, excerpts = []) {
+    const unique = uniqueStructuralTrace(units), lines = [], signatures = new Set();
+    let chars = 0;
+    const covers = (start, end)=>{
+        let cursor = start;
+        for (const e of [
+            ...excerpts
+        ].sort((a, b)=>a.byteStart - b.byteStart)){
+            if (e.byteStart > cursor) break;
+            if (e.byteEnd > cursor) cursor = e.byteEnd;
+            if (cursor >= end) return true;
+        }
+        return cursor >= end;
+    };
+    for (const u of unique){
+        if (!u.partIndex || u.parentByteStart !== undefined && covers(u.parentByteStart, u.parentByteEnd)) continue;
+        const signatureKey = `${u.headerByteStart}:${u.headerByteEnd}`;
+        const signature = signatures.has(signatureKey) ? '' : `; enclosing signature bytes ${signatureKey.replace(':', '-')}${u.headerComplete === false ? ' (header incomplete; continues to byte ' + u.fullHeaderByteEnd + ')' : ''}`;
+        const label = String(u.symbolPath ?? u.unitId).slice(0, 256);
+        const line = `${label}: part-${u.partIndex} of ${u.totalParts}; lines ${u.startLine}-${u.endLine}; previous=${u.previousPartId ?? 'none'}; next=${u.nextPartId ?? 'none'}${signature}`;
+        if (chars + line.length + 1 > STRUCTURAL_NAVIGATION_CHARS) break;
+        lines.push(line);
+        chars += line.length + 1;
+        signatures.add(signatureKey);
+    }
+    return lines.join('\n');
+}
+export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], namespaceId = store.namespaceId, deadlineAt = Infinity, budget, windowPolicy = DEFAULT_WINDOW_POLICY) {
     const source = store.getSource(sourceId);
     if (!source || source.namespaceId !== namespaceId || source.status !== 'active') return null;
-    const chunks = store.getEvidenceChunks(sourceId, {
-        namespaceId,
-        deadlineAt,
-        budget,
-        maxInspected: 8192,
-        maxBytes: 2 * 1024 * 1024
-    });
     let required;
     try {
         required = spanIds.map((id)=>store.readEvidenceSpan(id, {
@@ -51,6 +251,173 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
     } catch  {
         return null;
     }
+    const sourceBytes = Number(store.db.prepare('SELECT byte_length FROM blobs WHERE sha256=?').get(source.contentSha256)?.byte_length ?? 0);
+    const cursorCode = !!recall.cursorContext && !!getLanguageGrammar(source.originKey) && getLanguageGrammar(source.originKey)?.id !== 'markdown';
+    if ((sourceBytes > 64 * 1024 || cursorCode || windowPolicy.preferIndexedSeeds) && required.length) {
+        const excerpts = [
+            ...required
+        ], trace = [];
+        let incomplete = false;
+        let fallbackUnits;
+        let fallbackBytes;
+        for (const anchor of required.slice(0, windowPolicy.maxAnchors)){
+            const prefix = `wiki/structure/${sourceId}/`;
+            const rows = store.db.prepare(`SELECT canonical_json FROM derived_nodes WHERE namespace_id=? AND status='active' AND logical_key>=? AND logical_key<? AND json_extract(canonical_json,'$.entries[0].structural.kind') IN ('block','part','section','file') AND json_extract(canonical_json,'$.entries[0].structural.byteStart')<=? AND json_extract(canonical_json,'$.entries[0].structural.byteEnd')>=? ORDER BY json_extract(canonical_json,'$.entries[0].structural.byteEnd')-json_extract(canonical_json,'$.entries[0].structural.byteStart') LIMIT 4`).all(namespaceId, prefix, prefix + '~', anchor.byteStart, anchor.byteEnd);
+            if (!rows.length && getLanguageGrammar(source.originKey) && sourceBytes <= 256 * 1024 && Date.now() < deadlineAt) {
+                if (!fallbackUnits) {
+                    try {
+                        const full = store.createEvidenceSpan(sourceId, anchor.artifactId, 0, sourceBytes, {
+                            namespaceId,
+                            budget,
+                            deadlineAt
+                        });
+                        fallbackBytes = Buffer.from(full.text);
+                        fallbackUnits = structuralUnits(full.text, source.originKey);
+                    } catch  {
+                        fallbackUnits = [];
+                        incomplete = true;
+                    }
+                }
+                const local = fallbackUnits.filter((u)=>[
+                        'block',
+                        'part'
+                    ].includes(u.kind) && u.byteStart <= anchor.byteStart && u.byteEnd >= anchor.byteEnd).sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart))[0];
+                if (local && fallbackBytes) {
+                    const end = local.byteEnd - local.byteStart <= windowPolicy.maxWindowBytes ? local.byteEnd : Math.min(local.byteEnd, anchor.byteEnd);
+                    const ranges = [
+                        [
+                            local.byteStart,
+                            end
+                        ]
+                    ];
+                    if (local.kind === 'part' && local.headerByteStart < local.byteStart) ranges.unshift([
+                        local.headerByteStart,
+                        boundedHeaderEnd(fallbackBytes, local.headerByteStart, local.headerByteEnd)
+                    ]);
+                    const support = [];
+                    try {
+                        for (const [a, b] of ranges)support.push(store.createEvidenceSpan(sourceId, anchor.artifactId, a, b, {
+                            namespaceId,
+                            budget,
+                            deadlineAt
+                        }));
+                        const union = [
+                            ...excerpts,
+                            ...support
+                        ];
+                        if (Buffer.byteLength(renderExcerpts(union)) <= Math.max(windowPolicy.maxWindowBytes, Buffer.byteLength(renderExcerpts(required)))) {
+                            excerpts.push(...support);
+                            trace.push({
+                                ...local,
+                                artifactId: anchor.artifactId,
+                                whole: end === local.byteEnd,
+                                headerComplete: rangesCover(union, local.headerByteStart, local.headerByteEnd, anchor.artifactId)
+                            });
+                        } else incomplete = true;
+                    } catch  {
+                        incomplete = true;
+                    }
+                }
+            }
+            for (const row of rows){
+                const entry = JSON.parse(String(row.canonical_json)).entries?.[0], u = entry?.structural;
+                if (!u) continue;
+                if (excerpts.reduce((n, e)=>n + e.byteEnd - e.byteStart, 0) >= windowPolicy.maxWindowBytes) {
+                    incomplete = true;
+                    break;
+                }
+                try {
+                    const support = (entry.spanIds ?? []).map((id)=>store.readEvidenceSpan(id, {
+                            namespaceId,
+                            budget,
+                            deadlineAt
+                        }));
+                    const union = [
+                        ...new Map([
+                            ...excerpts,
+                            ...support
+                        ].map((e)=>[
+                                e.spanId,
+                                e
+                            ])).values()
+                    ];
+                    const bound = Math.max(windowPolicy.maxWindowBytes, Buffer.byteLength(renderExcerpts(required)));
+                    if (evidenceWindowCharge(union, windowPolicy) > bound) {
+                        incomplete = true;
+                        continue;
+                    }
+                    const covered = (start, end)=>{
+                        let cursor = start;
+                        for (const e of [
+                            ...union
+                        ].sort((a, b)=>a.byteStart - b.byteStart)){
+                            if (e.artifactId !== anchor.artifactId) continue;
+                            if (e.byteStart > cursor) break;
+                            if (e.byteEnd > cursor) cursor = e.byteEnd;
+                            if (cursor >= end) return true;
+                        }
+                        return cursor >= end;
+                    };
+                    const whole = covered(u.byteStart, u.byteEnd), headerComplete = covered(u.headerByteStart, u.headerByteEnd);
+                    excerpts.push(...support);
+                    trace.push({
+                        ...u,
+                        whole,
+                        headerComplete,
+                        fullHeaderByteEnd: u.headerByteEnd
+                    });
+                    incomplete ||= !whole || u.kind === 'part' || !headerComplete;
+                    break;
+                } catch  {
+                    incomplete = true;
+                    break;
+                }
+            }
+        }
+        const exact = [
+            ...new Map(excerpts.map((e)=>[
+                    e.spanId,
+                    e
+                ])).values()
+        ];
+        const text = renderExcerpts(exact), score = scoreFacetCoverage(recall, text);
+        return bind({
+            sourceId,
+            text: '',
+            spanIds: [],
+            artifactIds: [],
+            matchedFacetIds: score.matchedFacetIds,
+            supportGroupIds: [],
+            reasons: [
+                'lexical_match'
+            ],
+            trace: {
+                sourceRevision: source.originRevision,
+                sourceStatus: source.status,
+                trustClass: source.trustClass,
+                structuralUnits: uniqueStructuralTrace(trace),
+                indexedSeedHydration: true,
+                ...incomplete ? {
+                    truncated: true,
+                    structuralIncomplete: true
+                } : {}
+            },
+            utility: score.score,
+            ...trace.length ? {
+                derivedText: [
+                    renderStructuralNavigation(trace, exact),
+                    ...uniqueStructuralTrace(trace).map((u)=>`${u.pathVerified ? 'Verified source path' : 'Inferred source region'}: ${u.originKey}; symbol ${u.symbolPath}; original lines ${u.startLine}-${u.endLine}${!u.whole ? '; partial structural evidence' : ''}`)
+                ].filter(Boolean).join('\n').slice(0, STRUCTURAL_NAVIGATION_CHARS)
+            } : {}
+        }, exact);
+    }
+    const chunks = store.getEvidenceChunks(sourceId, {
+        namespaceId,
+        deadlineAt,
+        budget,
+        maxInspected: Math.min(4096, budget ? budget.maxInspected - budget.inspected : 4096),
+        maxBytes: 64 * 1024
+    });
     if (!chunks.length && !required.length) return null;
     const full = chunks.map((c)=>c.text).join(''), small = estimateTokens(full) <= 2048;
     let chosen = chunks;
@@ -110,10 +477,11 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
         let used = 0;
         const addRanges = (ranges)=>{
             const pending = ranges.filter(([start, end], i)=>end > start && !expanded.some((e)=>e.byteStart <= start && e.byteEnd >= end) && !ranges.some(([a, b], j)=>j !== i && a <= start && b >= end && (a < start || b > end || j < i)));
+            if (!pending.length) return 'covered';
             const size = pending.reduce((n, [a, b])=>n + b - a, 0);
-            if (used + size > 8192 || budget && (size > budget.maxBytes - budget.bytes || pending.length > budget.maxInspected - budget.inspected) || Date.now() >= deadlineAt) {
+            if (used + size > windowPolicy.maxWindowBytes || budget && (size > budget.maxBytes - budget.bytes || pending.length > budget.maxInspected - budget.inspected) || Date.now() >= deadlineAt) {
                 structuralIncomplete = true;
-                return false;
+                return 'rejected';
             }
             const staged = [];
             try {
@@ -124,11 +492,11 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
                 }));
             } catch  {
                 structuralIncomplete = true;
-                return false;
+                return 'rejected';
             }
             expanded.push(...staged);
             used += size;
-            return true;
+            return 'admitted';
         };
         for (const anchor of anchors){
             const enclosing = units.filter((u)=>u.byteStart <= anchor.byteStart && u.byteEnd >= anchor.byteEnd && u.kind !== 'part' && u.kind !== 'statement').sort((a, b)=>a.byteEnd - a.byteStart - (b.byteEnd - b.byteStart));
@@ -141,7 +509,8 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
                         whole.byteStart,
                         whole.byteEnd
                     ]
-                ])) structuralTrace.push({
+                ]) === 'admitted') structuralTrace.push({
+                    artifactId,
                     unitId: whole.unitId,
                     symbolPath: whole.symbolPath,
                     whole: true,
@@ -166,9 +535,12 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
                         headerStart,
                         headerEnd
                     ]
-                ])) structuralTrace.push({
+                ]) === 'admitted') structuralTrace.push({
+                    artifactId,
                     unitId: part.unitId,
                     symbolPath: parent?.symbolPath ?? part.symbolPath,
+                    parentByteStart: parent?.byteStart,
+                    parentByteEnd: parent?.byteEnd,
                     partIndex: part.partIndex,
                     totalParts: part.totalParts,
                     previousPartId: part.previousPartId ?? null,
@@ -187,6 +559,12 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
         if (expanded.length) selectedExcerpts = expanded;
     }
     const score = scoreFacetCoverage(recall, full + ' ' + required.map((p)=>p.text).join(' '));
+    const delivered = [
+        ...selectedExcerpts,
+        ...required
+    ];
+    const uniqueTrace = uniqueStructuralTrace(structuralTrace);
+    const navigation = renderStructuralNavigation(uniqueTrace, delivered);
     return bind({
         sourceId,
         text: '',
@@ -201,8 +579,8 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
             sourceRevision: source.originRevision,
             sourceStatus: source.status,
             trustClass: source.trustClass,
-            ...structuralTrace.length ? {
-                structuralUnits: structuralTrace
+            ...uniqueTrace.length ? {
+                structuralUnits: uniqueTrace
             } : {},
             ...chunks.truncated || structuralIncomplete ? {
                 truncated: true,
@@ -210,13 +588,10 @@ export function buildEvidenceWindow(store, sourceId, recall, spanIds = [], names
             } : {}
         },
         utility: score.score,
-        ...structuralTrace.some((u)=>u.partIndex) ? {
-            derivedText: 'Structural navigation (not original quote):\n' + structuralTrace.filter((u)=>u.partIndex).map((u)=>`${u.symbolPath}: part-${u.partIndex} of ${u.totalParts}; lines ${u.startLine}-${u.endLine}; previous=${u.previousPartId ?? 'none'}; next=${u.nextPartId ?? 'none'}; enclosing signature bytes ${u.headerByteStart}-${u.headerByteEnd}${u.headerComplete === false ? ' (header incomplete; continues to byte ' + u.fullHeaderByteEnd + ')' : ''}`).join('\n')
+        ...navigation ? {
+            derivedText: navigation
         } : {}
-    }, [
-        ...selectedExcerpts,
-        ...required
-    ]);
+    }, delivered);
 }
 function claimSignatures(recall, text) {
     return text.split(/(?<=[.!?])\s+|\n/u).filter((t)=>{
@@ -239,7 +614,7 @@ function claimSignatures(recall, text) {
     }).sort();
 }
 const historical = (q)=>/\b(history|historical|previous|prior|old|changed?|changes|compare|comparison|diff|versus|vs|before|original|initial|supersed\w*|release\s+1|v1)\b/i.test(q.original);
-export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = store.namespaceId, windowCache, deadlineAt = Infinity, budget) {
+export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = store.namespaceId, windowCache, deadlineAt = Infinity, budget, windowPolicy = DEFAULT_WINDOW_POLICY) {
     const spanCache = new Map();
     const readSupport = (id)=>{
         let p = spanCache.get(id);
@@ -302,7 +677,7 @@ export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = st
                 chars: 0
             };
             const chars = spans.reduce((n, s)=>n + readSupport(s).text.length, 0);
-            if (used.count >= 4 || used.chars + chars > 8192 && used.count > 0) {
+            if (used.count >= windowPolicy.maxAnchors || used.chars + chars > windowPolicy.maxWindowBytes && used.count > 0) {
                 reject = true;
                 truncated = true;
                 break;
@@ -314,13 +689,74 @@ export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = st
         ].sort());
         for (const [sourceId, spans] of bySource){
             const structuralSeed = entry.structural ? spans : [];
-            if (windowCache && !windowCache.has(sourceId)) windowCache.set(sourceId, buildEvidenceWindow(store, sourceId, recall, structuralSeed, namespaceId, deadlineAt, budget));
-            let base = windowCache?.get(sourceId) ?? buildEvidenceWindow(store, sourceId, recall, structuralSeed, namespaceId, deadlineAt, budget);
-            if (!base) continue;
-            if (entry.structural && !base.trace.structuralUnits?.some((u)=>u.unitId === entry.structural.unitId) && !spans.every((id)=>base.spanIds.includes(id))) {
-                const routed = buildEvidenceWindow(store, sourceId, recall, spans, namespaceId, deadlineAt, budget);
-                if (routed) base = routed;
+            let base;
+            const sourceGrammar = getLanguageGrammar(store.getSource(sourceId)?.originKey ?? '');
+            const standaloneCode = !!sourceGrammar && sourceGrammar.id !== 'markdown';
+            if (entry.structural && isDiscreteCodeUnit(entry.structural) && standaloneCode) {
+                const required = spans.map((id)=>readSupport(id));
+                const u = entry.structural;
+                if (u.parentId) {
+                    const parent = store.db.prepare("SELECT canonical_json FROM derived_nodes WHERE namespace_id=? AND status='active' AND logical_key=?").get(namespaceId, `wiki/structure/${sourceId}/${u.parentId}`);
+                    const enclosing = parent ? JSON.parse(String(parent.canonical_json)).entries?.[0]?.structural : undefined;
+                    if (enclosing?.kind === 'block' && enclosing.headerByteEnd > enclosing.headerByteStart && enclosing.headerByteEnd - enclosing.headerByteStart <= 4096 && !required.some((e)=>e.byteStart <= enclosing.headerByteStart && e.byteEnd >= enclosing.headerByteEnd)) {
+                        try {
+                            required.push(store.createEvidenceSpan(sourceId, required[0].artifactId, enclosing.headerByteStart, enclosing.headerByteEnd, {
+                                namespaceId,
+                                budget,
+                                deadlineAt
+                            }));
+                        } catch  {
+                            truncated = true;
+                        }
+                    }
+                }
+                const score = scoreFacetCoverage(recall, String(entry.text) + ' ' + u.symbolPath);
+                base = bind({
+                    sourceId,
+                    text: '',
+                    spanIds: [],
+                    artifactIds: [],
+                    matchedFacetIds: score.matchedFacetIds,
+                    supportGroupIds: [],
+                    reasons: [
+                        'provenance_support'
+                    ],
+                    trace: {
+                        sourceStatus: 'active',
+                        structuralUnits: [
+                            {
+                                ...u,
+                                whole: rangesCover(required, u.byteStart, u.byteEnd, required[0].artifactId),
+                                headerComplete: rangesCover(required, u.headerByteStart, u.headerByteEnd, required[0].artifactId)
+                            }
+                        ],
+                        coherentStructuralRoute: true
+                    },
+                    utility: score.score
+                }, required);
+                if (base.trace.structuralUnits.some((unit)=>!unit.whole || !unit.headerComplete)) base.trace = {
+                    ...base.trace,
+                    truncated: true,
+                    structuralIncomplete: true
+                };
+            } else {
+                if (windowCache && !windowCache.has(sourceId)) windowCache.set(sourceId, buildEvidenceWindow(store, sourceId, recall, structuralSeed, namespaceId, deadlineAt, budget, windowPolicy));
+                base = windowCache?.get(sourceId) ?? buildEvidenceWindow(store, sourceId, recall, structuralSeed, namespaceId, deadlineAt, budget, windowPolicy);
+                if (base && entry.structural && (!standaloneCode || isDocumentStructuralUnit(entry.structural))) {
+                    base = {
+                        ...base,
+                        trace: {
+                            ...base.trace,
+                            documentStructuralRoute: true,
+                            structuralUnits: uniqueStructuralTrace([
+                                ...base.trace.structuralUnits ?? [],
+                                entry.structural
+                            ])
+                        }
+                    };
+                }
             }
+            if (!base) continue;
             const required = spans.map((id)=>readSupport(id));
             const alternateContext = required.flatMap((p)=>{
                 if (base.artifactIds.includes(p.artifactId)) return [];
@@ -361,10 +797,14 @@ export function hydrateProvenanceSupport(store, nodeId, recall, namespaceId = st
                 ...required,
                 ...alternateContext
             ]);
-            if (Number(row.layer) === 1) c.derivedText = `[${row.status}] revision ${row.revision}: ${row.body}`;
+            if (Number(row.layer) === 1) {
+                c.derivedText = `[${row.status}] revision ${row.revision}: ${row.body}`;
+                c.trace.semanticInterpretation = true;
+            }
             c.claimSignatures = claimSignatures(recall, String(entry.text));
             c.trace = {
                 ...c.trace,
+                extractiveRouting: Number(row.layer) === 2 && entry.textKind !== 'derived' && bySource.size === 1,
                 seedNodeId: nodeId,
                 nodeStatus: row.status,
                 ...entry.entryId ? {
@@ -591,7 +1031,76 @@ export function buildTemporalStateLedger(store, candidateSourceIds, recall, name
     }
     return ledgers;
 }
-export function discoverEvidenceCandidates(store, query, namespaceId = store.namespaceId, deadlineAt = Infinity) {
+export function isDocumentStructuralUnit(unit) {
+    if (unit?.kind === 'section') return true;
+    const grammar = getLanguageGrammar(String(unit?.originKey ?? ''));
+    return !isDiscreteCodeUnit(unit) && (!grammar || grammar.id === 'markdown') && !/^code: .+ \((?:python|typescript)\)$/.test(String(unit?.inferredLabel ?? ''));
+}
+export function isDiscreteCodeUnit(unit) {
+    if (unit?.kind === 'block') return true;
+    if (unit?.kind !== 'part' || unit.symbolPath === unit.originKey) return false;
+    const grammar = getLanguageGrammar(String(unit.originKey ?? ''));
+    return !!grammar && grammar.id !== 'markdown' || /^code: .+ \((?:python|typescript)\)$/.test(String(unit.inferredLabel ?? ''));
+}
+export function selectCoherentEvidence(candidates, recall, windowPolicy = DEFAULT_WINDOW_POLICY) {
+    const byRange = new Map();
+    for (const c of candidates){
+        const key = c.excerpts?.map((e)=>`${e.artifactId}:${e.byteStart}:${e.byteEnd}`).sort().join('|') ?? c.spanIds.join('|');
+        const old = byRange.get(key);
+        if (old) mergeEvidenceMetadata(old, c);
+        else byRange.set(key, {
+            ...c
+        });
+    }
+    const unique = [
+        ...byRange.values()
+    ];
+    const quality = (c)=>scoreFacetCoverage(recall, c.text + ' ' + (c.trace?.structuralUnits ?? []).map((u)=>u.symbolPath).join(' ')).score;
+    unique.sort((a, b)=>quality(b) - quality(a) || a.text.length - b.text.length || a.spanIds.join().localeCompare(b.spanIds.join()));
+    if (!unique.length) return [];
+    const selected = [], covered = new Set();
+    let bytes = 0;
+    const top = quality(unique[0]);
+    const comparative = /\b(compare|contrast|difference|differences|history|historical)\b/i.test(recall.original);
+    for (const c of unique){
+        const coverage = scoreFacetCoverage(recall, c.text + ' ' + (c.trace?.structuralUnits ?? []).map((u)=>u.symbolPath).join(' '), covered);
+        const exactNew = recall.facets.some((f)=>f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'entity') && !covered.has(f.id) && coverage.matchedFacetIds.includes(f.id) && c.text.includes(f.surface));
+        const essential = c.reasons.includes('contradiction') || c.reasons.includes('dependency');
+        const discrete = (c.trace?.structuralUnits ?? []).some(isDiscreteCodeUnit) && !(c.trace?.structuralUnits ?? []).some((u)=>u.kind === 'section') && !c.trace?.documentStructuralRoute;
+        const ranges = selected.flatMap((x)=>x.excerpts ?? []);
+        const covering = selected.find((x)=>(c.excerpts ?? []).every((e)=>(x.excerpts ?? []).some((r)=>r.artifactId === e.artifactId && r.byteStart <= e.byteStart && r.byteEnd >= e.byteEnd)));
+        if (covering) {
+            mergeEvidenceMetadata(covering, c);
+            continue;
+        }
+        if (discrete && selected.length && !comparative && !essential && quality(c) < top / 2 && !exactNew) continue;
+        if (discrete && selected.length >= 2 && !comparative && !essential && coverage.gain <= 0) continue;
+        const next = evidenceWindowCharge([
+            ...selected.flatMap((x)=>x.excerpts ?? []),
+            ...c.excerpts ?? []
+        ], windowPolicy);
+        if (next > windowPolicy.maxSourceBytes && selected.length) continue;
+        selected.push(c);
+        bytes = next;
+        coverage.matchedFacetIds.forEach((id)=>covered.add(id));
+    }
+    return selected;
+}
+export function focusCursorEvidence(candidates, recall) {
+    const primary = recall.cursorContext?.primaryIdentifiers ?? [];
+    if (!primary.length) return candidates;
+    const exact = (text, id)=>new RegExp('(?:^|[^A-Za-z0-9_$])' + id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:$|[^A-Za-z0-9_$])').test(text);
+    const definition = (c)=>primary.some((id)=>(c.trace.structuralUnits ?? []).some((u)=>u.symbolName === id || String(u.symbolPath).endsWith('::' + id)));
+    if (!candidates.some(definition)) return candidates;
+    const strongest = Math.max(...candidates.filter(definition).map((c)=>c.utility));
+    return candidates.filter((c)=>{
+        const linked = c.reasons.some((r)=>r === 'dependency' || r === 'contradiction') || c.trace.semanticInterpretation || Object.values(c.supportRequirements ?? {}).some((ids)=>ids.some((id)=>!c.spanIds.includes(id)));
+        const hit = primary.some((id)=>exact(c.text, id));
+        if (linked || definition(c) || hit || c.utility >= strongest / 2) return true;
+        return false;
+    });
+}
+export function discoverEvidenceCandidates(store, query, namespaceId = store.namespaceId, deadlineAt = Infinity, resources = {}) {
     const recall = analyzeRecallQuery(query);
     if (!recall.substantiveTerms.length) return {
         candidates: [],
@@ -602,11 +1111,24 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
         },
         truncated: false
     };
+    const corpusBytes = Number(store.db.prepare("SELECT coalesce(sum(b.byte_length),0) bytes FROM sources s JOIN source_lifecycle l USING(source_id) JOIN blobs b ON b.sha256=s.content_sha256 WHERE s.namespace_id=? AND l.status='active'").get(namespaceId).bytes);
+    const policy = resolveRetrievalWorkPolicy({
+        ...resources,
+        corpusBytes
+    });
+    const activeSourceCount = Number(store.db.prepare("SELECT count(*) n FROM sources s JOIN source_lifecycle l USING(source_id) WHERE s.namespace_id=? AND l.status='active'").get(namespaceId).n);
+    const windowPolicy = resolveEvidenceWindowPolicy(resources.historyTokens ?? 9500, activeSourceCount, policy.maxBytes);
     const budget = createStoreReadBudget({
-        maxInspected: 8192,
-        maxBytes: 8 * 1024 * 1024,
+        maxInspected: policy.hydrationRows,
+        maxBytes: Math.floor(policy.maxBytes / 2),
         deadlineAt
     });
+    const lane = ()=>createStoreReadBudget({
+            maxInspected: policy.discoveryRows,
+            maxBytes: Math.floor(policy.maxBytes / 8),
+            deadlineAt
+        });
+    const rawBudget = lane(), factBudget = lane(), wikiBudget = lane(), facetBudget = lane();
     const raw = store.search(query, {
         namespaceId,
         layers: [
@@ -614,7 +1136,7 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
         ],
         limit: 128,
         deadlineAt,
-        budget
+        budget: rawBudget
     });
     let inspectedChunks = raw.inspected ?? raw.length, statisticsInspected = raw.statisticsInspected ?? 0, continuationTruncated = false;
     const covered = new Set(raw.filter((h)=>scoreFacetCoverage(recall, h.title + ' ' + h.body).anchored).flatMap((h)=>scoreFacetCoverage(recall, h.title + ' ' + h.body).matchedFacetIds));
@@ -626,15 +1148,21 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
             break;
         }
         facetQueries++;
+        const anchor = recall.facets.find((f)=>f.origin === 'question' && (f.kind === 'identifier' || f.kind === 'entity') && f.id !== facet.id);
         const extra = store.search(facet.surface, {
             namespaceId,
             layers: [
                 0
             ],
-            limit: 256,
-            maxInspected: 256,
+            limit: 128,
+            maxInspected: 128,
             deadlineAt,
-            budget
+            budget: facetBudget,
+            ...anchor ? {
+                requiredTerms: [
+                    anchor.aliases[0]
+                ]
+            } : {}
         });
         inspectedChunks += extra.inspected ?? extra.length;
         statisticsInspected += extra.statisticsInspected ?? 0;
@@ -644,48 +1172,41 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
             scoreFacetCoverage(recall, h.title + ' ' + h.body).matchedFacetIds.forEach((f)=>covered.add(f));
         }
     }
-    let rawCursor = raw.nextRowid ?? 0, rawPages = 0, continuedInspected = 0, continuedStatistics = 0;
-    while(raw.truncated && rawPages < 3 && Date.now() < deadlineAt && budget.inspected < budget.maxInspected && budget.bytes < budget.maxBytes){
-        const page = store.search(query, {
-            namespaceId,
-            layers: [
-                0
-            ],
-            limit: 128,
-            afterRowid: rawCursor,
-            deadlineAt,
-            budget,
-            maxInspected: 256
-        });
-        rawPages++;
-        continuedInspected += page.inspected ?? page.length;
-        continuedStatistics += page.statisticsInspected ?? 0;
-        if ((page.nextRowid ?? rawCursor) <= rawCursor) break;
-        rawCursor = page.nextRowid;
-        for (const h of page)if (!raw.some((r)=>r.chunkId === h.chunkId)) raw.push(h);
-        if (!page.truncated) break;
-    }
-    inspectedChunks += continuedInspected;
-    statisticsInspected = statisticsInspected + continuedStatistics;
-    const nodes = Date.now() < deadlineAt ? store.search(query, {
+    const facts = store.search(query, {
         namespaceId,
         layers: [
-            1,
+            1
+        ],
+        limit: 32,
+        deadlineAt,
+        budget: factBudget
+    });
+    const wiki = store.search(query, {
+        namespaceId,
+        layers: [
             2
         ],
         limit: 64,
         deadlineAt,
-        budget
-    }) : Object.assign([], {
-        truncated: true,
-        inspected: 0,
-        statisticsInspected: 0
+        budget: wikiBudget
     });
-    statisticsInspected += nodes.statisticsInspected ?? 0;
+    const nodes = Object.assign([
+        ...facts,
+        ...wiki
+    ], {
+        inspected: facts.inspected + wiki.inspected,
+        truncated: facts.truncated || wiki.truncated
+    });
     const out = new Map(), windowCache = new Map();
+    const structuralPool = [], extractivePool = [];
+    const collect = (c)=>{
+        if (c.trace?.coherentStructuralRoute) structuralPool.push(c);
+        else if (c.trace?.extractiveRouting) extractivePool.push(c);
+        else merge(c);
+    };
     const merge = (c)=>{
         const prev = out.get(c.sourceId);
-        if (prev && c.derivedText === undefined && c.trace?.seedNodeId) {
+        if (prev && c.trace?.seedNodeId) {
             const union = [
                 ...new Map([
                     ...prev.excerpts ?? [],
@@ -695,7 +1216,7 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
                         e
                     ])).values()
             ];
-            if (renderExcerpts(union).length > 12288) {
+            if (evidenceWindowCharge(union, windowPolicy) > windowPolicy.maxSourceBytes) {
                 prev.trace = {
                     ...prev.trace,
                     truncated: true
@@ -721,16 +1242,28 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
                 ...prev.excerpts ?? [],
                 ...c.excerpts ?? []
             ]);
-            if (c.derivedText && !prev.derivedText?.includes(c.derivedText)) prev.derivedText = (prev.derivedText ? prev.derivedText + '\n' : '') + c.derivedText;
+            if (c.derivedText && !prev.derivedText?.includes(c.derivedText)) {
+                const combined = (prev.derivedText ? prev.derivedText + '\n' : '') + c.derivedText;
+                if (c.trace?.indexedSeedHydration) {
+                    if (combined.length <= STRUCTURAL_NAVIGATION_CHARS) prev.derivedText = combined;
+                } else prev.derivedText = combined;
+            }
             prev.reasons = [
                 ...new Set([
                     ...prev.reasons,
                     ...c.reasons
                 ])
             ];
+            prev.utility = Math.max(prev.utility, c.utility);
             prev.trace = {
                 ...prev.trace,
-                ...c.trace
+                ...c.trace,
+                documentStructuralRoute: !!(prev.trace.documentStructuralRoute || c.trace.documentStructuralRoute),
+                semanticInterpretation: !!(prev.trace.semanticInterpretation || c.trace.semanticInterpretation),
+                structuralUnits: uniqueStructuralTrace([
+                    ...prev.trace.structuralUnits ?? [],
+                    ...c.trace.structuralUnits ?? []
+                ])
             };
             prev.supportRequirements = {
                 ...prev.supportRequirements,
@@ -753,9 +1286,7 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
     for (const hit of raw){
         if (Date.now() >= deadlineAt) break;
         if (!hit.sourceId || !scoreFacetCoverage(recall, hit.title + ' ' + hit.body).anchored) continue;
-        if (!windowCache.has(hit.sourceId)) windowCache.set(hit.sourceId, buildEvidenceWindow(store, hit.sourceId, recall, hit.spanId ? [
-            hit.spanId
-        ] : [], namespaceId, deadlineAt, budget));
+        if (!windowCache.has(hit.sourceId)) windowCache.set(hit.sourceId, buildEvidenceWindow(store, hit.sourceId, recall, selectEvidenceAnchors(raw.filter((h)=>h.sourceId === hit.sourceId && h.spanId), recall, windowPolicy.maxAnchors).map((h)=>h.spanId), namespaceId, deadlineAt, budget, windowPolicy));
         const c = windowCache.get(hit.sourceId);
         if (c && scoreFacetCoverage(recall, c.text).anchored && c.utility > 0) merge({
             ...c,
@@ -776,19 +1307,19 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
     }
     for (const h of seeds){
         if (Date.now() >= deadlineAt) break;
-        for (const c of hydrateProvenanceSupport(store, h.nodeId, recall, namespaceId, windowCache, deadlineAt, budget))merge(c);
+        for (const c of hydrateProvenanceSupport(store, h.nodeId, recall, namespaceId, windowCache, deadlineAt, budget, windowPolicy))collect(c);
     }
     const related = expandRelatedPremises(store, seeds.map((h)=>h.nodeId), recall, namespaceId, deadlineAt, budget);
     for (const r of related){
         if (Date.now() >= deadlineAt) break;
-        for (const c of hydrateProvenanceSupport(store, r.node.nodeId, recall, namespaceId, windowCache, deadlineAt, budget)){
+        for (const c of hydrateProvenanceSupport(store, r.node.nodeId, recall, namespaceId, windowCache, deadlineAt, budget, windowPolicy)){
             c.reasons.push(r.relation === 'contradicts' ? 'contradiction' : 'dependency');
             c.trace = {
                 ...c.trace,
                 relation: r.relation,
                 direction: r.direction
             };
-            merge(c);
+            collect(c);
         }
     }
     const questionFacetIds = new Set(recall.facets.filter((f)=>f.origin === 'question').map((f)=>f.id));
@@ -812,7 +1343,7 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
             if (Date.now() >= deadlineAt) break;
             const row = store.db.prepare('SELECT title,body FROM derived_nodes WHERE node_id=? AND namespace_id=?').get(b.nodeId, namespaceId);
             if (!row || !scoreFacetCoverage(recall, `${row.title} ${row.body}`).anchored) continue;
-            for (const c of hydrateProvenanceSupport(store, b.nodeId, recall, namespaceId, windowCache, deadlineAt, budget)){
+            for (const c of hydrateProvenanceSupport(store, b.nodeId, recall, namespaceId, windowCache, deadlineAt, budget, windowPolicy)){
                 c.reasons.push('triangulated_bridge');
                 c.utility += b.triangulationScore;
                 c.trace = {
@@ -821,9 +1352,40 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
                     minHop: b.minHop,
                     triangulationScore: b.triangulationScore
                 };
-                merge(c);
+                collect(c);
             }
         }
+    }
+    const bySource = new Map();
+    for (const c of structuralPool){
+        const list = bySource.get(c.sourceId) ?? [];
+        list.push(c);
+        bySource.set(c.sourceId, list);
+    }
+    for (const [sourceId, pool] of bySource){
+        const selected = selectCoherentEvidence(pool, recall, windowPolicy);
+        const raw = out.get(sourceId);
+        if (raw && getLanguageGrammar(store.getSource(sourceId)?.originKey ?? '') && !raw.supportGroupIds.length && !raw.trace?.documentStructuralRoute && selected.length && selected.every((c)=>!(c.trace?.structuralUnits ?? []).some((u)=>!isDiscreteCodeUnit(u)))) {
+            const covered = new Set(selected.flatMap((c)=>c.matchedFacetIds));
+            const residual = (raw.excerpts ?? []).filter((e)=>scoreFacetCoverage(recall, e.text, covered).gain > 0);
+            if (!residual.length) out.delete(sourceId);
+            else {
+                bind(raw, residual);
+                const score = scoreFacetCoverage(recall, raw.text);
+                raw.utility = score.score;
+                raw.matchedFacetIds = score.matchedFacetIds;
+            }
+        }
+        for (const c of selected)merge(c);
+    }
+    for (const c of extractivePool){
+        const current = out.get(c.sourceId);
+        const hasCoherent = current?.trace?.coherentStructuralRoute && !current?.trace?.documentStructuralRoute;
+        if (hasCoherent && !c.reasons.some((r)=>r === 'contradiction' || r === 'dependency') && !historical(recall) && !/\b(contrast)\b/i.test(recall.original)) {
+            const seen = new Set(current.matchedFacetIds);
+            if (!c.matchedFacetIds.some((id)=>!seen.has(id))) continue;
+        }
+        merge(c);
     }
     if (out.size > 0 && Date.now() < deadlineAt) {
         const ledgers = buildTemporalStateLedger(store, [
@@ -834,14 +1396,15 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
                 const cand = out.get(srcId);
                 if (cand && !cand.derivedText?.includes(l.ledgerText)) {
                     cand.derivedText = (cand.derivedText ? cand.derivedText + '\n' : '') + l.ledgerText;
+                    cand.trace.semanticInterpretation = true;
                 }
             }
         }
     }
     for (const c of out.values())c.claimSignatures = claimSignatures(recall, c.text);
-    const candidates = [
+    const candidates = focusCursorEvidence([
         ...out.values()
-    ].sort((a, b)=>b.utility - a.utility || a.sourceId.localeCompare(b.sourceId));
+    ], recall).sort((a, b)=>b.utility - a.utility || a.sourceId.localeCompare(b.sourceId));
     const groupClaims = new Map();
     for (const c of candidates)for (const g of c.supportGroupIds){
         const set = groupClaims.get(g) ?? new Set();
@@ -861,10 +1424,6 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
         seen.add(key);
         return true;
     });
-    const retainedSpans = new Set(unique.flatMap((c)=>c.spanIds));
-    for (const c of unique){
-        c.supportGroupIds = c.supportGroupIds.filter((g)=>(c.supportRequirements?.[g] ?? []).every((s)=>retainedSpans.has(s)));
-    }
     return {
         candidates: unique,
         redundantSourceIds,
@@ -873,8 +1432,19 @@ export function discoverEvidenceCandidates(store, query, namespaceId = store.nam
             chunks: inspectedChunks,
             nodes: nodes.inspected ?? nodes.length,
             statistics: statisticsInspected,
-            inspectedTotal: budget.inspected,
-            readBytes: budget.bytes,
+            inspectedTotal: budget.inspected + rawBudget.inspected + factBudget.inspected + wikiBudget.inspected + facetBudget.inspected,
+            readBytes: budget.bytes + rawBudget.bytes + factBudget.bytes + wikiBudget.bytes + facetBudget.bytes,
+            maxInspected: policy.maxInspected,
+            maxReadBytes: policy.maxBytes,
+            windowAnchors: windowPolicy.maxAnchors,
+            windowBytes: windowPolicy.maxWindowBytes,
+            sourceEvidenceBytes: windowPolicy.maxSourceBytes,
+            hydrationReserved: policy.hydrationRows,
+            l0Inspected: rawBudget.inspected,
+            l1Inspected: factBudget.inspected,
+            l2Inspected: wikiBudget.inspected,
+            facetInspected: facetBudget.inspected,
+            hydrationInspected: budget.inspected,
             facetQueries,
             neighbors: related.length,
             neighborsInspected: related.inspected,

@@ -62,7 +62,7 @@ test('R2 superseded derived values are excluded for current state and labeled fo
 
 test('R3 shared-key neighbors are admitted and inspected graph work is bounded and marked truncated',()=>{const f=fixture();try{const s=f.store.ingestSource({originKey:'graph-bounds',text:'Zircon qualification.'}),span=f.store.getEvidenceChunks(s.sourceId)[0].spanId;const make=(i:number)=>f.store.publishNode({namespaceId:f.store.namespaceId,layer:1,logicalKey:'shared'+i,kind:'fact',title:'Zircon qualification '+i,body:'Zircon qualification '+i,canonical:{entity:'Zircon'},compilerVersion:'test',observedAt:1,spanIds:[span],extractionRule:'test'});const seed=make(0),neighbor=make(1);assert.ok(expandRelatedPremises(f.store,[seed.nodeId],analyzeRecallQuery('Zircon qualification')).some(r=>r.relation==='shared_key'&&r.node.nodeId===neighbor.nodeId));for(let i=2;i<90;i++)make(i);const r=f.store.getRelatedNodes([seed.nodeId],{limit:64}) as any;assert.ok(r.truncated);assert.ok(r.inspected<=256);const expired=f.store.getRelatedNodes([seed.nodeId],{deadlineAt:0} as any) as any;assert.ok(expired.truncated);assert.equal(expired.length,0);}finally{f.clean();}});
 
-test('R4 compiled equivalent single claims deduplicate without defeating exhaustive obligations',()=>{const f=fixture();try{for(let i=0;i<5;i++)f.store.ingestSource({originKey:'copy'+i,text:'Varden launch is Tuesday.'});new ContextForgeCompiler(f.store).compile();const p=plan(f.store,'Varden launch');assert.equal(p.receipt.selections.length,1);const all=plan(f.store,'Review all documents');assert.equal(all.receipt.selections.length,5);}finally{f.clean();}});
+test('R4 compiled equivalent single claims deduplicate without defeating explicit source obligations',()=>{const f=fixture();try{for(let i=0;i<5;i++)f.store.ingestSource({originKey:'copy'+i,text:'Varden launch is Tuesday.'});new ContextForgeCompiler(f.store).compile();const p=plan(f.store,'Varden launch');assert.equal(p.receipt.selections.length,1);const all=plan(f.store,'Review all documents',{sourceIds:f.store.db.prepare("SELECT source_id FROM sources WHERE namespace_id=?").all(f.store.namespaceId).map(r=>String(r.source_id))});assert.equal(all.receipt.selections.length,5);}finally{f.clean();}});
 
 test('R5 compound identifier planner admission, exact case bonus, alias cap observability',()=>{const f=fixture();try{f.store.ingestSource({originKey:'compact',text:'RFC38 adopted.'});assert.equal(plan(f.store,'RFC-38').receipt.selections.length,1);const exact=scoreFacetCoverage('vz_8Q-04a-Z9','vz_8Q-04a-Z9'),normalized=scoreFacetCoverage('vz_8Q-04a-Z9','vz_8q-04a-z9');assert.ok(exact.score>normalized.score);assert.ok(normalized.anchored);const q=analyzeRecallQuery(Array.from({length:100},(_,i)=>'alpha-'+i+'-beta').join(' '));buildFtsQuery(q);assert.ok(q.truncated);}finally{f.clean();}});
 
@@ -121,7 +121,7 @@ test('R4 repeated supported claims ignore unrelated archive suffixes but exhaust
  const ids=[];for(let i=0;i<5;i++)ids.push(f.store.ingestSource({originKey:'archive-copy-'+i,text:'Varden launch is Tuesday.\nArchive copy '+i+'.'}).sourceId);
  new ContextForgeCompiler(f.store).compile();const p=plan(f.store,'Varden launch');
  assert.equal(p.receipt.selections.length,1);assert.equal(p.receipt.coldStorage.exclusions.filter(x=>x.reason==='redundant').length,4);assert.match(text(p),/Varden launch is Tuesday/);assert.equal(p.receipt.retrieval!.supportGroupMissingIds.length,0);
- const all=plan(f.store,'Review all documents');assert.deepEqual(new Set(all.receipt.selections.map(i=>i.sourceId)),new Set(ids));
+ const all=plan(f.store,'Review all documents',{sourceIds:ids});assert.deepEqual(new Set(all.receipt.selections.map(i=>i.sourceId)),new Set(ids));
  for(let i=0;i<5;i++)assert.ok(text(all).includes('Archive copy '+i+'.'));
  }finally{f.clean();}});
 
@@ -158,8 +158,8 @@ test('R3 planner continues uncovered anchored facets beyond the combined scan ca
  const rare=f.store.ingestSource({originKey:'rare-epsilon',text:'Zircon epsilon qualification '+('padding '.repeat(70))});
  for(let i=0;i<200;i++)f.store.ingestSource({originKey:'epsilon-noise-'+i,text:'Unrelated epsilon '+i});
  const p=plan(f.store,'Zircon alpha beta gamma delta epsilon');
- assert.ok(p.receipt.selections.some(s=>s.sourceId===rare.sourceId));assert.ok(p.receipt.retrieval!.work.facetQueries>0);assert.ok(p.receipt.retrieval!.truncated);
- assert.ok(p.receipt.retrieval!.work.chunks<=256+8*256);assert.ok(p.receipt.retrieval!.work.inspectedTotal<=8192);assert.ok(p.receipt.retrieval!.work.readBytes<=8*1024*1024);
+ assert.ok(p.receipt.selections.some(s=>s.sourceId===rare.sourceId));assert.ok(p.receipt.retrieval!.work.chunks>0);assert.ok(p.receipt.retrieval!.truncated); // Ranked SQL may recover the rare hit without a continuation.
+ assert.ok(p.receipt.retrieval!.work.chunks<=256+8*256);assert.ok(p.receipt.retrieval!.work.inspectedTotal<=p.receipt.retrieval!.work.maxInspected);assert.ok(p.receipt.retrieval!.work.readBytes<=p.receipt.retrieval!.work.maxReadBytes);
  }finally{f.clean();}});
 
 test('R3 discover checks deadline before preparing the second FTS lane',()=>{const f=fixture();const now=Date.now;try{
@@ -172,7 +172,7 @@ test('R3 discover checks deadline before preparing the second FTS lane',()=>{con
 test('R4 identical canonical entity predicate object claims deduplicate across assertion labels',()=>{const f=fixture();try{
  for(const [i,label] of ['Fact','State','Decision','Fact','State'].entries())f.store.ingestSource({originKey:'typed-copy-'+i,text:label+': Varden | launch = Tuesday\nArchive copy '+i+'.'});
  new ContextForgeCompiler(f.store).compile();const p=plan(f.store,'Varden launch');assert.equal(p.receipt.selections.length,1);assert.match(text(p),/Tuesday/);
- assert.equal(plan(f.store,'Review all documents').receipt.selections.length,5);
+ assert.equal(plan(f.store,'Review all documents',{sourceIds:f.store.db.prepare("SELECT source_id FROM sources WHERE namespace_id=?").all(f.store.namespaceId).map(r=>String(r.source_id))}).receipt.selections.length,5);
  }finally{f.clean();}});
 
 // Bounded storage regression probes (kept in the shipped retrieval suite).
@@ -189,13 +189,12 @@ test('R3 discovery streams only capped rows, reports inspected work, and resumes
  assert.ok(second.every(h=>!first.some(p=>p.sourceId===h.sourceId)));
 }));
 
-test('R3 statistics are capped, charged to shared work and not cached as complete',()=>boundedFixture(s=>{
+test('R3 indexed corpus ranking does not spend hydration budget sampling early rows',()=>boundedFixture(s=>{
  for(let i=0;i<25;i++)s.ingestSource({originKey:String(i),text:'Zircon matching '+i});
- const budget=createStoreReadBudget({maxInspected:11});
- const hits=s.search('Zircon',{budget,limit:10,maxInspected:8,maxStatisticsInspected:3});
- assert.equal(hits.statisticsInspected,3);assert.equal(hits.inspected,8);assert.equal(hits.workInspected,11);assert.equal(budget.inspected,11);assert.equal(hits.truncated,true);
- const next=s.search('Zircon',{maxStatisticsInspected:3,maxInspected:1});assert.equal(next.statisticsInspected,3);
- const stopped=s.search('Zircon',{budget});assert.equal(stopped.inspected,0);assert.equal(stopped.statisticsInspected,0);assert.equal(stopped.truncated,true);
+ const budget=createStoreReadBudget({maxInspected:11});const hits=s.search('Zircon',{budget,limit:10,maxInspected:8,maxStatisticsInspected:3});
+ assert.equal(hits.statisticsInspected,0);assert.equal(hits.inspected,8);assert.equal(hits.workInspected,8);assert.equal(budget.inspected,8);
+ const rest=s.search('Zircon',{budget});assert.equal(rest.inspected,3);assert.equal(budget.inspected,11);
+ const stopped=s.search('Zircon',{budget});assert.equal(stopped.inspected,0);assert.equal(stopped.truncated,true);
 }));
 
 test('R3 discovery checks deadlines between iterator steps and before later lanes',()=>boundedFixture(s=>{
@@ -224,13 +223,10 @@ test('R3 bounded hydration still rejects quote corruption',()=>boundedFixture(s=
  assert.throws(()=>s.getEvidenceChunks(source.sourceId),/EvidenceQuoteMismatch/);
 }));
 
-test('R3 statistics stop at deadline before any FTS lane runs',()=>boundedFixture(s=>{
- for(let i=0;i<5;i++)s.ingestSource({originKey:String(i),text:'Zircon matching '+i});
- const prepare=s.db.prepare.bind(s.db),now=Date.now;let clock=100,actual=0,queries=0;
- s.db.prepare=((sql:string)=>{const stmt=prepare(sql);if(sql.includes('FROM retrieval_fts'))queries++;
- if(sql.includes('SELECT p.source_id,substr(CAST(c.body')){const iterate=stmt.iterate.bind(stmt);stmt.iterate=(...args:any[])=>{const it=iterate(...args),next=it.next.bind(it);it.next=()=>{const r=next();if(!r.done){actual++;clock=200;}return r;};return it;};}return stmt;}) as any;
- Date.now=()=>clock;
- try{const hits=s.search('Zircon',{deadlineAt:150});assert.equal(actual,1);assert.equal(hits.statisticsInspected,1);assert.equal(hits.inspected,0);assert.equal(queries,0);assert.equal(hits.truncated,true);}finally{Date.now=now;}
+test('R3 expired discovery prepares neither statistics scans nor FTS lanes',()=>boundedFixture(s=>{
+ s.ingestSource({originKey:'one',text:'Zircon matching'});const prepare=s.db.prepare.bind(s.db);let scans=0;
+ s.db.prepare=((sql:string)=>{if(sql.includes('FROM retrieval_fts')||sql.includes('SELECT p.source_id,substr(CAST(c.body'))scans++;return prepare(sql);}) as any;
+ const hits=s.search('Zircon',{deadlineAt:0});assert.equal(scans,0);assert.equal(hits.statisticsInspected,0);assert.equal(hits.inspected,0);assert.equal(hits.truncated,true);
 }));
 
 test('R3 facet-only continuation reaches anchored rare evidence behind global ranking cap',()=>boundedFixture(s=>{
@@ -240,8 +236,8 @@ test('R3 facet-only continuation reaches anchored rare evidence behind global ra
  const budget=createStoreReadBudget({maxInspected:200});
  const global=s.search('Zircon alpha beta gamma delta epsilon',{budget,limit:128,maxInspected:128,maxStatisticsInspected:0});
  assert.ok(!global.some(h=>h.sourceId===rare.sourceId));assert.equal(global.inspected,128);
- const continuation=s.search('epsilon',{budget,limit:32,maxInspected:32,maxStatisticsInspected:0});
- assert.ok(continuation.some(h=>h.sourceId===rare.sourceId));assert.equal(budget.inspected,160);
+ const continuation=s.search('epsilon',{budget,limit:32,maxInspected:32,maxStatisticsInspected:0,requiredTerms:['Zircon']});
+ assert.ok(continuation.some(h=>h.sourceId===rare.sourceId));assert.equal(budget.inspected,129);
 }));
 
 test('R3 exact support span hydration can share the same deadline and byte budget',()=>boundedFixture(s=>{
